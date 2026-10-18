@@ -113,3 +113,28 @@ def test_send_signal_dispatches_and_is_denied_without_rule(
     )
     assert "NO_RULE" in repr(result)
     assert "NO_RULE" in (tmp_path / "audit.jsonl").read_text(encoding="utf-8")
+
+
+def test_send_signal_keeps_json_integers_exact(tmp_path: Path, edge_dbc_path: Path) -> None:
+    """FastMCP must not coerce an integer value to float: 64-bit signals need every bit."""
+    import can
+
+    from ithildin.mcp.permissions import AllowRule
+
+    read = _make_ctx(tmp_path)
+    read.database.add_dbc(edge_dbc_path, ["CAN_1"])
+    read.allowlist.add_rule(AllowRule(id=0, message_id=123, signal="LogData"))
+    sent: list[can.Message] = []
+    write = McpWriteContext(
+        read=read,
+        audit=AuditWriter(tmp_path / "audit.jsonl"),
+        send=lambda msg, _bus=None: sent.append(msg),
+    )
+    mcp = build_server(read, write_ctx=write)
+    _run(
+        mcp.call_tool(
+            "send_signal",
+            {"message": "LogBlob", "signal": "LogData", "value": 0x0123456789ABCDEF},
+        )
+    )
+    assert bytes(sent[0].data) == bytes.fromhex("efcdab8967452301")

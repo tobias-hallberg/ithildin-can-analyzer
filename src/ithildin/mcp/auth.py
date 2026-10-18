@@ -29,6 +29,11 @@ if TYPE_CHECKING:
 
 TOKEN_FILENAME = "mcp_token"
 
+# How much of a refused request's body to read before answering. Plenty for
+# any MCP message; a client without the token streaming more than this gets
+# no more of our time, and its 401 may then be cut short by a reset.
+_DRAIN_LIMIT = 64 * 1024
+
 
 def load_or_create_token(path: Path) -> str:
     """Return the persisted token, generating one on first use (``0o600``)."""
@@ -65,9 +70,26 @@ class BearerAuthMiddleware:
         headers = dict(scope.get("headers") or [])
         presented = headers.get(b"authorization", b"").decode("latin-1")
         if not (presented and hmac.compare_digest(presented, self._expected)):
+            await _drain_body(receive)
             await _send_401(send)
             return
         await self._app(scope, receive, send)
+
+
+async def _drain_body(receive: Receive) -> None:
+    """Read a refused request's body before answering it.
+
+    Closing the connection while the client's body is still in flight makes
+    the TCP stack answer that body with a reset, and on Windows a reset
+    discards the 401 the client hasn't read yet. Python's ``http.client``,
+    for one, sends the body as a separate packet after the headers.
+    """
+    remaining = _DRAIN_LIMIT
+    while remaining > 0:
+        message = await receive()
+        if message["type"] != "http.request" or not message.get("more_body", False):
+            return
+        remaining -= len(message.get("body", b""))
 
 
 async def _send_401(send: Send) -> None:

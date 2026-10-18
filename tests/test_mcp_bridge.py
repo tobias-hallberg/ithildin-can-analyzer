@@ -95,8 +95,12 @@ def test_stop_when_never_started_is_safe(bridge: McpServerBridge) -> None:
     assert bridge.is_running is False
 
 
-def _http_status(port: int, token: str | None) -> int:
-    """POST to the MCP endpoint, returning the HTTP status (or the error code)."""
+def _http_status(port: int, token: str | None, timeout: float = 30.0) -> int:
+    """POST to the MCP endpoint and return the HTTP status.
+
+    Network errors propagate, so a failing assertion names the real error
+    rather than reading as a status of 0.
+    """
     import urllib.error
     import urllib.request
 
@@ -107,16 +111,23 @@ def _http_status(port: int, token: str | None) -> int:
         f"http://127.0.0.1:{port}/mcp", data=b"{}", headers=headers, method="POST"
     )
     try:
-        with urllib.request.urlopen(req, timeout=3) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             return int(resp.status)
     except urllib.error.HTTPError as exc:
         return int(exc.code)
+
+
+def _serving(port: int, token: str | None) -> bool:
+    """Readiness probe: has the transport started answering HTTP?"""
+    try:
+        _http_status(port, token, timeout=1.0)
     except OSError:
         # Not serving yet. Linux refuses the connection outright (URLError);
         # Windows accepts it into the backlog and then aborts mid-response
         # (WinError 10053), which surfaces as a bare OSError. URLError is an
         # OSError subclass, so this covers both.
-        return 0
+        return False
+    return True
 
 
 def test_live_http_requires_bearer_token(qtbot, bridge: McpServerBridge) -> None:  # type: ignore[no-untyped-def]
@@ -125,7 +136,7 @@ def test_live_http_requires_bearer_token(qtbot, bridge: McpServerBridge) -> None
     port = _free_port()
     with qtbot.waitSignal(bridge.started, timeout=5000):
         bridge.start(host="127.0.0.1", port=port)
-    qtbot.waitUntil(lambda: _http_status(port, bridge.token) != 0, timeout=5000)
+    qtbot.waitUntil(lambda: _serving(port, bridge.token), timeout=20000)
 
     assert _http_status(port, None) == 401
     assert _http_status(port, "wrong") == 401

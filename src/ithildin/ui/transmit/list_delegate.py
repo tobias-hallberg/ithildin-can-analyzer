@@ -15,6 +15,7 @@ toggles ``tx.active`` without selecting the row.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from PySide6.QtCore import (
@@ -53,6 +54,9 @@ if TYPE_CHECKING:
 TX_ROW_ROLE = Qt.ItemDataRole.UserRole + 1
 """Per-item role: stash the :class:`TxMessage` reference on the model item."""
 
+type ValueFormatter = Callable[[TxMessage, str, object], str | None]
+"""``(tx, signal_name, value) -> text``, or ``None`` to use the default."""
+
 
 _ROW_HEIGHT = 46
 _BTN_SIZE = 22
@@ -78,6 +82,14 @@ class TxListDelegate(QStyledItemDelegate):
         super().__init__(parent)
         self._master_enabled = False
         self._blink_on = True
+        self._format_value: ValueFormatter | None = None
+
+    def set_value_formatter(self, fn: ValueFormatter) -> None:
+        """Render summary values the delegate can't on its own; it has no DBC.
+
+        ``fn`` returns the text for one value, or ``None`` for the default.
+        """
+        self._format_value = fn
 
     def set_master_enabled(self, enabled: bool) -> None:
         if enabled == self._master_enabled:
@@ -160,31 +172,16 @@ class TxListDelegate(QStyledItemDelegate):
         painter.setFont(_glyph_font())
         painter.drawText(btn_rect, int(Qt.AlignmentFlag.AlignCenter), glyph)
 
-        # First text line: name + hex ID.
         text_x = btn_rect.right() + 10
         text_w = rect.right() - text_x - 8
         name_y = rect.top() + 6
         name_font = tabular_font()
         name_font.setPointSize(11)
         name_fm = QFontMetrics(name_font)
-        painter.setFont(name_font)
-        painter.setPen(QPen(QColor(tokens["fg_0"])))
-        painter.drawText(
-            text_x,
-            name_y + name_fm.ascent(),
-            f"{tx.message_name}",
-        )
-        name_w = name_fm.horizontalAdvance(tx.message_name)
-        # Hex ID immediately after the name, dimmer.
-        painter.setPen(QPen(QColor(tokens["fg_3"])))
-        painter.drawText(
-            text_x + name_w + 8,
-            name_y + name_fm.ascent(),
-            f"0x{tx.message_id:X}",
-        )
 
         # Period badge on the far right of the first line.
         badge_text, badge_state = self._badge(tx, transmitting)
+        line_right = rect.right() - 8
         if badge_text:
             badge_font = tabular_font()
             badge_font.setPointSize(8)
@@ -199,6 +196,21 @@ class TxListDelegate(QStyledItemDelegate):
                 _BADGE_HEIGHT,
             )
             self._paint_badge(painter, badge_rect, tokens, badge_state, badge_text, has_dot)
+            line_right = badge_rect.left() - 8
+
+        # First text line: name + hex ID, elided to stay clear of the badge.
+        id_text = f"0x{tx.message_id:X}"
+        name, show_id = fit_name_and_id(name_fm, tx.message_name, id_text, line_right - text_x)
+        painter.setFont(name_font)
+        painter.setPen(QPen(QColor(tokens["fg_0"])))
+        painter.drawText(text_x, name_y + name_fm.ascent(), name)
+        if show_id:
+            painter.setPen(QPen(QColor(tokens["fg_3"])))
+            painter.drawText(
+                text_x + name_fm.horizontalAdvance(name) + _ID_GAP,
+                name_y + name_fm.ascent(),
+                id_text,
+            )
 
         # Second line: signal summary, ellipsised. Empty-overrides placeholder
         # paints dimmer than a real summary so it reads as metadata.
@@ -292,14 +304,16 @@ class TxListDelegate(QStyledItemDelegate):
             text,
         )
 
-    @staticmethod
-    def _summary_for(tx: TxMessage) -> str:
+    def _summary_for(self, tx: TxMessage) -> str:
         """Build the second-line summary; empty overrides → ``(defaults)``."""
         if not tx.signal_values:
             return "(defaults)"
         parts: list[str] = []
         for name, v in list(tx.signal_values.items())[:4]:
-            if isinstance(v, bool):
+            custom = self._format_value(tx, name, v) if self._format_value else None
+            if custom is not None:
+                parts.append(f"{name}:{custom}")
+            elif isinstance(v, bool):
                 parts.append(f"{name}:{'ON' if v else 'OFF'}")
             elif isinstance(v, float):
                 parts.append(f"{name}:{v:g}")
@@ -310,6 +324,21 @@ class TxListDelegate(QStyledItemDelegate):
         return " · ".join(parts)
 
 
+_ID_GAP = 8
+
+
+def fit_name_and_id(fm: QFontMetrics, name: str, id_text: str, width: int) -> tuple[str, bool]:
+    """Elide ``name`` so name, gap and ID fit in ``width`` pixels.
+
+    The ID keeps its full width. When not even a few name characters fit
+    beside it, the ID is dropped (``False``) and the name takes the line.
+    """
+    width = max(0, width)
+    room = width - fm.horizontalAdvance(id_text) - _ID_GAP
+    show_id = room >= fm.horizontalAdvance("MMM…")
+    return fm.elidedText(name, Qt.TextElideMode.ElideRight, room if show_id else width), show_id
+
+
 def _glyph_font() -> QFont:
     f = QFont()
     f.setPointSize(8)
@@ -317,4 +346,4 @@ def _glyph_font() -> QFont:
     return f
 
 
-__all__ = ["TX_ROW_ROLE", "TxListDelegate"]
+__all__ = ["TX_ROW_ROLE", "TxListDelegate", "fit_name_and_id"]

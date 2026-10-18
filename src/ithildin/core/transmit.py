@@ -20,6 +20,7 @@ The shared :func:`encode_tx_message` helper is also called by the MCP
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -56,6 +57,7 @@ class TxSignalSpec:
     value: float | int | bool | str
     length_bits: int
     is_signed: bool
+    is_float: bool
     minimum: float | None
     maximum: float | None
     scale: float
@@ -92,19 +94,22 @@ class TxSetup:
 # --------------------------------------------------------------------------
 
 
-def infer_kind(sig: cantools.database.Signal) -> TxSignalKind:
+def infer_kind(sig: cantools.database.Signal, message: cantools.database.Message) -> TxSignalKind:
     """Pick a control kind for ``sig`` per handoff §7.2.
 
     Per-signal overrides on the :class:`TxMessage` win over this — call
     :func:`resolve_kind` when you have a :class:`TxMessage` in hand.
     """
+    if sig.is_multiplexer and multiplexer_choices(message, sig):
+        return "enum-dd"
     if int(getattr(sig, "length", 0) or 0) == 1:
         return "bool"
     choices = getattr(sig, "choices", None)
     if choices:
         return "enum-seg" if len(choices) <= 4 else "enum-dd"
-    mn = _maybe_float(getattr(sig, "minimum", None))
-    mx = _maybe_float(getattr(sig, "maximum", None))
+    if _is_wide_integer(sig):
+        return "hex"
+    mn, mx = signal_range(sig)
     if bool(getattr(sig, "is_signed", False)) and mn is not None and mx is not None and mn < 0 < mx:
         return "signed"
     autofill = _autofill_attribute(sig)
@@ -115,21 +120,137 @@ def infer_kind(sig: cantools.database.Signal) -> TxSignalKind:
     return "num-sm"
 
 
-def resolve_kind(tx: TxMessage, sig: cantools.database.Signal) -> TxSignalKind:
+def signal_range(sig: cantools.database.Signal) -> tuple[float | None, float | None]:
+    """Physical ``(min, max)`` the signal can actually carry.
+
+    The DBC's declared range, narrowed to what the raw bits can encode.
+    DBCs often leave the range as ``[0|0]``, which cantools reads as no
+    range, or declare one the bits can't hold, such as ``[0|255]`` on an
+    8-bit signal scaled by 0.1. Float signals keep the declared range.
+    """
+    mn = _maybe_float(getattr(sig, "minimum", None))
+    mx = _maybe_float(getattr(sig, "maximum", None))
+    length = int(getattr(sig, "length", 0) or 0)
+    if bool(getattr(sig, "is_float", False)) or length <= 0:
+        return mn, mx
+    if bool(getattr(sig, "is_signed", False)):
+        raw_lo, raw_hi = -(1 << (length - 1)), (1 << (length - 1)) - 1
+    else:
+        raw_lo, raw_hi = 0, (1 << length) - 1
+    scale = float(getattr(sig, "scale", 1.0) or 1.0)
+    offset = float(getattr(sig, "offset", 0.0) or 0.0)
+    ends: tuple[float, float]
+    if scale.is_integer() and offset.is_integer():
+        # Exact ints: as a float, a 64-bit bound rounds past what fits.
+        ends = (raw_lo * int(scale) + int(offset), raw_hi * int(scale) + int(offset))
+    else:
+        ends = (raw_lo * scale + offset, raw_hi * scale + offset)
+    lo, hi = min(ends), max(ends)
+    narrowed_lo = lo if mn is None else max(lo, mn)
+    narrowed_hi = hi if mx is None else min(hi, mx)
+    if narrowed_lo > narrowed_hi:
+        return lo, hi
+    return narrowed_lo, narrowed_hi
+
+
+def multiplexer_choices(
+    message: cantools.database.Message, selector: cantools.database.Signal
+) -> dict[int, str]:
+    """IDs ``selector`` can take in ``message``, labelled for the editor.
+
+    The DBC's value table names an ID when it has one; otherwise the label
+    lists the signals that ID carries.
+    """
+    carried: dict[int, list[str]] = {}
+    for sig in message.signals:
+        if sig.multiplexer_signal == selector.name:
+            for mux_id in sig.multiplexer_ids or ():
+                carried.setdefault(int(mux_id), []).append(str(sig.name))
+    names = getattr(selector, "choices", None) or {}
+    labels: dict[int, str] = {}
+    for mux_id, signals in sorted(carried.items()):
+        if mux_id in names:
+            labels[mux_id] = str(names[mux_id])
+        else:
+            more = f" +{len(signals) - 2}" if len(signals) > 2 else ""
+            labels[mux_id] = ", ".join(signals[:2]) + more
+    return labels
+
+
+def implied_selectors(
+    message: cantools.database.Message, values: Mapping[str, object]
+) -> dict[str, int]:
+    """Values for the multiplexer selectors that ``values`` leaves unset.
+
+    Setting a multiplexed signal without its selector means "send that
+    signal", so the selector takes the ID that carries it. A selector with
+    nothing to follow takes its initial value when that is a valid ID, else
+    its lowest valid ID: 0 often isn't one, and cantools refuses to encode
+    an unknown selector ID.
+    """
+    by_name = {sig.name: sig for sig in message.signals}
+    implied: dict[str, int] = {}
+    for name in values:
+        sig = by_name.get(name)
+        while sig is not None and sig.multiplexer_signal is not None and sig.multiplexer_ids:
+            selector = sig.multiplexer_signal
+            if selector in values or selector in implied:
+                break
+            implied[selector] = int(sig.multiplexer_ids[0])
+            sig = by_name.get(selector)
+    for sig in message.signals:
+        if not sig.is_multiplexer or sig.name in values or sig.name in implied:
+            continue
+        ids = list(multiplexer_choices(message, sig))
+        if not ids:
+            continue
+        initial = _maybe_float(getattr(sig, "initial", None))
+        implied[sig.name] = int(initial) if initial is not None and initial in ids else ids[0]
+    return implied
+
+
+def inactive_signals(message: cantools.database.Message, values: Mapping[str, object]) -> set[str]:
+    """Signals a frame built from ``values`` won't carry: other selector branches."""
+    selection = {**implied_selectors(message, values), **values}
+    by_name = {sig.name: sig for sig in message.signals}
+    inactive: set[str] = set()
+    for sig in message.signals:
+        cur = sig
+        while cur.multiplexer_signal is not None:
+            if selection.get(cur.multiplexer_signal) not in (cur.multiplexer_ids or ()):
+                inactive.add(sig.name)
+                break
+            cur = by_name[cur.multiplexer_signal]
+    return inactive
+
+
+def resolve_kind(
+    tx: TxMessage, sig: cantools.database.Signal, message: cantools.database.Message
+) -> TxSignalKind:
     """Per-message override → :func:`infer_kind` fallback."""
     override = tx.kind_overrides.get(sig.name)
     if override is not None:
         return override
-    return infer_kind(sig)
+    return infer_kind(sig, message)
 
 
 def build_signal_spec(
     sig: cantools.database.Signal,
+    message: cantools.database.Message,
     *,
     kind: TxSignalKind,
-    current_value: float | int | bool | str | None,
+    values: Mapping[str, float | int | bool | str],
 ) -> TxSignalSpec:
-    """Snapshot one signal's metadata for the editor."""
+    """Snapshot one signal's metadata, and its value in ``values``, for the editor.
+
+    A selector missing from ``values`` shows the ID the encoder will send.
+    """
+    minimum, maximum = signal_range(sig)
+    mux_choices = multiplexer_choices(message, sig) if sig.is_multiplexer else None
+    raw_choices = mux_choices or getattr(sig, "choices", None)
+    current_value = values.get(sig.name)
+    if current_value is None and mux_choices:
+        current_value = implied_selectors(message, values).get(sig.name)
     initial = _maybe_float(getattr(sig, "initial", None))
     if current_value is not None:
         value: float | int | bool | str = current_value
@@ -143,16 +264,13 @@ def build_signal_spec(
         value=value,
         length_bits=int(getattr(sig, "length", 0) or 0),
         is_signed=bool(getattr(sig, "is_signed", False)),
-        minimum=_maybe_float(getattr(sig, "minimum", None)),
-        maximum=_maybe_float(getattr(sig, "maximum", None)),
+        is_float=bool(getattr(sig, "is_float", False)),
+        minimum=minimum,
+        maximum=maximum,
         scale=float(getattr(sig, "scale", 1.0) or 1.0),
         offset=float(getattr(sig, "offset", 0.0) or 0.0),
         unit=str(getattr(sig, "unit", "") or ""),
-        choices=(
-            {int(k): str(v) for k, v in raw.items()}
-            if (raw := getattr(sig, "choices", None))
-            else None
-        ),
+        choices={int(k): str(v) for k, v in raw_choices.items()} if raw_choices else None,
         initial=initial,
     )
 
@@ -169,14 +287,18 @@ def encode_tx_message(
 ) -> bytes:
     """Encode a CAN message payload from a sparse overrides dict.
 
-    Unspecified signals fall back to ``signal.initial`` then ``0.0`` —
-    same rule MCP's ``send_signal`` uses. Returns the raw bytes; the
-    caller wraps them in a :class:`can.Message`.
+    Unspecified multiplexer selectors follow :func:`implied_selectors`;
+    other unspecified signals fall back to ``signal.initial`` then ``0.0``.
+    Returns the raw bytes; the caller wraps them in a :class:`can.Message`.
     """
+    implied = implied_selectors(message_obj, overrides)
     signal_values: dict[str, Any] = {}
     for sig in message_obj.signals:
         if sig.name in overrides:
             signal_values[sig.name] = overrides[sig.name]
+            continue
+        if sig.name in implied:
+            signal_values[sig.name] = implied[sig.name]
             continue
         initial = getattr(sig, "initial", None)
         signal_values[sig.name] = float(initial) if initial is not None else 0.0
@@ -384,6 +506,24 @@ def _maybe_float(v: Any) -> float | None:
         return None
 
 
+def _is_wide_integer(sig: cantools.database.Signal) -> bool:
+    """An integer signal wider than a float's 53-bit mantissa, scaled by whole numbers.
+
+    A float would round its low bits away, so the editor keeps the value
+    as a Python int. cantools converts an int exactly when the factor and
+    offset are whole numbers. With a fractional factor it divides in
+    floats, so such a signal stays a numeric control and float-limited.
+    """
+    scale = float(getattr(sig, "scale", 1.0) or 1.0)
+    offset = float(getattr(sig, "offset", 0.0) or 0.0)
+    return (
+        int(getattr(sig, "length", 0) or 0) > 53
+        and not bool(getattr(sig, "is_float", False))
+        and scale.is_integer()
+        and offset.is_integer()
+    )
+
+
 def _autofill_attribute(sig: cantools.database.Signal) -> str | None:
     """Best-effort lookup of a vendor-specific ``autofill`` attribute.
 
@@ -411,6 +551,10 @@ __all__ = [
     "TxSignalSpec",
     "build_signal_spec",
     "encode_tx_message",
+    "implied_selectors",
+    "inactive_signals",
     "infer_kind",
+    "multiplexer_choices",
     "resolve_kind",
+    "signal_range",
 ]

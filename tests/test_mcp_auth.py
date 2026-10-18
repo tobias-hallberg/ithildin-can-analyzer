@@ -81,6 +81,49 @@ def test_middleware_rejects_wrong_token() -> None:
     assert rec.status == 401
 
 
+def test_middleware_reads_the_body_before_refusing() -> None:
+    """Regression: answering before the body arrived let the TCP stack reset
+    the connection, and on Windows the reset ate the 401 (flaky bridge test)."""
+    import asyncio
+
+    events: list[str] = []
+    chunks = [b"{", b'"a"', b"}"]
+
+    async def receive() -> dict:
+        events.append("receive")
+        return {"type": "http.request", "body": chunks.pop(0), "more_body": bool(chunks)}
+
+    async def send(message: dict) -> None:
+        events.append(message["type"])
+
+    mw = BearerAuthMiddleware(lambda *_a: None, token="s3cret")
+    asyncio.run(mw(_http_scope(None), receive, send))
+    assert events == [
+        "receive",
+        "receive",
+        "receive",
+        "http.response.start",
+        "http.response.body",
+    ]
+
+
+def test_middleware_stops_draining_an_endless_body() -> None:
+    import asyncio
+
+    reads = 0
+
+    async def endless() -> dict:
+        nonlocal reads
+        reads += 1
+        return {"type": "http.request", "body": b"x" * 16384, "more_body": True}
+
+    rec = _Recorder()
+    mw = BearerAuthMiddleware(lambda *_a: None, token="s3cret")
+    asyncio.run(mw(_http_scope(None), endless, rec.send))
+    assert rec.status == 401
+    assert reads == 4  # 64 KiB in 16 KiB chunks
+
+
 def test_middleware_passes_correct_token() -> None:
     import asyncio
 

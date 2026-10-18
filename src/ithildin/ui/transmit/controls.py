@@ -17,10 +17,12 @@ The :func:`control_for_signal` factory dispatches on
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
+from decimal import Decimal
 from typing import Any
 
-from PySide6.QtCore import QPoint, QRect, QRectF, Qt, Signal
+from PySide6.QtCore import QLocale, QPoint, QRect, QRectF, QRegularExpression, Qt, Signal
 from PySide6.QtGui import (
     QBrush,
     QColor,
@@ -30,11 +32,15 @@ from PySide6.QtGui import (
     QPainter,
     QPaintEvent,
     QPen,
+    QRegularExpressionValidator,
     QResizeEvent,
+    QWheelEvent,
 )
 from PySide6.QtWidgets import (
     QAbstractButton,
+    QAbstractSpinBox,
     QComboBox,
+    QDoubleSpinBox,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -68,6 +74,36 @@ def _readout_pill(text: str, parent: QWidget | None = None) -> QLabel:
     lbl.setContentsMargins(8, 2, 8, 2)
     lbl.setObjectName("TxReadoutPill")
     return lbl
+
+
+def _raw_bounds(minimum: float, maximum: float, scale: float) -> tuple[int, int]:
+    """Whole multiples of ``scale`` that stay inside ``[minimum, maximum]``.
+
+    Rounding the endpoints instead can land half a step outside the range,
+    on a value the signal's bits can't encode. The epsilon absorbs float
+    error such as ``255 * 0.1 == 25.500000000000004``.
+    """
+    return math.ceil(minimum / scale - 1e-6), math.floor(maximum / scale + 1e-6)
+
+
+def _decimals(scale: float) -> int:
+    """Decimal places needed to show every multiple of ``scale`` exactly (max 6)."""
+    exponent = Decimal(repr(scale)).normalize().as_tuple().exponent
+    return min(6, max(0, -exponent)) if isinstance(exponent, int) else 0
+
+
+class _StepperField(QDoubleSpinBox):
+    """Spin field that ignores the wheel unless focused.
+
+    The editor sits in a scroll area, and a wheel tick over an unfocused
+    field would otherwise change a value that may be on the bus.
+    """
+
+    def wheelEvent(self, event: QWheelEvent) -> None:
+        if self.hasFocus():
+            super().wheelEvent(event)
+        else:
+            event.ignore()
 
 
 def _format_number(value: float, scale: float) -> str:
@@ -250,10 +286,9 @@ class TxDropdown(QComboBox):
         self._choices = dict(sorted(choices.items()))
         for raw, label in self._choices.items():
             self.addItem(f"{label}  ({raw})", int(raw))
-        if value is not None:
-            idx = self.findData(int(value))
-            if idx >= 0:
-                self.setCurrentIndex(idx)
+        # A value outside the table shows blank rather than the first entry,
+        # which would claim a value the frame doesn't carry.
+        self.setCurrentIndex(self.findData(int(value)) if value is not None else -1)
         self.currentIndexChanged.connect(self._on_changed)
 
     @property
@@ -294,8 +329,7 @@ class TxSlider(QWidget):
         self._min = minimum
         self._max = maximum
         # We work in integer raw units of `scale` so QSlider behaves.
-        self._raw_min = round(minimum / self._scale)
-        self._raw_max = round(maximum / self._scale)
+        self._raw_min, self._raw_max = _raw_bounds(minimum, maximum, self._scale)
         if self._raw_max <= self._raw_min:
             self._raw_max = self._raw_min + 1
         row = QHBoxLayout(self)
@@ -376,7 +410,12 @@ class TxSlider(QWidget):
 
 
 class TxStepper(QFrame):
-    """−/+ buttons with a mono numeric readout and trailing range hint."""
+    """Typeable numeric field between −/+ buttons, with a trailing range hint.
+
+    Large ranges are where clicking alone falls short, so the field takes a
+    typed value (committed on Enter or focus-out) and the buttons repeat
+    while held.
+    """
 
     value_changed = Signal(float)
 
@@ -392,11 +431,8 @@ class TxStepper(QFrame):
         super().__init__(parent)
         self.setObjectName("TxStepperFrame")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        self._min = minimum
-        self._max = maximum
-        self._scale = max(scale, 1.0)  # large-range scale is whole-units
-        self._unit = unit
-        self._value = max(minimum, min(maximum, float(value)))
+        self._scale = max(scale, 1e-9)
+        self._raw_min, self._raw_max = _raw_bounds(minimum, maximum, self._scale)
 
         row = QHBoxLayout(self)
         row.setContentsMargins(0, 0, 0, 0)
@@ -404,18 +440,32 @@ class TxStepper(QFrame):
         self._minus = QPushButton("−", self)
         self._minus.setObjectName("TxStepperBtn")
         self._minus.setFixedWidth(28)
-        self._minus.clicked.connect(lambda: self._bump(-self._scale))
+        self._minus.setAutoRepeat(True)
         row.addWidget(self._minus)
-        self._readout = QLabel(self._format(), self)
-        self._readout.setObjectName("TxStepperReadout")
-        self._readout.setFont(tabular_font())
-        self._readout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._readout.setMinimumWidth(110)
-        row.addWidget(self._readout, 1)
+        self._field = _StepperField(self)
+        # Every other readout formats with a decimal point; the system locale
+        # (a comma in much of Europe) would make this field the odd one out.
+        self._field.setLocale(QLocale.c())
+        self._field.setObjectName("TxStepperReadout")
+        self._field.setFont(tabular_font())
+        self._field.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._field.setMinimumWidth(110)
+        self._field.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+        self._field.setKeyboardTracking(False)
+        self._field.setDecimals(_decimals(self._scale))
+        self._field.setRange(self._raw_min * self._scale, self._raw_max * self._scale)
+        self._field.setSingleStep(max(self._scale, 1.0))  # large-range steps are whole units
+        self._field.setSuffix(f" {unit}" if unit else "")
+        self._field.setValue(float(value))
+        self._value = self._snap(self._field.value())
+        self._field.valueChanged.connect(self._on_changed)
+        row.addWidget(self._field, 1)
+        self._minus.clicked.connect(lambda: self._field.stepBy(-1))
         self._plus = QPushButton("+", self)
         self._plus.setObjectName("TxStepperBtn")
         self._plus.setFixedWidth(28)
-        self._plus.clicked.connect(lambda: self._bump(self._scale))
+        self._plus.setAutoRepeat(True)
+        self._plus.clicked.connect(lambda: self._field.stepBy(1))
         row.addWidget(self._plus)
         self._range = QLabel(f"{minimum:g}…{maximum:g}", self)
         self._range.setObjectName("TxStepperRange")
@@ -431,21 +481,25 @@ class TxStepper(QFrame):
         return self._value
 
     def set_value(self, v: float) -> None:
-        clamped = max(self._min, min(self._max, float(v)))
-        if clamped != self._value:
-            self._value = clamped
-            self._readout.setText(self._format())
+        self._field.blockSignals(True)
+        self._field.setValue(float(v))
+        self._field.blockSignals(False)
+        self._value = self._snap(self._field.value())
 
-    def _bump(self, delta: float) -> None:
-        new = max(self._min, min(self._max, self._value + delta))
-        if new != self._value:
-            self._value = new
-            self._readout.setText(self._format())
-            self.value_changed.emit(new)
+    def _snap(self, v: float) -> float:
+        """Nearest whole multiple of ``scale`` inside the range: what will be sent."""
+        raw = max(self._raw_min, min(self._raw_max, round(v / self._scale)))
+        return raw * self._scale
 
-    def _format(self) -> str:
-        unit = f" {self._unit}" if self._unit else ""
-        return f"{self._value:.0f}{unit}"
+    def _on_changed(self, v: float) -> None:
+        snapped = self._snap(v)
+        if snapped != v:
+            self._field.blockSignals(True)
+            self._field.setValue(snapped)
+            self._field.blockSignals(False)
+        if snapped != self._value:
+            self._value = snapped
+            self.value_changed.emit(snapped)
 
     def _restyle(self) -> None:
         tokens = _tokens()
@@ -467,9 +521,16 @@ class TxStepper(QFrame):
             QPushButton#TxStepperBtn:hover {{
                 background: {tokens["bg_3"]};
             }}
-            QLabel#TxStepperReadout {{
+            QDoubleSpinBox#TxStepperReadout {{
                 color: {tokens["fg_0"]};
                 background: transparent;
+                border: 0;
+                border-right: 1px solid {tokens["border_0"]};
+                border-radius: 0;
+                padding: 2px 4px;
+            }}
+            QDoubleSpinBox#TxStepperReadout:focus {{
+                background: {tokens["bg_1"]};
             }}
             QLabel#TxStepperRange {{
                 color: {tokens["fg_3"]};
@@ -514,7 +575,10 @@ class TxSignedSlider(QWidget):
         row = QHBoxLayout(self)
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(8)
-        self._bar = _SignedBar(self._raw_min, self._raw_max, self)
+        # The drawn span is symmetric but the value is not: a signed 8-bit
+        # signal spans −128…127, so the bar stops one step short of +128.
+        limits = _raw_bounds(minimum, maximum, self._scale)
+        self._bar = _SignedBar(self._raw_min, self._raw_max, limits, self)
         self._bar.set_value(round(float(value) / self._scale))
         self._bar.value_changed.connect(self._on_raw_changed)
         row.addWidget(self._bar, 1)
@@ -562,10 +626,17 @@ class _SignedBar(QWidget):
 
     value_changed = Signal(int)
 
-    def __init__(self, raw_min: int, raw_max: int, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        raw_min: int,
+        raw_max: int,
+        limits: tuple[int, int],
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
         self._raw_min = raw_min
         self._raw_max = raw_max
+        self._limit_min, self._limit_max = limits
         self._raw = 0
         self.setMinimumHeight(28)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -574,7 +645,7 @@ class _SignedBar(QWidget):
         return self._raw
 
     def set_value(self, raw: int) -> None:
-        raw = max(self._raw_min, min(self._raw_max, raw))
+        raw = max(self._limit_min, min(self._limit_max, raw))
         if raw == self._raw:
             return
         self._raw = raw
@@ -633,42 +704,66 @@ class _SignedBar(QWidget):
 
 
 class TxHexGrid(QWidget):
-    """Row of mono ``HH`` cells. Editable; emits a hex string on change."""
+    """Row of mono ``HH`` cells editing a raw integer, most significant byte first.
 
-    value_changed = Signal(str)
+    For integer signals too wide for a float to hold exactly. ``value`` is
+    a Python int, so every bit of a 64-bit signal survives; a signed signal
+    reads its cells as two's complement.
+    """
 
-    def __init__(self, value: str, byte_count: int = 8, parent: QWidget | None = None) -> None:
+    value_changed = Signal(object)  # int; Signal(int) would cut it to 32 bits
+
+    def __init__(
+        self,
+        value: int,
+        length_bits: int,
+        is_signed: bool = False,
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
-        bytes_list = _parse_hex(value, byte_count)
+        self._bits = max(1, length_bits)
+        self._signed = is_signed
         row = QHBoxLayout(self)
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(4)
+        validator = QRegularExpressionValidator(QRegularExpression("[0-9A-Fa-f]{0,2}"), self)
         self._cells: list[QLineEdit] = []
-        for b in bytes_list:
-            cell = QLineEdit(b, self)
+        for _ in range((self._bits + 7) // 8):
+            cell = QLineEdit(self)
             cell.setFont(tabular_font())
             cell.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            cell.setMaxLength(2)
+            cell.setValidator(validator)
             cell.setFixedWidth(28)
             cell.setObjectName("TxHexCell")
             cell.editingFinished.connect(self._emit)
             row.addWidget(cell)
             self._cells.append(cell)
         row.addStretch(1)
+        self.set_value(value)
+        self._emitted = self.value
         self._restyle()
         ThemeManager.instance().theme_changed.connect(lambda _t: self._restyle())
 
     @property
-    def value(self) -> str:
-        return " ".join(c.text().upper().rjust(2, "0") for c in self._cells)
+    def value(self) -> int:
+        digits = "".join(c.text().rjust(2, "0") for c in self._cells)
+        raw = int(digits, 16) & ((1 << self._bits) - 1)
+        if self._signed and raw >> (self._bits - 1):
+            raw -= 1 << self._bits
+        return raw
 
-    def set_value(self, v: str) -> None:
-        bytes_list = _parse_hex(v, len(self._cells))
-        for cell, byte in zip(self._cells, bytes_list, strict=False):
-            cell.setText(byte)
+    def set_value(self, v: int) -> None:
+        digits = f"{int(v) & ((1 << self._bits) - 1):0{len(self._cells) * 2}X}"
+        for i, cell in enumerate(self._cells):
+            cell.setText(digits[2 * i : 2 * i + 2])
 
     def _emit(self) -> None:
-        self.value_changed.emit(self.value)
+        # Re-render so "a" reads "0A" and bits past the signal's width drop.
+        value = self.value
+        self.set_value(value)
+        if value != self._emitted:
+            self._emitted = value
+            self.value_changed.emit(value)
 
     def _restyle(self) -> None:
         tokens = _tokens()
@@ -684,12 +779,6 @@ class TxHexGrid(QWidget):
             QLineEdit#TxHexCell:focus {{ border-color: {tokens["accent"]}; }}
             """
         )
-
-
-def _parse_hex(value: str, byte_count: int) -> list[str]:
-    raw = "".join(ch for ch in (value or "") if ch in "0123456789ABCDEFabcdef")
-    raw = raw.upper().ljust(byte_count * 2, "0")[: byte_count * 2]
-    return [raw[i : i + 2] for i in range(0, byte_count * 2, 2)]
 
 
 # ---------------------------------------------------------------------------
@@ -804,8 +893,15 @@ def control_for_signal(
         ctrl.value_changed.connect(lambda v: on_change(int(v)))  # type: ignore[attr-defined]
         return ctrl
     if kind == "hex":
-        hex_w = TxHexGrid(str(spec.value or ""), parent=parent)
-        hex_w.value_changed.connect(lambda v: on_change(str(v)))
+        # The grid edits raw bits; the stored value is physical. The hex kind
+        # only goes to whole-number scaling, so int arithmetic keeps both
+        # directions exact.
+        factor, offset = int(spec.scale), int(spec.offset)
+        physical = int(spec.value) if not isinstance(spec.value, str) else offset
+        hex_w = TxHexGrid(
+            (physical - offset) // factor, spec.length_bits, spec.is_signed, parent=parent
+        )
+        hex_w.value_changed.connect(lambda raw: on_change(raw * factor + offset))
         return hex_w
     if kind == "auto":
         return TxAutoBadge(

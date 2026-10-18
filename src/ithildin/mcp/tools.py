@@ -32,7 +32,7 @@ import can
 
 from ithildin.app_state.bus_reader import BusReader
 from ithildin.app_state.database import Database
-from ithildin.core.transmit import encode_tx_message
+from ithildin.core.transmit import encode_tx_message, multiplexer_choices, signal_range
 from ithildin.core.types import FrameRecord
 from ithildin.mcp.audit import AuditWriter
 from ithildin.mcp.permissions import (
@@ -388,23 +388,29 @@ def _iter_decoders(database: Database) -> Iterator[tuple[Path, str, Any]]:
 
 
 def _signal_dict(msg: Any, sig: Any, bus: str, path: Path) -> dict[str, Any]:
+    # The range is what the bits can carry, narrowed by the DBC's declared
+    # range: the same bounds send_signal enforces. A multiplexer selector's
+    # choices are the IDs its message defines.
+    minimum, maximum = signal_range(sig)
+    choices = multiplexer_choices(msg, sig) if sig.is_multiplexer else None
+    if not choices and getattr(sig, "choices", None):
+        choices = {int(k): str(v) for k, v in sig.choices.items()}
     return {
         "message": msg.name,
         "message_id": int(msg.frame_id),
         "message_id_hex": f"0x{msg.frame_id:X}",
         "signal": sig.name,
         "unit": getattr(sig, "unit", "") or "",
-        "minimum": _maybe_float(getattr(sig, "minimum", None)),
-        "maximum": _maybe_float(getattr(sig, "maximum", None)),
+        "minimum": minimum,
+        "maximum": maximum,
         "length_bits": int(getattr(sig, "length", 0)),
         "scale": _maybe_float(getattr(sig, "scale", None)),
         "offset": _maybe_float(getattr(sig, "offset", None)),
         "is_signed": bool(getattr(sig, "is_signed", False)),
-        "choices": (
-            {int(k): str(v) for k, v in sig.choices.items()}
-            if getattr(sig, "choices", None)
-            else None
-        ),
+        "choices": choices or None,
+        "is_multiplexer": bool(sig.is_multiplexer),
+        "multiplexer_signal": sig.multiplexer_signal,
+        "multiplexer_ids": [int(i) for i in sig.multiplexer_ids] if sig.multiplexer_ids else None,
         "bus": bus,
         "dbc_path": str(path),
     }
@@ -428,7 +434,7 @@ def send_signal(
     ctx: McpWriteContext,
     message: str,
     signal: str,
-    value: float,
+    value: int | float,
     agent: str = "",
     bus: str | None = None,
 ) -> dict[str, Any]:
@@ -437,6 +443,8 @@ def send_signal(
     ``bus`` names the target bus; omit it when exactly one is open.
     Returns a dict with ``ok`` plus, on failure, a ``reason``.
     Every attempt — allowed or denied — is appended to the audit log.
+    An int ``value`` stays an int all the way to the encoder, so a 64-bit
+    signal keeps the low bits a float would round away.
     """
     bus_name = bus if bus is not None else ctx.read.bus_reader.bus_name
     if bus_name is not None and ctx.read.bus_reader.is_listen_only(bus_name):
@@ -450,7 +458,7 @@ def send_signal(
             rule_id=None,
             detail=f"bus {bus_name!r} is listen-only",
         )
-    if not math.isfinite(value):
+    if isinstance(value, float) and not math.isfinite(value):
         return _audit_and_return(
             ctx,
             call="send_signal",
@@ -476,7 +484,7 @@ def send_signal(
     request = SendSignalRequest(
         message_id=int(message_obj.frame_id),
         signal=signal,
-        value=float(value),
+        value=value,
         agent=agent,
         bus_name=bus_name,
     )
@@ -485,8 +493,7 @@ def send_signal(
         for sig in message_obj.signals:
             if sig.name != sig_name:
                 continue
-            mn = _maybe_float(getattr(sig, "minimum", None))
-            mx = _maybe_float(getattr(sig, "maximum", None))
+            mn, mx = signal_range(sig)
             if mn is not None and mx is not None:
                 return SignalRange(minimum=mn, maximum=mx)
         return None
@@ -517,7 +524,7 @@ def send_signal(
 
     try:
         assert decoder is not None
-        data = encode_tx_message(decoder.database, message_obj, {signal: float(value)})
+        data = encode_tx_message(decoder.database, message_obj, {signal: value})
     except Exception as exc:
         return _audit_and_return(
             ctx,

@@ -381,3 +381,28 @@ def test_get_audit_log_tails_and_filters(qapp, tmp_path: Path) -> None:  # type:
 
     only_a1 = get_audit_log(ctx, count=3, agent="a1")
     assert [e["seq"] for e in only_a1] == [5, 7, 9]
+
+
+def test_signal_metadata_reports_bit_range_and_multiplexing(
+    qapp, tmp_path: Path, edge_dbc_path: Path
+) -> None:  # type: ignore[no-untyped-def]
+    ctx = _make_ctx(tmp_path)
+    ctx.database.add_dbc(edge_dbc_path, ["CAN_1"])
+
+    temp = describe_signal(ctx, "ImdStatus.Temperature")
+    assert temp is not None
+    # Declared [0|0], so the range is what 16 bits at 0.1 / -40 can carry.
+    assert temp["minimum"] == -40.0
+    assert temp["maximum"] == 6513.5
+    assert temp["multiplexer_signal"] == "OpCode"
+    assert temp["multiplexer_ids"] == [128]
+
+    by_name = {s["signal"]: s for s in list_signals(ctx, "ImdCtrl")}
+    selector = by_name["Request_mux"]
+    assert selector["is_multiplexer"] is True
+    assert selector["choices"] == {
+        98: "Excitation_off",
+        193: "Restart",
+        240: "Set_max_voltage",
+    }
+    assert by_name["Set_max_voltage"]["multiplexer_ids"] == [240]

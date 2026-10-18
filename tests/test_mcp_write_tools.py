@@ -377,3 +377,54 @@ def test_send_signal_named_listen_only_bus_is_refused(  # type: ignore[no-untype
         assert _audit_lines(tmp_path)[0]["decision"] == "DENY"
     finally:
         reader.close()
+
+
+# ---------- signals the example DBC lacks ----------
+
+
+def test_send_signal_beyond_what_the_bits_hold_is_out_of_range(
+    qapp, tmp_path: Path, edge_dbc_path: Path
+) -> None:  # type: ignore[no-untyped-def]
+    """A [0|0] range means "none declared"; the bits still bound the value."""
+    ctx, sent = _make_ctx(tmp_path, edge_dbc_path)
+    ctx.read.allowlist.add_rule(AllowRule(id=0, message_id=1601, signal="Temperature"))
+    # 16 bits at 0.1 with offset -40 hold -40 … 6513.5.
+    result = send_signal(ctx, "ImdStatus", "Temperature", 7000.0)
+    assert result["reason"] == "OUT_OF_RANGE"
+    assert sent == []
+
+
+def test_send_signal_sets_the_selector_for_a_multiplexed_signal(
+    qapp, tmp_path: Path, edge_dbc_path: Path
+) -> None:  # type: ignore[no-untyped-def]
+    ctx, sent = _make_ctx(tmp_path, edge_dbc_path)
+    ctx.read.allowlist.add_rule(AllowRule(id=0, message_id=1600, signal="Set_max_voltage"))
+    result = send_signal(ctx, "ImdCtrl", "Set_max_voltage", 800)
+    assert result["ok"] is True
+    assert sent[0].data[0] == 240
+    assert int.from_bytes(sent[0].data[1:3], "little") == 800
+
+
+def test_send_signal_keeps_a_64_bit_int_exact(qapp, tmp_path: Path, edge_dbc_path: Path) -> None:  # type: ignore[no-untyped-def]
+    ctx, sent = _make_ctx(tmp_path, edge_dbc_path)
+    ctx.read.allowlist.add_rule(AllowRule(id=0, message_id=123, signal="LogData"))
+    result = send_signal(ctx, "LogBlob", "LogData", 0x0123456789ABCDEF)
+    assert result["ok"] is True
+    assert bytes(sent[0].data) == bytes.fromhex("efcdab8967452301")
+    # One past the top is refused by the range check, not the encoder.
+    result = send_signal(ctx, "LogBlob", "LogData", 2**64)
+    assert result["reason"] == "OUT_OF_RANGE"
+
+
+def test_send_signal_keeps_a_whole_number_scaled_64_bit_value_exact(
+    qapp, tmp_path: Path, edge_dbc_path: Path
+) -> None:  # type: ignore[no-untyped-def]
+    ctx, sent = _make_ctx(tmp_path, edge_dbc_path)
+    ctx.read.allowlist.add_rule(AllowRule(id=0, message_id=124, signal="Odometer"))
+    # Factor 10, offset -1000: raw 0x0123456789ABCDEF.
+    result = send_signal(ctx, "WideScaled", "Odometer", 0x0123456789ABCDEF * 10 - 1000)
+    assert result["ok"] is True
+    assert bytes(sent[0].data) == bytes.fromhex("efcdab8967452301")
+    # Just past the top: a float bound would round up and let it reach the encoder.
+    result = send_signal(ctx, "WideScaled", "Odometer", 2**64 * 10 - 1000)
+    assert result["reason"] == "OUT_OF_RANGE"

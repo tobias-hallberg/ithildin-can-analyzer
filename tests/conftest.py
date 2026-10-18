@@ -108,3 +108,49 @@ def example_dbc_path(tmp_path: Path) -> Path:
     path = tmp_path / "example.dbc"
     path.write_text(_DBC_SOURCE, encoding="utf-8")
     return path
+
+
+_EDGE_DBC_SOURCE = """\
+VERSION ""
+
+NS_ :
+
+BS_:
+
+BU_:
+
+BO_ 1600 ImdCtrl: 4 Vector__XXX
+ SG_ Request_mux M : 0|8@1+ (1,0) [0|255] "" Vector__XXX
+ SG_ Set_max_voltage m240 : 8|16@1+ (1,0) [0|1000] "V" Vector__XXX
+ SG_ Restart m193 : 8|8@1+ (1,0) [0|255] "" Vector__XXX
+ SG_ Excitation_off m98 : 8|8@1+ (1,0) [0|255] "" Vector__XXX
+
+BO_ 1601 ImdStatus: 8 Vector__XXX
+ SG_ OpCode M : 0|8@1+ (1,0) [0|255] "" Vector__XXX
+ SG_ Temperature m128 : 8|16@1+ (0.1,-40) [0|0] "degC" Vector__XXX
+ SG_ Rp m225 : 8|16@1+ (1,0) [0|65535] "kOhm" Vector__XXX
+ SG_ Rp_uncertainty m225 : 24|8@1+ (1,0) [0|100] "%" Vector__XXX
+ SG_ Rn m225 : 32|16@1+ (1,0) [0|65535] "kOhm" Vector__XXX
+ SG_ Rn_uncertainty m225 : 48|8@1+ (1,0) [0|100] "%" Vector__XXX
+
+BO_ 123 LogBlob: 8 Vector__XXX
+ SG_ LogData : 0|64@1+ (1,0) [0|0] "" Vector__XXX
+
+BO_ 124 WideScaled: 8 Vector__XXX
+ SG_ Odometer : 0|64@1+ (10,-1000) [0|0] "m" Vector__XXX
+
+BO_ 125 WideFractional: 8 Vector__XXX
+ SG_ Energy : 0|64@1+ (0.5,0) [0|0] "Wh" Vector__XXX
+
+VAL_ 1601 OpCode 128 "Temperature reading" ;
+"""
+
+
+@pytest.fixture
+def edge_dbc_path(tmp_path: Path) -> Path:
+    """Shapes the example DBC lacks: multiplexed messages (an IMD-style
+    request/response pair), a signal with no declared range, and 64-bit
+    signals unscaled, with whole-number scaling, and with a fractional factor."""
+    path = tmp_path / "edge.dbc"
+    path.write_text(_EDGE_DBC_SOURCE, encoding="utf-8")
+    return path

@@ -136,13 +136,15 @@ def register_write_tools(mcp: FastMCP, ctx: McpWriteContext) -> None:
     def send_signal(
         message: str,
         signal: str,
-        value: float,
+        value: int | float,
         agent: str = "",
         bus: str | None = None,
     ) -> dict[str, Any]:
         """Encode + send one signal value (DBC-validated, allowlist-gated).
 
-        ``bus`` is required only when more than one bus is open.
+        ``bus`` is required only when more than one bus is open. Pass
+        integers as JSON integers so 64-bit signals keep every bit. Sending
+        a multiplexed signal sets its selector to that signal's branch.
         """
         return tools.send_signal(ctx, message, signal, value, agent=agent, bus=bus)
 

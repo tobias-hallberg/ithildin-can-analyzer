@@ -10,6 +10,7 @@ from unittest.mock import MagicMock
 
 from ithildin.core.transmit import TxMessage, TxSetup
 from ithildin.ui._drag_payload import MessagePayload, SignalPayload
+from ithildin.ui.transmit.controls import TxDropdown
 from ithildin.ui.transmit_window import TransmitWindow
 from ithildin.workspace.schema import BusConfig
 from tests.conftest import make_app_context
@@ -299,6 +300,58 @@ def test_drop_message_with_enum_signal_populates_editor(
     assert len(win._setup.transmits) == 1
     assert win._selected == 0
     assert win._editor_title.text().startswith("GearState")
+
+
+def test_mux_selector_dropdown_shows_only_the_selected_branch(
+    qapp, qtbot, tmp_path: Path, edge_dbc_path: Path
+) -> None:  # type: ignore[no-untyped-def]
+    ctx = make_app_context(tmp_path)
+    ctx.project.workspace.bus = [
+        BusConfig(name="CAN_1", interface="virtual", channel="ch0", bitrate=500000)
+    ]
+    ctx.database.add_dbc(edge_dbc_path, ["CAN_1"])
+    win = TransmitWindow(instance_id="tx1")
+    qtbot.addWidget(win)
+    win.bind(ctx)
+    win._scheduler.apply = MagicMock()  # type: ignore[union-attr]
+
+    win._on_payload_dropped(MessagePayload(message="ImdCtrl", message_id=1600))
+    selector = win._signal_widgets["Request_mux"]
+    assert isinstance(selector, TxDropdown)
+    assert selector.value == 98
+    rows = win._signal_rows
+    assert not rows["Excitation_off"].isHidden()
+    assert rows["Set_max_voltage"].isHidden()
+    assert rows["Restart"].isHidden()
+
+    selector.set_value(240)
+    assert win._setup.transmits[0].signal_values["Request_mux"] == 240
+    assert not rows["Set_max_voltage"].isHidden()
+    assert rows["Excitation_off"].isHidden()
+
+
+def test_list_summary_shows_raw_hex_for_wide_signals(
+    qapp, qtbot, tmp_path: Path, edge_dbc_path: Path
+) -> None:  # type: ignore[no-untyped-def]
+    """Regression: the list summary showed 64-bit values in decimal, unlike the editor's grid."""
+    ctx = make_app_context(tmp_path)
+    ctx.project.workspace.bus = [
+        BusConfig(name="CAN_1", interface="virtual", channel="ch0", bitrate=500000)
+    ]
+    ctx.database.add_dbc(edge_dbc_path, ["CAN_1"])
+    win = TransmitWindow(instance_id="tx1")
+    qtbot.addWidget(win)
+    win.bind(ctx)
+    win._scheduler.apply = MagicMock()  # type: ignore[union-attr]
+
+    win._on_payload_dropped(MessagePayload(message="WideScaled", message_id=124))
+    grid = win._signal_widgets["Odometer"]
+    grid.set_value(0x0123456789ABCDEF)
+    grid._cells[7].editingFinished.emit()
+    tx = win._setup.transmits[0]
+    # Factor 10, offset -1000: the stored value is the exact physical int.
+    assert tx.signal_values["Odometer"] == 0x0123456789ABCDEF * 10 - 1000
+    assert win._list_delegate._summary_for(tx) == "Odometer:0x0123456789ABCDEF"
 
 
 def test_drop_unbound_message_is_rejected(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]

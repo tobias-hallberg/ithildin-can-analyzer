@@ -44,8 +44,9 @@ from ithildin.core.transmit import (
     TxMessage,
     TxScheduler,
     TxSetup,
-    TxSignalKind,
+    TxSignalSpec,
     build_signal_spec,
+    inactive_signals,
     resolve_kind,
 )
 from ithildin.ui._child_base import ChildView
@@ -87,6 +88,10 @@ class TransmitWindow(ChildView):
         self._setup = TxSetup()
         self._selected: int = -1
         self._signal_widgets: dict[str, QWidget] = {}
+        self._signal_rows: dict[str, QWidget] = {}
+        # The editor's message, kept so a selector change can re-filter rows.
+        self._editor_message: Any = None
+        self._selector_names: set[str] = set()
         # Block re-entrancy while we programmatically populate signal
         # widgets — value-changed signals fire while restoring and would
         # otherwise stomp the values we just loaded.
@@ -305,6 +310,7 @@ class TransmitWindow(ChildView):
         # event filter rather than subclassing QListView.
         self._list_view.installEventFilter(self)
         self._list_delegate = TxListDelegate(self._list_view)
+        self._list_delegate.set_value_formatter(self._summary_value)
         self._list_view.setItemDelegate(self._list_delegate)
         self._list_delegate.active_toggled.connect(self._on_delegate_toggle)
         self._list_view.selectionModel().currentChanged.connect(self._on_row_changed)
@@ -412,6 +418,8 @@ class TransmitWindow(ChildView):
         for tx in self._setup.transmits:
             item = QStandardItem()
             item.setData(tx, TX_ROW_ROLE)
+            # The delegate elides long names to keep clear of the badge.
+            item.setToolTip(f"{tx.message_name}  0x{tx.message_id:X}  ·  {tx.bus_name}")
             item.setEditable(False)
             self._list_model.appendRow(item)
         self._count_in_header.setText(str(len(self._setup.transmits)))
@@ -426,6 +434,9 @@ class TransmitWindow(ChildView):
             if w is not None:
                 w.setParent(None)
         self._signal_widgets.clear()
+        self._signal_rows.clear()
+        self._editor_message = None
+        self._selector_names = set()
 
         if not (0 <= self._selected < len(self._setup.transmits)):
             # Empty state: hide every header widget (rather than leave them
@@ -487,17 +498,19 @@ class TransmitWindow(ChildView):
             self._payload_preview.clear()
             return
 
+        self._editor_message = msg
+        self._selector_names = {sig.name for sig in msg.signals if sig.is_multiplexer}
         self._suspend_signal_capture = True
         try:
             for sig in msg.signals:
-                kind = resolve_kind(tx, sig)
-                spec = build_signal_spec(
-                    sig, kind=kind, current_value=tx.signal_values.get(sig.name)
-                )
+                kind = resolve_kind(tx, sig, msg)
+                spec = build_signal_spec(sig, msg, kind=kind, values=tx.signal_values)
                 row = self._build_signal_row(spec, tx)
+                self._signal_rows[spec.name] = row
                 self._editor_layout.insertWidget(self._editor_layout.count() - 1, row)
         finally:
             self._suspend_signal_capture = False
+        self._refresh_branch_rows(tx)
 
         # Live payload preview reflecting current overrides.
         self._payload_preview.update_for(tx)
@@ -530,11 +543,35 @@ class TransmitWindow(ChildView):
         self._signal_widgets[spec.name] = control
         rl.addWidget(control, 1)
 
-        kind_label = QLabel(_KIND_BADGE.get(spec.kind, spec.kind), row)
+        kind_label = QLabel(_type_badge(spec), row)
         kind_label.setObjectName("TxKindBadge")
         kind_label.setFont(tabular_font())
         rl.addWidget(kind_label)
         return row
+
+    def _summary_value(self, tx: TxMessage, name: str, value: object) -> str | None:
+        """List-summary text for hex-kind values: the raw bits, as the editor's grid shows them."""
+        decoder = self._ctx.database.decoder_for_bus(tx.bus_name) if self._ctx else None
+        if decoder is None or not isinstance(value, int):
+            return None
+        try:
+            msg = decoder.database.get_message_by_frame_id(tx.message_id)
+            sig = msg.get_signal_by_name(name)
+        except KeyError:
+            return None
+        if resolve_kind(tx, sig, msg) != "hex":
+            return None
+        raw = (value - int(sig.offset)) // int(sig.scale)
+        length = int(sig.length)
+        return f"0x{raw & ((1 << length) - 1):0{(length + 7) // 8 * 2}X}"
+
+    def _refresh_branch_rows(self, tx: TxMessage) -> None:
+        """Show only the rows the current multiplexer selection will send."""
+        if not self._selector_names:
+            return
+        inactive = inactive_signals(self._editor_message, tx.signal_values)
+        for name, row in self._signal_rows.items():
+            row.setVisible(name not in inactive)
 
     def _on_signal_changed(self, signal_name: str, value: Any) -> None:
         if self._suspend_signal_capture:
@@ -543,6 +580,8 @@ class TransmitWindow(ChildView):
             return
         tx = self._setup.transmits[self._selected]
         tx.signal_values[signal_name] = value
+        if signal_name in self._selector_names:
+            self._refresh_branch_rows(tx)
         self._payload_preview.update_for(tx)
         # Debounce: re-encoding every active periodic TX is cheap but not
         # free, and a slider drag fires hundreds of value_changed events
@@ -853,13 +892,14 @@ class TransmitWindow(ChildView):
         QTimer.singleShot(_ERROR_TOAST_MS, self._refresh_status_bar)
 
 
-_KIND_BADGE: dict[TxSignalKind, str] = {
-    "bool": "bool",
-    "enum-seg": "enum",
-    "enum-dd": "enum",
-    "num-sm": "u8",
-    "num-lg": "u16",
-    "signed": "i16",
-    "hex": "raw",
-    "auto": "auto",
-}
+def _type_badge(spec: TxSignalSpec) -> str:
+    """Row tag: the control family, or for numbers the signal's real encoding."""
+    if spec.kind == "bool":
+        return "bool"
+    if spec.kind in ("enum-seg", "enum-dd"):
+        return "enum"
+    if spec.kind == "auto":
+        return "auto"
+    if spec.is_float:
+        return f"f{spec.length_bits}"
+    return f"{'i' if spec.is_signed else 'u'}{spec.length_bits}"

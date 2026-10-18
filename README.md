@@ -59,7 +59,11 @@ What works today:
   the bus from a file via `ReplayController` (linear playback only —
   pause and scrub land in v0.2).
 - **Transmit** — one-shot and periodic sends behind a master switch,
-  with per-signal controls matched to the signal type.
+  with per-signal controls matched to the signal type. Multiplexed
+  messages get a dropdown of their selector IDs and show only the
+  selected branch. Integer signals wider than 53 bits are edited as hex
+  bytes and sent exactly; with a fractional factor they are still
+  limited to float precision.
 - **MCP server** — bearer-token-gated, loopback-only streamable-HTTP
   transport with ten read tools (bus, DBC, and traffic introspection) and
   two write tools (`send_signal`, `send_frame`) routed through a
@@ -171,8 +175,9 @@ Read tools are always available. **Write tools reach the bus and are
 default-deny** — a send with no matching allowlist rule is rejected.
 
 Add rules in the same MCP dialog. **Add rule…** picks the message and
-signal from your loaded DBCs and shows the signal's unit and DBC range as
-you choose, so you can see what you're authorising; a raw CAN ID like
+signal from your loaded DBCs and shows the signal's unit and range as
+you choose (the DBC's range, narrowed to what the signal's bits can
+hold), so you can see what you're authorising; a raw CAN ID like
 `0x301` is still accepted for traffic with no DBC. Leave the rate limit at
 `unlimited` or dial in a ceiling in Hz. Then watch the audit feed at the
 bottom of the dialog as the agent works.
@@ -183,13 +188,13 @@ bottom of the dialog as the agent works.
 | `get_bus_stats` | Open state and per-bus frame totals |
 | `list_dbcs` | Loaded DBC files, their bus bindings, and counts |
 | `list_messages` | Every message in the loaded DBCs — **start here** |
-| `list_signals` | Full signal metadata for one message, value tables included |
+| `list_signals` | Full signal metadata for one message, value tables and multiplexer IDs included |
 | `describe_signal` | Metadata for a single `Message.Signal` |
 | `get_recent_messages` | Recent decoded frames; filter by ID, bus, or timestamp |
 | `get_signal_value` | Latest observed value of one signal |
 | `list_allowlist` | The rules currently authorising sends |
 | `get_audit_log` | Recent send decisions — why a send was allowed or denied |
-| `send_signal` | Encode + send one signal value (allowlist-gated) |
+| `send_signal` | Encode + send one signal value (allowlist-gated); a multiplexed signal sets its selector |
 | `send_frame` | Send a raw frame by ID + hex payload (needs a wildcard rule) |
 
 Both write tools take an optional `bus` argument, required only when more
