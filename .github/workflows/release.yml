@@ -40,13 +40,18 @@ jobs:
       - name: Run PyInstaller
         run: uv run pyinstaller packaging/ithildin.spec --noconfirm
 
+      # Pinned so a runner image that moves to Inno Setup 7 can't change
+      # the install path or compiler under us; --allow-downgrade makes the
+      # pin hold even then.
       - name: Install Inno Setup
-        run: choco install innosetup --no-progress --yes
+        run: choco install innosetup --version 6.7.1 --allow-downgrade --no-progress --yes
 
       - name: Build installer
         shell: pwsh
         run: |
-          $iscc = "$env:ProgramFiles(x86)\Inno Setup 6\ISCC.exe"
+          # Braces required: in a string, "$env:ProgramFiles(x86)" expands
+          # $env:ProgramFiles and appends a literal "(x86)".
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
           & "$iscc" "/DAppVersion=${{ steps.ver.outputs.version }}" packaging\windows\installer.iss
 
       - uses: actions/upload-artifact@v4
