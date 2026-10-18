@@ -1,0 +1,115 @@
+name: release
+
+# Builds Windows .exe installer and Linux AppImage. Publishes them to
+# a GitHub Release on tag push (v*). `workflow_dispatch` runs the build
+# jobs only, without releasing — for smoke-testing the pipeline.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write  # needed by softprops/action-gh-release
+
+jobs:
+  windows:
+    name: Build Windows installer
+    runs-on: windows-latest
+    # Shipped binaries bundle the CANtact backend, and upstream ships no
+    # cantact wheel past cp312, so the release builds stay on 3.12.
+    env:
+      UV_PYTHON: "3.12"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version from pyproject.toml
+        id: ver
+        shell: pwsh
+        run: |
+          $v = (Select-String -Path pyproject.toml -Pattern '^version = "(.*)"').Matches[0].Groups[1].Value
+          "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - uses: astral-sh/setup-uv@v3
+
+      - name: Sync dependencies (runtime + packaging)
+        run: uv sync --group packaging --extra cantact
+
+      - name: Run PyInstaller
+        run: uv run pyinstaller packaging/ithildin.spec --noconfirm
+
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress --yes
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $iscc = "$env:ProgramFiles(x86)\Inno Setup 6\ISCC.exe"
+          & "$iscc" "/DAppVersion=${{ steps.ver.outputs.version }}" packaging\windows\installer.iss
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ithildin-windows-installer
+          path: dist/installer/Ithildin-*-Setup.exe
+          if-no-files-found: error
+
+  linux:
+    name: Build Linux AppImage
+    runs-on: ubuntu-22.04
+    # Shipped binaries bundle the CANtact backend, and upstream ships no
+    # cantact wheel past cp312, so the release builds stay on 3.12.
+    env:
+      UV_PYTHON: "3.12"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libfuse2 libegl1 libxkbcommon0 libxcb-cursor0
+
+      - uses: astral-sh/setup-uv@v3
+
+      - name: Sync dependencies (runtime + packaging)
+        run: uv sync --group packaging --extra cantact
+
+      - name: Run PyInstaller
+        run: uv run pyinstaller packaging/ithildin.spec --noconfirm
+
+      - name: Fetch appimagetool
+        run: |
+          curl -fsSL -o /tmp/appimagetool \
+            https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x /tmp/appimagetool
+
+      - name: Build AppImage
+        env:
+          APPIMAGETOOL: /tmp/appimagetool
+        run: bash packaging/linux/build-appimage.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ithildin-linux-appimage
+          path: dist/Ithildin-*-x86_64.AppImage
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: [windows, linux]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            artifacts/ithildin-windows-installer/*.exe
+            artifacts/ithildin-linux-appimage/*.AppImage

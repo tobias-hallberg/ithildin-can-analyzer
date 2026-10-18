@@ -1,0 +1,46 @@
+name: Bug report
+description: Something isn't working as expected
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug. For **security** issues please do not use
+        this form — see [SECURITY.md](../../blob/main/SECURITY.md).
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, and what happened instead?
+      placeholder: Steps to reproduce, expected vs. actual behaviour.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: ithildin version
+      description: Installer version, or the git commit if running from source.
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Windows
+        - Linux
+        - Other (note in the description)
+    validations:
+      required: true
+  - type: input
+    id: backend
+    attributes:
+      label: CAN adapter / backend
+      description: e.g. PEAK PCAN-USB (pcan), Kvaser Leaf, virtual. Include the vendor driver version.
+      placeholder: pcan — PCAN-USB FD, driver 4.x
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / DBC
+      description: Relevant log output, the Report dock message, and a minimal DBC excerpt if decode is involved.
+      render: text

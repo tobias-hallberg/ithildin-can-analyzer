@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Ithildin
+GenericName=CAN Bus Analyser
+Comment=Open-source CAN bus analyser with a built-in MCP server
+Exec=ithildin %f
+Icon=ithildin
+Terminal=false
+Categories=Development;Engineering;Electronics;
+MimeType=application/x-ithildin-project;
+StartupWMClass=Ithildin

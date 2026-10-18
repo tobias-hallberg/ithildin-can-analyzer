@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# uv
+.venv/
+
+# Build
+build/
+dist/
+
+# IDE / AI-assistant config
+.vscode/
+.idea/
+*.swp
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db
+tmp/*
+
+# Runtime
+*.log
+mcp_audit*.log
+.coverage
+htmlcov/
+
+# Scratch project files at the repo root (the demo lives in examples/)
+/*.itp
+
+# Captured CAN data — keep fixtures + examples
+*.blf
+*.asc
+*.mf4
+!tests/fixtures/*.blf
+!tests/fixtures/*.asc
+!tests/fixtures/*.mf4
+!examples/*.blf
+!examples/*.asc
+!examples/*.mf4

@@ -1,0 +1,15 @@
+schema_version = 2
+name = "Demo workspace (virtual bus)"
+
+[[bus]]
+name = "CAN_1"
+interface = "virtual"
+channel = "demo"
+bitrate = 500000
+fd = false
+
+[mcp]
+enabled = false
+host = "127.0.0.1"
+port = 7320
+dry_run = false

@@ -1,0 +1,112 @@
+VERSION ""
+
+
+NS_ : 
+	NS_DESC_
+	CM_
+	BA_DEF_
+	BA_
+	VAL_
+	CAT_DEF_
+	CAT_
+	FILTER
+	BA_DEF_DEF_
+	EV_DATA_
+	ENVVAR_DATA_
+	SGTYPE_
+	SGTYPE_VAL_
+	BA_DEF_SGTYPE_
+	BA_SGTYPE_
+	SIG_TYPE_REF_
+	VAL_TABLE_
+	SIG_GROUP_
+	SIG_VALTYPE_
+	SIGTYPE_VALTYPE_
+	BO_TX_BU_
+	BA_DEF_REL_
+	BA_REL_
+	BA_DEF_DEF_REL_
+	BU_SG_REL_
+	BU_EV_REL_
+	BU_BO_REL_
+	SG_MUL_VAL_
+
+BS_:
+
+BU_: BCU JSC MCU BMS VCU
+
+
+VAL_TABLE_ K_LOCK_KEY_ERROR 3 "DEF_KMAN_KEY_NOT_PRESENT" 2 "DEF_KMAN_KEY_ERROR_WRONG_KEY" 1 "DEF_KMAN_KEY_ERROR_ENCRYPTION" 0 "DEF_KMAN_KEY_ERROR_NO_ERROR" ;
+VAL_TABLE_ K_LOCK_KEY_IDENTIFICATION 3 "DEF_CN_KEY_ID_NOT_RECOGNIZED" 2 "DEF_CN_KEY_ID_RECOGNIZED" 1 "DEF_CN_KEY_ID_RECOGNIZING" 0 " DEF_CN_KEY_ID_NOT_DEFINED" ;
+VAL_TABLE_ OpCode_mux 229 "'error flags'" 228 "'battery voltage'" 227 "'voltages Vp and Vn'" 226 "'isolation capacitances'" 225 "'isolation resistances'" 224 "'isolation state'" 11 "'Serial number 3'" 10 "'Serial number 2'" 9 "'Serial number 1'" 8 "'Serial number 0'" 7 "'Version 2'" 6 "'Version 1'" 5 "'Version 0'" 4 " 'Part name 3'" 3 "'Part name 2'" 2 "'Part name 1'" 1 "'Part name 0'" ;
+VAL_TABLE_ SIM100_Request_mux 229 "Request 'error flags'" 228 "Request 'battery voltage'" 227 "Request 'voltages Vp and Vn'" 226 "Request 'isolation capacitances'" 225 "Request 'isolation resistances'" 224 "Request 'isolation state'" 11 "Request 'Serial number 3'" 10 "Request 'Serial number 2'" 9 "Request 'Serial number 1'" 8 "Request 'Serial number 0'" 7 "Request 'Version 2'" 6 "Request 'Version 1'" 5 "Request 'Version 0'" 4 "Request 'Part name 3'" 3 "Request 'Part name 2'" 2 "Request 'Part name 1'" 1 "Request 'Part name 0'" 240 "Set max battery design voltage" 193 "Restart SIM100 " 98 "Turn excitation pulse off" ;
+VAL_TABLE_ Restart_SIM100 19088743 "Signal to restart SIM100" ;
+VAL_TABLE_ Excitation_signal_off -559038945 "Turn off excitation pulse" ;
+
+
+
+BO_ 280 JSC_Status1: 1 JSC
+ SG_ JSC_Left : 0|1@1+ (1,0) [0|1] "bool" Vector__XXX
+ SG_ JSC_Right : 1|1@1+ (1,0) [0|1] "bool" Vector__XXX
+ SG_ JSC_Down : 2|1@1+ (1,0) [0|1] "bool" Vector__XXX
+ SG_ JSC_Up : 3|1@1+ (1,0) [0|1] "bool" Vector__XXX
+ SG_ JSC_Center : 4|1@1+ (1,0) [0|1] "bool" Vector__XXX
+ SG_ JSC_Counter : 5|3@1+ (1,0) [0|1] "uint" Vector__XXX
+
+BO_ 512 Motor_Status: 8 MCU
+ SG_ MotorRPM : 0|16@1- (1,0) [-20000|20000] "rpm" Vector__XXX
+ SG_ MotorTorque : 16|16@1- (0.1,0) [-500|500] "Nm" Vector__XXX
+ SG_ MotorTemp : 32|8@1+ (1,-40) [-40|215] "degC" Vector__XXX
+ SG_ InverterTemp : 40|8@1+ (1,-40) [-40|215] "degC" Vector__XXX
+ SG_ MotorState : 48|3@1+ (1,0) [0|7] "" Vector__XXX
+ SG_ InverterReady : 51|1@1+ (1,0) [0|1] "bool" Vector__XXX
+ SG_ DerateActive : 52|1@1+ (1,0) [0|1] "bool" Vector__XXX
+
+BO_ 513 Battery_Status: 8 BMS
+ SG_ PackVoltage : 0|16@1+ (0.1,0) [0|1000] "V" Vector__XXX
+ SG_ PackCurrent : 16|16@1- (0.1,0) [-1500|1500] "A" Vector__XXX
+ SG_ SoC : 32|8@1+ (0.5,0) [0|100] "%" Vector__XXX
+ SG_ SoH : 40|8@1+ (0.5,0) [0|100] "%" Vector__XXX
+ SG_ PackTemp : 48|8@1- (1,0) [-40|85] "degC" Vector__XXX
+ SG_ BmsState : 56|4@1+ (1,0) [0|15] "" Vector__XXX
+ SG_ ContactorClosed : 60|1@1+ (1,0) [0|1] "bool" Vector__XXX
+
+BO_ 514 Vehicle_Control: 8 VCU
+ SG_ VehicleSpeed : 0|16@1+ (0.01,0) [0|400] "km/h" Vector__XXX
+ SG_ AccelPedal : 16|8@1+ (0.5,0) [0|100] "%" Vector__XXX
+ SG_ BrakePedal : 24|8@1+ (0.5,0) [0|100] "%" Vector__XXX
+ SG_ SteeringAngle : 32|16@1- (0.1,0) [-720|720] "deg" Vector__XXX
+ SG_ GearPosition : 48|3@1+ (1,0) [0|7] "" Vector__XXX
+ SG_ DriveMode : 51|3@1+ (1,0) [0|7] "" Vector__XXX
+ SG_ HVKeyState : 54|2@1+ (1,0) [0|3] "" Vector__XXX
+
+
+
+BA_DEF_ BO_  "MsgType" ENUM  "Periodic","Event","PeriodicAndEvent";
+BA_DEF_ BO_  "MsgPeriod" INT 0 10000;
+BA_DEF_ BO_  "MsgDelay" INT 0 10000;
+BA_DEF_ BO_  "GenMsgBackgroundColor" STRING ;
+BA_DEF_ BO_  "GenMsgForegroundColor" STRING ;
+BA_DEF_ BO_  "matchingcriteria" INT 0 0;
+BA_DEF_ BO_  "filterlabeling" INT 0 0;
+BA_DEF_DEF_  "MsgType" "Periodic";
+BA_DEF_DEF_  "MsgPeriod" 100;
+BA_DEF_DEF_  "MsgDelay" 20;
+BA_DEF_DEF_  "GenMsgBackgroundColor" "#ffffff";
+BA_DEF_DEF_  "GenMsgForegroundColor" "#000000";
+BA_DEF_DEF_  "matchingcriteria" 0;
+BA_DEF_DEF_  "filterlabeling" 0;
+BA_ "MsgPeriod" BO_ 280 40;
+BA_ "MsgType" BO_ 280 0;
+BA_ "MsgPeriod" BO_ 512 10;
+BA_ "MsgType" BO_ 512 0;
+BA_ "MsgPeriod" BO_ 513 100;
+BA_ "MsgType" BO_ 513 0;
+BA_ "MsgPeriod" BO_ 514 20;
+BA_ "MsgType" BO_ 514 0;
+VAL_ 512 MotorState 0 "Off" 1 "Standby" 2 "Drive" 3 "Regen" 4 "Coast" 7 "Fault_extra_extra_long" ;
+VAL_ 513 BmsState 0 "Init" 1 "Idle" 2 "Precharge" 3 "Drive" 4 "Charge" 5 "Balance" 6 "Sleep" 15 "Fault" ;
+VAL_ 514 GearPosition 0 "P" 1 "R" 2 "N" 3 "D" 4 "S" ;
+VAL_ 514 DriveMode 0 "Eco" 1 "Normal" 2 "Sport" 3 "Snow" 4 "Track" ;
+VAL_ 514 HVKeyState 0 "Off" 1 "Acc" 2 "On" 3 "Crank" ;
+

@@ -1,0 +1,401 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Tobias Hallberg
+"""Tests for ``ui.signal_plot.SignalPlotWindow``."""
+
+from __future__ import annotations
+
+import uuid
+from pathlib import Path
+
+import can
+
+from ithildin.app_state.project import Project
+from ithildin.core.types import FrameRecord
+from ithildin.ui.signal_plot import (
+    SignalPlotWindow,
+    _maxlen_for_window,
+    _parse_window_text,
+)
+from ithildin.workspace.schema import BusConfig, PreferencesConfig, Workspace
+from tests.conftest import make_app_context
+
+
+def test_add_and_remove_signal_curve(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    win = SignalPlotWindow(instance_id="p1")
+    qtbot.addWidget(win)
+    win.bind(make_app_context(tmp_path))
+
+    win.add_signal("EngineCommand.EngineSpeed")
+    assert "EngineCommand.EngineSpeed" in win.signal_paths()
+    # Curve list switches from "empty hint" to "list" when a curve is added.
+    assert win._curve_list._stack.currentWidget() is win._curve_list._scroll
+
+    win.remove_signal("EngineCommand.EngineSpeed")
+    assert win.signal_paths() == []
+    assert win._curve_list._stack.currentWidget() is win._curve_list._empty_hint
+
+
+def test_drop_payload_triggers_add(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    from ithildin.ui._drag_payload import SignalPayload
+
+    win = SignalPlotWindow(instance_id="p1")
+    qtbot.addWidget(win)
+    win.bind(make_app_context(tmp_path))
+
+    win._drop.payload_dropped.emit(
+        SignalPayload(message="BodyStatus", message_id=0x200, signal="VehicleSpeed")
+    )
+    assert win.signal_paths() == ["BodyStatus.VehicleSpeed"]
+
+
+def test_drop_multiple_signals_adds_all_curves(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    """A multi-select MIME packet adds one curve per packed payload."""
+    from PySide6.QtCore import QPoint, Qt
+    from PySide6.QtGui import QDropEvent
+
+    from ithildin.ui._drag_payload import SignalPayload, pack_into_mime
+
+    win = SignalPlotWindow(instance_id="p1")
+    qtbot.addWidget(win)
+    win.bind(make_app_context(tmp_path))
+
+    mime = pack_into_mime(
+        [
+            SignalPayload(message="BodyStatus", message_id=0x200, signal="VehicleSpeed"),
+            SignalPayload(message="EngineCommand", message_id=0x100, signal="EngineSpeed"),
+        ]
+    )
+    event = QDropEvent(
+        QPoint(10, 10),
+        Qt.DropAction.CopyAction,
+        mime,
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    win._drop.dropEvent(event)
+
+    assert sorted(win.signal_paths()) == [
+        "BodyStatus.VehicleSpeed",
+        "EngineCommand.EngineSpeed",
+    ]
+
+
+def test_filter_then_decode_updates_curve(
+    qapp, qtbot, tmp_path: Path, example_dbc_path: Path
+) -> None:  # type: ignore[no-untyped-def]
+    """End-to-end: open virtual bus, send frames, plot updates EngineSpeed curve."""
+    channel = f"plot-{uuid.uuid4().hex[:8]}"
+    cfg = BusConfig(name="CAN_1", interface="virtual", channel=channel, bitrate=500000)
+
+    ctx = make_app_context(tmp_path)
+    ctx.database.add_dbc(example_dbc_path, ["CAN_1"])
+
+    win = SignalPlotWindow(instance_id="p1")
+    qtbot.addWidget(win)
+    win.bind(ctx)
+    win.add_signal("EngineCommand.EngineSpeed")
+
+    with qtbot.waitSignal(ctx.bus_reader.bus_started, timeout=2000):
+        ctx.bus_reader.open(cfg)
+
+    # EngineSpeed scale is 0.125; raw 6400 = 800 rpm.
+    sender = can.Bus(interface="virtual", channel=channel)
+    try:
+        for raw in (6400, 6800, 7200):
+            payload = raw.to_bytes(2, "little") + (700).to_bytes(2, "little") + bytes(4)
+            sender.send(can.Message(arbitration_id=0x100, data=payload, is_extended_id=False))
+    finally:
+        sender.shutdown()
+
+    curve = win._curves["EngineCommand.EngineSpeed"]
+    qtbot.waitUntil(lambda: len(curve.values) >= 3, timeout=3000)
+    assert list(curve.values)[:3] == [800.0, 850.0, 900.0]
+    ctx.bus_reader.close()
+
+
+def test_add_message_works_pre_capture(  # type: ignore[no-untyped-def]
+    qapp, qtbot, tmp_path: Path, example_dbc_path: Path
+) -> None:
+    """Dropping a message onto a Plot before any bus is open must add curves.
+
+    Regression: the old guard rejected ``add_message`` whenever
+    ``bus_reader.bus_name is None``, which is precisely the launch-time
+    state. ``Database.decoder_for_message`` now resolves the message
+    through any loaded DBC.
+    """
+    ctx = make_app_context(tmp_path)
+    ctx.database.add_dbc(example_dbc_path, ["CAN_1"])  # no bus opened
+
+    win = SignalPlotWindow(instance_id="p1")
+    qtbot.addWidget(win)
+    win.bind(ctx)
+
+    assert ctx.bus_reader.bus_name is None
+    win.add_message("EngineCommand")
+
+    assert sorted(win.signal_paths()) == [
+        "EngineCommand.EngineSpeed",
+        "EngineCommand.IdleSetpoint",
+    ]
+
+
+def test_save_and_restore_state(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    """save_state then restore_state on a fresh window re-creates the curve list."""
+    ctx = make_app_context(tmp_path)
+    src = SignalPlotWindow(instance_id="p1")
+    qtbot.addWidget(src)
+    src.bind(ctx)
+    src.add_signal("BodyStatus.VehicleSpeed")
+    src.add_signal("EngineCommand.EngineSpeed")
+    snap = src.save_state()
+    assert snap["signals"] == [
+        "BodyStatus.VehicleSpeed",
+        "EngineCommand.EngineSpeed",
+    ]
+    # No curve is hidden by default → no hidden_signals key in the
+    # saved state.
+    assert "hidden_signals" not in snap
+    # Left pane is visible by default.
+    assert snap["left_pane_visible"] is True
+
+    dst = SignalPlotWindow(instance_id="p2")
+    qtbot.addWidget(dst)
+    dst.bind(ctx)
+    dst.restore_state(snap)
+    assert sorted(dst.signal_paths()) == [
+        "BodyStatus.VehicleSpeed",
+        "EngineCommand.EngineSpeed",
+    ]
+
+
+def test_merge_axes_enabled_only_for_same_unit(  # type: ignore[no-untyped-def]
+    qapp, qtbot, tmp_path: Path, example_dbc_path: Path
+) -> None:
+    """Merge is allowed only when every visible curve shares a type, and
+    collapsing folds the per-curve axis columns into one."""
+    ctx = make_app_context(tmp_path)
+    ctx.database.add_dbc(example_dbc_path, ["CAN_1"])
+    win = SignalPlotWindow(instance_id="p1")
+    qtbot.addWidget(win)
+    win.bind(ctx)
+    plot = win._plot
+
+    # Two rpm signals → mergeable; two axis columns until merged.
+    win.add_signal("EngineCommand.EngineSpeed")
+    win.add_signal("EngineCommand.IdleSetpoint")
+    assert plot._merge_enabled() is True
+    assert len(plot._axis_column_widths()) == 2
+
+    plot.set_y_merged(True)
+    assert plot.is_y_merged() is True
+    assert len(plot._axis_column_widths()) == 1
+
+    # Adding a km/h signal breaks the shared type → merge auto-resets.
+    win.add_signal("BodyStatus.VehicleSpeed")
+    assert plot._merge_enabled() is False
+    assert plot.is_y_merged() is False
+    assert len(plot._axis_column_widths()) == 3
+
+
+def test_merge_survives_same_type_add(qapp, qtbot) -> None:  # type: ignore[no-untyped-def]
+    """A same-type signal added while merged keeps the axes joined; a
+    different-type one only suspends the join until it's removed."""
+    from PySide6.QtGui import QColor
+
+    from ithildin.ui._gl_plot import GLPlotWidget
+
+    plot = GLPlotWidget()
+    qtbot.addWidget(plot)
+    for path in ("a", "b"):
+        plot.add_curve(path, QColor("white"))
+        plot.set_curve_unit(path, "rpm")
+    plot.set_y_merged(True)
+    assert plot.is_y_merged() is True
+
+    # Mimic add_signal's order: the curve appears with an empty unit,
+    # then the unit is set a moment later. The merge must not be dropped.
+    plot.add_curve("c", QColor("white"))
+    plot.set_curve_unit("c", "rpm")
+    assert plot.is_y_merged() is True
+    assert len(plot._axis_column_widths()) == 1
+
+    # A different unit suspends the join (intent preserved)...
+    plot.add_curve("d", QColor("white"))
+    plot.set_curve_unit("d", "km/h")
+    assert plot.is_y_merged() is False
+    assert plot.is_merge_requested() is True
+
+    # ...and removing it rejoins automatically.
+    plot.remove_curve("d")
+    assert plot.is_y_merged() is True
+
+
+def test_merged_state_persists(  # type: ignore[no-untyped-def]
+    qapp, qtbot, tmp_path: Path, example_dbc_path: Path
+) -> None:
+    """A merged sub-plot round-trips through save/restore."""
+    ctx = make_app_context(tmp_path)
+    ctx.database.add_dbc(example_dbc_path, ["CAN_1"])
+    src = SignalPlotWindow(instance_id="p1")
+    qtbot.addWidget(src)
+    src.bind(ctx)
+    src.add_signal("EngineCommand.EngineSpeed")
+    src.add_signal("EngineCommand.IdleSetpoint")
+    src._plot.set_y_merged(True)
+
+    snap = src.save_state()
+    dst = SignalPlotWindow(instance_id="p2")
+    qtbot.addWidget(dst)
+    dst.bind(ctx)
+    dst.restore_state(snap)
+    assert dst._plot.is_y_merged() is True
+
+
+def test_save_and_restore_visibility(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    """Hiding a curve survives save → restore."""
+    ctx = make_app_context(tmp_path)
+    src = SignalPlotWindow(instance_id="p1")
+    qtbot.addWidget(src)
+    src.bind(ctx)
+    src.add_signal("BodyStatus.VehicleSpeed")
+    src.add_signal("EngineCommand.EngineSpeed")
+    # Hide one via the same path the eye click takes.
+    src._on_visibility_toggled("BodyStatus.VehicleSpeed", False)
+    snap = src.save_state()
+    assert snap["hidden_signals"] == ["BodyStatus.VehicleSpeed"]
+
+    dst = SignalPlotWindow(instance_id="p2")
+    qtbot.addWidget(dst)
+    dst.bind(ctx)
+    dst.restore_state(snap)
+    assert dst._curves["BodyStatus.VehicleSpeed"].visible is False
+    assert dst._curves["EngineCommand.EngineSpeed"].visible is True
+
+
+def test_unrelated_message_is_filtered_out(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    """If a frame's message is not a curve's parent, no decode happens."""
+    ctx = make_app_context(tmp_path)
+    win = SignalPlotWindow(instance_id="p1")
+    qtbot.addWidget(win)
+    win.bind(ctx)
+    win.add_signal("EngineCommand.EngineSpeed")
+
+    # No DBC loaded; a frame for any ID should not cause a decode attempt.
+    f = FrameRecord(bus_name="CAN_1", timestamp=0.0, arbitration_id=0x999, data=b"")
+    win._on_frames_received([f])  # must not raise
+    assert len(win._curves["EngineCommand.EngineSpeed"].values) == 0
+
+
+def test_window_seconds_default_is_twelve(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    win = SignalPlotWindow(instance_id="p1")
+    qtbot.addWidget(win)
+    win.bind(make_app_context(tmp_path))
+    assert win._window_seconds == 12.0
+    assert win._window_seconds_user_set is False
+
+
+def test_project_default_window_applied_on_bind(  # type: ignore[no-untyped-def]
+    qapp, qtbot, tmp_path: Path
+) -> None:
+    """A non-default project preference should propagate to new plots."""
+    project = Project(
+        path=None,
+        workspace=Workspace(
+            name="t",
+            preferences=PreferencesConfig(default_plot_window_seconds=45.0),
+        ),
+        user_root=tmp_path / "_root",
+    )
+    ctx = make_app_context(tmp_path, project=project)
+    win = SignalPlotWindow(instance_id="p1")
+    qtbot.addWidget(win)
+    win.bind(ctx)
+    assert win._window_seconds == 45.0
+
+
+def test_apply_window_seconds_resizes_curve_deques(  # type: ignore[no-untyped-def]
+    qapp, qtbot, tmp_path: Path
+) -> None:
+    win = SignalPlotWindow(instance_id="p1")
+    qtbot.addWidget(win)
+    win.bind(make_app_context(tmp_path))
+    win.add_signal("EngineCommand.EngineSpeed")
+    curve = win._curves["EngineCommand.EngineSpeed"]
+    assert curve.times.maxlen == _maxlen_for_window(12.0)
+
+    win._apply_window_seconds(60.0, mark_user=True)
+    assert win._window_seconds == 60.0
+    assert curve.times.maxlen == _maxlen_for_window(60.0)
+    assert curve.values.maxlen == _maxlen_for_window(60.0)
+
+
+def test_save_restore_round_trips_window_seconds(  # type: ignore[no-untyped-def]
+    qapp, qtbot, tmp_path: Path
+) -> None:
+    ctx = make_app_context(tmp_path)
+    src = SignalPlotWindow(instance_id="p1")
+    qtbot.addWidget(src)
+    src.bind(ctx)
+    src.add_signal("BodyStatus.VehicleSpeed")
+    src._apply_window_seconds(30.0, mark_user=True)
+    snap = src.save_state()
+    assert snap["window_seconds"] == 30.0
+
+    dst = SignalPlotWindow(instance_id="p2")
+    qtbot.addWidget(dst)
+    dst.bind(ctx)
+    dst.restore_state(snap)
+    assert dst._window_seconds == 30.0
+
+
+def test_window_seconds_not_persisted_when_at_project_default(  # type: ignore[no-untyped-def]
+    qapp, qtbot, tmp_path: Path
+) -> None:
+    """A window left at the project default should not write window_seconds."""
+    win = SignalPlotWindow(instance_id="p1")
+    qtbot.addWidget(win)
+    win.bind(make_app_context(tmp_path))
+    snap = win.save_state()
+    assert "window_seconds" not in snap
+
+
+def test_parse_window_text_accepts_units() -> None:
+    assert _parse_window_text("30") == 30.0
+    assert _parse_window_text("30 s") == 30.0
+    assert _parse_window_text("2 min") == 120.0
+    assert _parse_window_text("2m") == 120.0
+    assert _parse_window_text("0.5 s") == 0.5
+    assert _parse_window_text("") is None
+    assert _parse_window_text("nope") is None
+    assert _parse_window_text("-1") is None
+    assert _parse_window_text("99999") is None  # over the ceiling
+
+
+def test_stacked_subplots_round_trip(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    """Two stacked sub-plots with independent signals + a hidden curve
+    survive save → restore via the new ``subplots`` state key."""
+    ctx = make_app_context(tmp_path)
+    src = SignalPlotWindow(instance_id="p1")
+    qtbot.addWidget(src)
+    src.bind(ctx)
+    src.add_signal("BodyStatus.VehicleSpeed")  # lands in sub-plot 0
+    # Spawn a second sub-plot and add a signal directly to it.
+    src._add_subplot()
+    src._subplots[1].add_signal("EngineCommand.EngineSpeed")
+    src._subplots[1]._on_visibility_toggled("EngineCommand.EngineSpeed", False)
+
+    snap = src.save_state()
+    assert isinstance(snap["subplots"], list)
+    assert len(snap["subplots"]) == 2
+    assert snap["subplots"][0]["signals"] == ["BodyStatus.VehicleSpeed"]
+    assert snap["subplots"][1]["signals"] == ["EngineCommand.EngineSpeed"]
+    assert snap["subplots"][1]["hidden_signals"] == ["EngineCommand.EngineSpeed"]
+
+    dst = SignalPlotWindow(instance_id="p2")
+    qtbot.addWidget(dst)
+    dst.bind(ctx)
+    dst.restore_state(snap)
+    assert len(dst._subplots) == 2
+    assert dst._subplots[0].signal_paths() == ["BodyStatus.VehicleSpeed"]
+    assert dst._subplots[1].signal_paths() == ["EngineCommand.EngineSpeed"]
+    assert dst._subplots[1]._curves["EngineCommand.EngineSpeed"].visible is False
