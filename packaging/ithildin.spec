@@ -31,6 +31,8 @@ hiddenimports = [
     "can.interfaces.pcan",
     "can.interfaces.kvaser",
     "can.interfaces.cantact",
+    "can.interfaces.socketcan",
+    "can.interfaces.ixxat",
     "can.interfaces.virtual",
     "cantact",
 ]
