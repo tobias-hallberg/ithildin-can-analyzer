@@ -166,6 +166,11 @@ class TraceWindow(ChildView):
         if self._pending_state is not None:
             self._apply_pending_state()
 
+    def add_payload(self, payload: object) -> None:
+        """Subscribe to a dropped bus, DBC, message or signal payload."""
+        if self._tracked_pane is not None:
+            self._tracked_pane.add_payload(payload)
+
     # ---- Build ----
 
     def _build_body(self) -> None:

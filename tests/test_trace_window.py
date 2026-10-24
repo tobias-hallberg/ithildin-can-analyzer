@@ -71,7 +71,7 @@ def test_bus_drop_records_every_frame(qapp, qtbot, tmp_path: Path) -> None:  # t
 
     # Drop a BusPayload onto the tracked pane.
     assert win._tracked_pane is not None
-    win._tracked_pane._on_payload_dropped(BusPayload(bus_name="CAN_1"))
+    win._tracked_pane.add_payload(BusPayload(bus_name="CAN_1"))
 
     sender = can.Bus(interface="virtual", channel=channel)
     try:
@@ -116,7 +116,7 @@ def test_message_drop_resolves_via_database(  # type: ignore[no-untyped-def]
 
     # Drop a MessagePayload — the pane should resolve it to a (bus, dbc) pair
     # and add a msg-row in the tracked tree.
-    win._tracked_pane._on_payload_dropped(MessagePayload(message="EngineCommand", message_id=0x100))
+    win._tracked_pane.add_payload(MessagePayload(message="EngineCommand", message_id=0x100))
 
     sender = can.Bus(interface="virtual", channel=channel)
     try:
@@ -160,7 +160,7 @@ def test_dbc_drop_admits_every_message_in_dbc(  # type: ignore[no-untyped-def]
 
     # Drop the DBC — 0x100/0x200/0x300 are its messages; 0x400 is not and
     # must stay filtered out.
-    win._tracked_pane._on_payload_dropped(DbcPayload(path=str(example_dbc_path)))
+    win._tracked_pane.add_payload(DbcPayload(path=str(example_dbc_path)))
 
     sender = can.Bus(interface="virtual", channel=channel)
     try:
@@ -340,7 +340,7 @@ def test_save_restore_new_state_shape(  # type: ignore[no-untyped-def]
     qtbot.addWidget(win)
     win.bind(ctx)
     assert win._tracked_pane is not None
-    win._tracked_pane._on_payload_dropped(BusPayload(bus_name="CAN_1"))
+    win._tracked_pane.add_payload(BusPayload(bus_name="CAN_1"))
 
     state = win.save_state()
     assert isinstance(state.get("tracked"), list)
@@ -432,7 +432,7 @@ def test_row_selection_updates_detail_pane(  # type: ignore[no-untyped-def]
     with qtbot.waitSignal(bus.bus_started, timeout=2000):
         bus.open(cfg)
     assert win._tracked_pane is not None
-    win._tracked_pane._on_payload_dropped(BusPayload(bus_name="CAN_1"))
+    win._tracked_pane.add_payload(BusPayload(bus_name="CAN_1"))
 
     sender = can.Bus(interface="virtual", channel=channel)
     try:
@@ -484,7 +484,7 @@ def test_latest_mode_inspector_follows_pinned_id(  # type: ignore[no-untyped-def
     with qtbot.waitSignal(bus.bus_started, timeout=2000):
         bus.open(cfg)
     assert win._tracked_pane is not None
-    win._tracked_pane._on_payload_dropped(BusPayload(bus_name="CAN_1"))
+    win._tracked_pane.add_payload(BusPayload(bus_name="CAN_1"))
 
     sender = can.Bus(interface="virtual", channel=channel)
     try:
@@ -542,7 +542,7 @@ def test_stream_mode_inspector_freezes_on_clicked_frame(  # type: ignore[no-unty
     with qtbot.waitSignal(bus.bus_started, timeout=2000):
         bus.open(cfg)
     assert win._tracked_pane is not None
-    win._tracked_pane._on_payload_dropped(BusPayload(bus_name="CAN_1"))
+    win._tracked_pane.add_payload(BusPayload(bus_name="CAN_1"))
 
     sender = can.Bus(interface="virtual", channel=channel)
     try:
