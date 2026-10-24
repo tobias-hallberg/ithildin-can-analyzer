@@ -7,6 +7,22 @@ once it reaches 1.0.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-10-24
+
+### Added
+
+- Plot curve colours can be picked: click the colour bar on a legend row
+  for the theme swatches, a custom colour, or back to automatic. Picked
+  colours survive theme changes and are saved with the project.
+
+### Fixed
+
+- The Trace and Record toolbar buttons accept buses and databases dragged
+  from the left dock, not just signals and messages, and the new window
+  starts out tracking what was dropped.
+- MDI subwindows are easier to resize: the grab zone along each edge and
+  corner is several pixels deep instead of the 2 px frame.
+
 ## [0.1.0] - 2026-10-18
 
 First public beta. Feature set at this point:
@@ -43,5 +59,6 @@ First public beta. Feature set at this point:
   validates CAN ID range, payload length, and signal finiteness on every
   send.
 
-[Unreleased]: https://github.com/tobias-hallberg/ithildin-can-analyzer/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/tobias-hallberg/ithildin-can-analyzer/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/tobias-hallberg/ithildin-can-analyzer/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/tobias-hallberg/ithildin-can-analyzer/releases/tag/v0.1.0

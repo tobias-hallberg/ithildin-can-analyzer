@@ -544,7 +544,7 @@ wheels = [
 
 [[package]]
 name = "ithildin"
-version = "0.1.0"
+version = "0.1.1"
 source = { editable = "." }
 dependencies = [
     { name = "asammdf" },
