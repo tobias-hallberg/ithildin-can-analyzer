@@ -682,7 +682,7 @@ class TrackedTreePane(QWidget):
         layout.addWidget(header)
 
         self._drop = TraceDropArea(self)
-        self._drop.payload_dropped.connect(self._on_payload_dropped)
+        self._drop.payload_dropped.connect(self.add_payload)
 
         self._stack = QStackedWidget(self._drop)
 
@@ -750,7 +750,7 @@ class TrackedTreePane(QWidget):
             ids_by_path[path] = frozenset(decoder.message_ids())
         self._tree_model.recompute(ids_by_path)
 
-    def _on_payload_dropped(self, payload: object) -> None:
+    def add_payload(self, payload: object) -> None:
         if isinstance(payload, BusPayload):
             self._handle_bus_drop(payload)
             return

@@ -9,7 +9,9 @@ Each is a split ``QToolButton``:
 - Dropdown arrow: lists every open instance (click to focus). Empty
   state shows an italic disabled "No open xxxs".
 - Drop target for ``application/x-ithildin-signal``. Dropping a
-  signal/message spawns a new instance seeded with that payload.
+  signal/message spawns a new instance seeded with that payload. The
+  Trace and Record launchers also take bus and DBC drops, since those
+  windows subscribe to them too.
 - Shows a small parenthesised count when ≥ 1 instance is open.
 """
 
@@ -18,12 +20,14 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
-from PySide6.QtCore import QPoint, QRect, Qt
+from PySide6.QtCore import QMimeData, QPoint, QRect, Qt
 from PySide6.QtGui import QAction, QDragEnterEvent, QDragMoveEvent, QDropEvent
 from PySide6.QtWidgets import QMenu, QStyle, QStyleOptionToolButton, QToolButton, QWidget
 
 from ithildin.ui import icons
 from ithildin.ui._drag_payload import (
+    BUS_MIME,
+    DBC_MIME,
     SIGNAL_MIME,
     MessagePayload,
     SignalPayload,
@@ -33,9 +37,22 @@ from ithildin.ui._drag_payload import (
 if TYPE_CHECKING:
     from ithildin.ui.window_manager import WindowManager
 
+_DEFAULT_ACCEPTED: tuple[str, ...] = (SIGNAL_MIME,)
+# Views built on the bus → DBC → message subscription tree also take
+# whole buses and DBCs; the signal-level views have no meaning for them.
+_TREE_ACCEPTED = (SIGNAL_MIME, DBC_MIME, BUS_MIME)
+_ACCEPTED_BY_KIND: dict[str, tuple[str, ...]] = {
+    "trace": _TREE_ACCEPTED,
+    "record": _TREE_ACCEPTED,
+}
+
+
+def _has_accepted_format(mime: QMimeData, accepted: tuple[str, ...]) -> bool:
+    return any(mime.hasFormat(fmt) for fmt in accepted)
+
 
 class _InstanceMenu(QMenu):
-    """QMenu that accepts a signal-payload drop on one of its actions.
+    """QMenu that accepts a payload drop on one of its actions.
 
     Each open-instance ``QAction`` carries its ``window_id`` in
     ``action.data()``. On drop the menu looks up the action under the
@@ -47,19 +64,21 @@ class _InstanceMenu(QMenu):
         self,
         parent: QWidget,
         on_drop: Callable[[int, object], None],
+        accepted: tuple[str, ...],
     ) -> None:
         super().__init__(parent)
         self._on_drop = on_drop
+        self._accepted = accepted
         self.setAcceptDrops(True)
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
-        if event.mimeData().hasFormat(SIGNAL_MIME):
+        if _has_accepted_format(event.mimeData(), self._accepted):
             event.acceptProposedAction()
             return
         event.ignore()
 
     def dragMoveEvent(self, event: QDragMoveEvent) -> None:
-        if not event.mimeData().hasFormat(SIGNAL_MIME):
+        if not _has_accepted_format(event.mimeData(), self._accepted):
             event.ignore()
             return
         action = self.actionAt(event.position().toPoint())
@@ -103,7 +122,8 @@ class ViewLauncherButton(QToolButton):
         self._kind = kind
         self._label = label
         self._wm = wm
-        self._menu = _InstanceMenu(self, self._handle_drop_on_item)
+        self._accepted = _ACCEPTED_BY_KIND.get(kind, _DEFAULT_ACCEPTED)
+        self._menu = _InstanceMenu(self, self._handle_drop_on_item, self._accepted)
         self.setMenu(self._menu)
         self.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
         # QToolButtons added to a QToolBar via addWidget()/insertWidget()
@@ -137,14 +157,14 @@ class ViewLauncherButton(QToolButton):
     # ---- Drop target ----
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
-        if event.mimeData().hasFormat(SIGNAL_MIME):
+        if _has_accepted_format(event.mimeData(), self._accepted):
             event.acceptProposedAction()
             self.setDown(True)
             return
         event.ignore()
 
     def dragMoveEvent(self, event: QDragMoveEvent) -> None:
-        if not event.mimeData().hasFormat(SIGNAL_MIME):
+        if not _has_accepted_format(event.mimeData(), self._accepted):
             event.ignore()
             return
         event.acceptProposedAction()
@@ -243,7 +263,9 @@ class ViewLauncherButton(QToolButton):
             if entry.window_id != window_id:
                 continue
             view = entry.view
-            if isinstance(payload, SignalPayload) and hasattr(view, "add_signal"):
+            if hasattr(view, "add_payload"):
+                view.add_payload(payload)
+            elif isinstance(payload, SignalPayload) and hasattr(view, "add_signal"):
                 view.add_signal(payload.path())
             elif isinstance(payload, MessagePayload) and hasattr(view, "add_message"):
                 view.add_message(payload.message)
