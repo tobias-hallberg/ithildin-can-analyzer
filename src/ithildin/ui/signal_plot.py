@@ -37,6 +37,7 @@ from PySide6.QtCore import (
     QObject,
     QPoint,
     QPointF,
+    QRectF,
     QSize,
     Qt,
     QTimer,
@@ -52,13 +53,17 @@ from PySide6.QtGui import (
     QMouseEvent,
     QPainter,
     QPainterPath,
+    QPaintEvent,
+    QPalette,
     QPen,
     QPixmap,
     QResizeEvent,
 )
 from PySide6.QtWidgets import (
+    QAbstractButton,
     QApplication,
     QButtonGroup,
+    QColorDialog,
     QFrame,
     QGraphicsOpacityEffect,
     QGridLayout,
@@ -73,6 +78,7 @@ from PySide6.QtWidgets import (
     QToolButton,
     QVBoxLayout,
     QWidget,
+    QWidgetAction,
 )
 
 from ithildin.ui._child_base import ChildView
@@ -175,6 +181,63 @@ def _color_swatch(color: QColor, size: int = 12) -> QIcon:
     return QIcon(pm)
 
 
+class _ColorBar(QAbstractButton):
+    """A legend row's colour indicator; clicking it opens the colour menu.
+
+    Paints a 3 px bar but also covers the gap up to the eye, so the
+    click target isn't a pixel hunt. Widens on hover to show it's live.
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._color = QColor()
+        self.setFixedSize(11, 28)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setToolTip("Change colour")
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+
+    def set_color(self, color: QColor) -> None:
+        self._color = QColor(color)
+        self.update()
+
+    def paintEvent(self, event: QPaintEvent) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(self._color)
+        width = 5 if self.underMouse() else 3
+        p.drawRoundedRect(QRectF(0, 0, width, self.height()), 1, 1)
+
+
+class _SwatchButton(QAbstractButton):
+    """One round colour choice in the colour menu; checked = current."""
+
+    def __init__(self, color: QColor, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._color = QColor(color)
+        self.setCheckable(True)
+        self.setFixedSize(24, 24)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+
+    def color(self) -> QColor:
+        return QColor(self._color)
+
+    def paintEvent(self, event: QPaintEvent) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        outer = QRectF(self.rect()).adjusted(1.5, 1.5, -1.5, -1.5)
+        if self.isChecked() or self.underMouse():
+            text = self.palette().color(QPalette.ColorRole.Text)
+            p.setPen(QPen(text if self.isChecked() else self._color, 1.5))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawEllipse(outer)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(self._color)
+        p.drawEllipse(outer.adjusted(3.5, 3.5, -3.5, -3.5))
+
+
 class _SignalCurve:
     """One subscribed signal: its time series + colour + DBC metadata.
 
@@ -217,6 +280,9 @@ class _SignalCurve:
         # what's visible.
         self.visible: bool = True
         self._color = QColor(color)
+        # Set when the user picked the colour from the legend menu. Theme
+        # refreshes re-cycle only the automatic colours.
+        self.user_color: bool = False
         self.last_value: float | None = None
 
     def color(self) -> QColor:
@@ -334,6 +400,7 @@ class _CurveRow(QFrame):
     ``SignalPayload``s. When the row is part of a multi-selection in
     its owning pane, every selected row's payload rides along so a
     single drag gesture moves them all into a sibling sub-plot.
+    Clicking the colour bar asks the owning sub-plot for the colour menu.
     """
 
     # Carries the active Qt.KeyboardModifier flags at click time so the
@@ -341,6 +408,7 @@ class _CurveRow(QFrame):
     clicked = Signal(object)
     eye_toggled = Signal(bool)  # new visibility state
     remove_clicked = Signal()
+    color_menu_requested = Signal(QPoint)  # global position
 
     def __init__(
         self,
@@ -370,24 +438,26 @@ class _CurveRow(QFrame):
         grid.setContentsMargins(6, 7, 10, 7)
         grid.setHorizontalSpacing(8)
         grid.setVerticalSpacing(0)
-        grid.setColumnStretch(2, 1)
+        grid.setColumnStretch(1, 1)
 
-        # Column 1 — 3×28 colour bar.
-        self._color_bar = QFrame(self)
-        self._color_bar.setFixedSize(3, 28)
-        self._color_bar.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        grid.addWidget(self._color_bar, 0, 0, 2, 1)
-
-        # Column 2 — visibility eye.
+        # Column 1 — colour bar + visibility eye. No spacing between them:
+        # the bar's click target spans the gap up to the eye.
+        lead = QHBoxLayout()
+        lead.setContentsMargins(0, 0, 0, 0)
+        lead.setSpacing(0)
+        self._color_bar = _ColorBar(self)
+        self._color_bar.clicked.connect(self._on_color_bar_clicked)
+        lead.addWidget(self._color_bar)
         self._eye_btn = QToolButton(self)
         self._eye_btn.setAutoRaise(True)
         self._eye_btn.setIconSize(QSize(14, 14))
         self._eye_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._eye_btn.setToolTip("Hide / show this curve")
         self._eye_btn.clicked.connect(self._on_eye_clicked)
-        grid.addWidget(self._eye_btn, 0, 1, 2, 1, Qt.AlignmentFlag.AlignVCenter)
+        lead.addWidget(self._eye_btn, 0, Qt.AlignmentFlag.AlignVCenter)
+        grid.addLayout(lead, 0, 0, 2, 1)
 
-        # Column 3 — name + live value over an optional meta line. Wrapped
+        # Column 2 — name + live value over an optional meta line. Wrapped
         # in a vertical stack with stretches so the block centres vertically
         # when the meta label is hidden (signal-centric DBC + no range).
         name_row = QHBoxLayout()
@@ -411,16 +481,16 @@ class _CurveRow(QFrame):
         text_stack.addLayout(name_row)
         text_stack.addWidget(self._meta_label)
         text_stack.addStretch(1)
-        grid.addLayout(text_stack, 0, 2, 2, 1)
+        grid.addLayout(text_stack, 0, 1, 2, 1)
 
-        # Column 4 — remove X.
+        # Column 3 — remove X.
         self._x_btn = QToolButton(self)
         self._x_btn.setAutoRaise(True)
         self._x_btn.setIconSize(QSize(10, 10))
         self._x_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._x_btn.setToolTip("Remove from plot")
         self._x_btn.clicked.connect(self.remove_clicked.emit)
-        grid.addWidget(self._x_btn, 0, 3, 2, 1, Qt.AlignmentFlag.AlignVCenter)
+        grid.addWidget(self._x_btn, 0, 2, 2, 1, Qt.AlignmentFlag.AlignVCenter)
 
         self._opacity = QGraphicsOpacityEffect(self)
         self._opacity.setOpacity(1.0)
@@ -442,7 +512,7 @@ class _CurveRow(QFrame):
 
     def update_color(self, color: QColor) -> None:
         self._curve.set_color(color)
-        self._color_bar.setStyleSheet(f"background: {color.name()}; border-radius: 1px;")
+        self._color_bar.set_color(color)
         # Eye and X glyphs adopt a muted theme colour so they don't
         # compete with the coloured bar.
         muted = self.palette().color(self.foregroundRole())
@@ -535,6 +605,10 @@ class _CurveRow(QFrame):
         )
 
     # ---- Mouse events: click + start drag ----
+
+    def _on_color_bar_clicked(self) -> None:
+        bar = self._color_bar
+        self.color_menu_requested.emit(bar.mapToGlobal(QPoint(0, bar.height())))
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
@@ -718,6 +792,7 @@ class _CurveListPane(QWidget):
     selection_changed = Signal(object)  # frozenset[str]
     visibility_toggled = Signal(str, bool)
     remove_requested = Signal(str)
+    color_menu_requested = Signal(str, QPoint)  # path, global position
     # Emitted when one or more _CurveRows from a sibling sub-plot are
     # dropped onto this section. The host moves the curves.
     move_requested = Signal(object, list)  # source _SubPlot, list[str]
@@ -800,6 +875,9 @@ class _CurveListPane(QWidget):
             lambda visible, p=curve.path: self.visibility_toggled.emit(p, visible)
         )
         row.remove_clicked.connect(lambda p=curve.path: self.remove_requested.emit(p))
+        row.color_menu_requested.connect(
+            lambda pos, p=curve.path: self.color_menu_requested.emit(p, pos)
+        )
         # Insert above the stretch.
         insert_at = self._rows_layout.count() - 1
         self._rows_layout.insertWidget(max(0, insert_at), row)
@@ -973,6 +1051,7 @@ class _SubPlot(QObject):
         self._curve_list.visibility_toggled.connect(self._on_visibility_toggled)
         self._curve_list.selection_changed.connect(self._on_selection_changed)
         self._curve_list.move_requested.connect(self._on_drop_move_in)
+        self._curve_list.color_menu_requested.connect(self._on_color_menu_requested)
 
         # ---- Plot row: just the GL canvas inside its drop area.
         # No top strip; the per-sub-plot remove (✕) sits as a small
@@ -1140,6 +1219,68 @@ class _SubPlot(QObject):
         # (dim non-selected curves) is a deferred polish item.
         del paths
 
+    # ---- Curve colour ----
+
+    def set_curve_color(self, path: str, color: QColor | None) -> None:
+        """Pin ``path`` to ``color``; ``None`` hands it back to the theme cycle."""
+        curve = self._curves.get(path)
+        if curve is None:
+            return
+        curve.user_color = color is not None
+        if color is None:
+            cycle = self._palette["curves"]
+            assert isinstance(cycle, list)
+            color = QColor(str(cycle[list(self._curves).index(path) % len(cycle)]))
+        curve.set_color(color)
+        self._plot.set_curve_color(path, color)
+        self._curve_list.refresh_colors(self._color_for_path)
+
+    def _on_color_menu_requested(self, path: str, pos: QPoint) -> None:
+        menu = self._build_color_menu(path)
+        if menu is None:
+            return
+        menu.exec(pos)
+        menu.deleteLater()
+
+    def _build_color_menu(self, path: str) -> QMenu | None:
+        curve = self._curves.get(path)
+        if curve is None:
+            return None
+        cycle = self._palette["curves"]
+        assert isinstance(cycle, list)
+        menu = QMenu(self._curve_list)
+        row = QWidget(menu)
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(8, 6, 8, 6)
+        row_layout.setSpacing(2)
+        current = curve.color()
+        for entry in cycle:
+            color = QColor(str(entry))
+            swatch = _SwatchButton(color, row)
+            swatch.setChecked(curve.user_color and color == current)
+            swatch.clicked.connect(lambda _checked=False, c=color: self.set_curve_color(path, c))
+            swatch.clicked.connect(menu.close)
+            row_layout.addWidget(swatch)
+        swatches = QWidgetAction(menu)
+        swatches.setDefaultWidget(row)
+        menu.addAction(swatches)
+        menu.addSeparator()
+        custom = menu.addAction("Custom colour…")
+        custom.triggered.connect(lambda: self._pick_custom_color(path))
+        auto = menu.addAction("Automatic colour")
+        auto.setCheckable(True)
+        auto.setChecked(not curve.user_color)
+        auto.triggered.connect(lambda: self.set_curve_color(path, None))
+        return menu
+
+    def _pick_custom_color(self, path: str) -> None:
+        curve = self._curves.get(path)
+        if curve is None:
+            return
+        color = QColorDialog.getColor(curve.color(), self._curve_list, "Curve colour")
+        if color.isValid():
+            self.set_curve_color(path, color)
+
     def refresh_legend_live(self) -> None:
         for path, curve in self._curves.items():
             self._curve_list.update_live(path, curve.last_value)
@@ -1213,6 +1354,8 @@ class _SubPlot(QObject):
         cycle = self._palette["curves"]
         assert isinstance(cycle, list)
         for i, (path, curve) in enumerate(self._curves.items()):
+            if curve.user_color:
+                continue
             color = QColor(str(cycle[i % len(cycle)]))
             curve.set_color(color)
             self._plot.set_curve_color(path, color)
@@ -1370,6 +1513,9 @@ class _SubPlot(QObject):
         hidden = [p for p, c in self._curves.items() if not c.visible]
         if hidden:
             state["hidden_signals"] = hidden
+        colors = {p: c.color().name() for p, c in self._curves.items() if c.user_color}
+        if colors:
+            state["colors"] = colors
         if self._plot.is_merge_requested():
             state["axes_merged"] = True
         return state
@@ -1385,6 +1531,12 @@ class _SubPlot(QObject):
             for path in hidden:
                 if isinstance(path, str) and path in self._curves:
                     self._on_visibility_toggled(path, False)
+        colors = state.get("colors")
+        if isinstance(colors, dict):
+            for path, name in colors.items():
+                color = QColor(str(name))
+                if path in self._curves and color.isValid():
+                    self.set_curve_color(path, color)
         # Re-apply the merge intent after curves exist; it takes effect
         # only while the restored curves share a type.
         if state.get("axes_merged"):

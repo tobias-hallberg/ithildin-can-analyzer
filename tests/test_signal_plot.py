@@ -8,6 +8,8 @@ import uuid
 from pathlib import Path
 
 import can
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QColor
 
 from ithildin.app_state.project import Project
 from ithildin.core.types import FrameRecord
@@ -15,6 +17,7 @@ from ithildin.ui.signal_plot import (
     SignalPlotWindow,
     _maxlen_for_window,
     _parse_window_text,
+    _SwatchButton,
 )
 from ithildin.workspace.schema import BusConfig, PreferencesConfig, Workspace
 from tests.conftest import make_app_context
@@ -200,8 +203,6 @@ def test_merge_axes_enabled_only_for_same_unit(  # type: ignore[no-untyped-def]
 def test_merge_survives_same_type_add(qapp, qtbot) -> None:  # type: ignore[no-untyped-def]
     """A same-type signal added while merged keeps the axes joined; a
     different-type one only suspends the join until it's removed."""
-    from PySide6.QtGui import QColor
-
     from ithildin.ui._gl_plot import GLPlotWidget
 
     plot = GLPlotWidget()
@@ -399,3 +400,94 @@ def test_stacked_subplots_round_trip(qapp, qtbot, tmp_path: Path) -> None:  # ty
     assert dst._subplots[0].signal_paths() == ["BodyStatus.VehicleSpeed"]
     assert dst._subplots[1].signal_paths() == ["EngineCommand.EngineSpeed"]
     assert dst._subplots[1]._curves["EngineCommand.EngineSpeed"].visible is False
+
+
+def _two_curve_plot(qtbot, tmp_path: Path) -> SignalPlotWindow:  # type: ignore[no-untyped-def]
+    win = SignalPlotWindow(instance_id="p1")
+    qtbot.addWidget(win)
+    win.bind(make_app_context(tmp_path))
+    win.add_signal("BodyStatus.VehicleSpeed")
+    win.add_signal("EngineCommand.EngineSpeed")
+    return win
+
+
+def test_color_menu_pins_and_resets_curve_color(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    win = _two_curve_plot(qtbot, tmp_path)
+    sp = win._subplots[0]
+    path = "BodyStatus.VehicleSpeed"
+    auto_color = sp._curves[path].color()
+
+    menu = sp._build_color_menu(path)
+    assert menu is not None
+    swatches = menu.findChildren(_SwatchButton)
+    auto = menu.actions()[-1]
+    assert len(swatches) == 6
+    assert auto.text() == "Automatic colour"
+    assert auto.isChecked()
+    assert not any(s.isChecked() for s in swatches)
+
+    picked = swatches[3].color()
+    swatches[3].click()
+    curve = sp._curves[path]
+    assert curve.user_color
+    assert curve.color() == picked
+    assert sp._plot._curves[path].color == picked
+    assert sp._curve_list._rows[path]._color_bar._color == picked
+
+    menu = sp._build_color_menu(path)
+    assert menu is not None
+    swatches = menu.findChildren(_SwatchButton)
+    assert [s.isChecked() for s in swatches] == [False, False, False, True, False, False]
+    assert not menu.actions()[-1].isChecked()
+
+    menu.actions()[-1].trigger()
+    assert not curve.user_color
+    assert curve.color() == auto_color
+    assert sp._plot._curves[path].color == auto_color
+
+
+def test_clicking_color_bar_requests_color_menu(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    win = _two_curve_plot(qtbot, tmp_path)
+    pane = win._subplots[0]._curve_list
+    # Swap the menu-opening slot for a recorder so no modal menu runs.
+    pane.color_menu_requested.disconnect()
+    requested: list[str] = []
+    pane.color_menu_requested.connect(lambda path, _pos: requested.append(path))
+
+    row = pane._rows["EngineCommand.EngineSpeed"]
+    qtbot.mouseClick(row._color_bar, Qt.MouseButton.LeftButton)
+
+    assert requested == ["EngineCommand.EngineSpeed"]
+    assert pane.selected_paths() == []
+
+
+def test_user_color_survives_theme_refresh(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    win = _two_curve_plot(qtbot, tmp_path)
+    sp = win._subplots[0]
+    sp.set_curve_color("BodyStatus.VehicleSpeed", QColor("#123456"))
+    sp._curves["EngineCommand.EngineSpeed"].set_color(QColor("#000000"))
+
+    sp._refresh_plot_theme()
+
+    assert sp._curves["BodyStatus.VehicleSpeed"].color() == QColor("#123456")
+    cycle = sp._palette["curves"]
+    assert isinstance(cycle, list)
+    assert sp._curves["EngineCommand.EngineSpeed"].color() == QColor(str(cycle[1]))
+
+
+def test_save_and_restore_curve_colors(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    src = _two_curve_plot(qtbot, tmp_path)
+    src._subplots[0].set_curve_color("BodyStatus.VehicleSpeed", QColor("#123456"))
+
+    snap = src.save_state()
+    assert isinstance(snap["subplots"], list)
+    assert snap["subplots"][0]["colors"] == {"BodyStatus.VehicleSpeed": "#123456"}
+
+    dst = SignalPlotWindow(instance_id="p2")
+    qtbot.addWidget(dst)
+    dst.bind(make_app_context(tmp_path))
+    dst.restore_state(snap)
+    restored = dst._curves["BodyStatus.VehicleSpeed"]
+    assert restored.user_color
+    assert restored.color() == QColor("#123456")
+    assert not dst._curves["EngineCommand.EngineSpeed"].user_color
