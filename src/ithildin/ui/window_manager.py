@@ -28,8 +28,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from PySide6.QtCore import QEvent, QObject, QRect, Qt, QTimer, Signal
-from PySide6.QtGui import QIcon, QKeyEvent, QMouseEvent, QPixmap
+from PySide6.QtCore import QEvent, QObject, QPoint, QRect, Qt, QTimer, Signal
+from PySide6.QtGui import QIcon, QKeyEvent, QMouseEvent, QPixmap, QRegion
 from PySide6.QtWidgets import (
     QApplication,
     QInputDialog,
@@ -61,7 +61,9 @@ class _TightMdiFrameStyle(QProxyStyle):
     Overriding it via QSS works but forces the styled paint path, which
     also kills the edge-drag resize hit-test. A ``QProxyStyle`` over the
     pixel metric leaves the native paint path intact while shrinking the
-    frame to 2 px — small enough to look flush, still hit-testable.
+    frame to 2 px — small enough to look flush. QMdiSubWindow's own
+    resize hit-test is exactly the frame width, so ``_ResizeGrip``
+    widens the grab zone without widening the visible frame.
 
     Also zeros the title-bar height for maximized subwindows so the
     title bar disappears and the content fills the MDI viewport. Qt's
@@ -93,6 +95,119 @@ def _tight_mdi_style() -> _TightMdiFrameStyle:
     if _TIGHT_MDI_STYLE is None:
         _TIGHT_MDI_STYLE = _TightMdiFrameStyle()
     return _TIGHT_MDI_STYLE
+
+
+_GRIP_PX = 8
+_GRIP_TOP_PX = 4
+_GRIP_CORNER_PX = 16
+
+_LEFT = Qt.Edge.LeftEdge
+_RIGHT = Qt.Edge.RightEdge
+_TOP = Qt.Edge.TopEdge
+_BOTTOM = Qt.Edge.BottomEdge
+
+
+class _ResizeGrip(QWidget):
+    """Invisible edge or corner handle that resizes its ``QMdiSubWindow``.
+
+    Overlays the 2 px frame plus the outer edge of the view, so the side
+    and bottom grab zones are ``_GRIP_PX`` deep — about what a native
+    top-level window offers. Corners are L-shaped (masked) so they don't swallow a square
+    of the title-bar buttons or the view underneath.
+    """
+
+    def __init__(self, sub: QMdiSubWindow, edges: Qt.Edge) -> None:
+        super().__init__(sub)
+        self._sub = sub
+        self._edges = edges
+        self._press: tuple[QPoint, QRect] | None = None
+        horizontal = bool(edges & (_LEFT | _RIGHT))
+        vertical = bool(edges & (_TOP | _BOTTOM))
+        c, g = _GRIP_CORNER_PX, _GRIP_PX
+        # The top band overlays the title bar; kept thin so most of the
+        # bar still moves the window and its buttons stay clickable.
+        depth_y = _GRIP_TOP_PX if edges & _TOP else g
+        self._size: tuple[int | None, int | None]
+        if horizontal and vertical:
+            self._size = (c, c)
+            bar_y = 0 if edges & _TOP else c - g
+            bar_x = 0 if edges & _LEFT else c - g
+            self.setMask(QRegion(0, bar_y, c, depth_y) + QRegion(bar_x, 0, g, c))
+            backslash = edges in (_LEFT | _TOP, _RIGHT | _BOTTOM)
+            self.setCursor(
+                Qt.CursorShape.SizeFDiagCursor if backslash else Qt.CursorShape.SizeBDiagCursor
+            )
+        elif horizontal:
+            self._size = (g, None)
+            self.setCursor(Qt.CursorShape.SizeHorCursor)
+        else:
+            self._size = (None, depth_y)
+            self.setCursor(Qt.CursorShape.SizeVerCursor)
+        sub.installEventFilter(self)
+        self._place()
+
+    def _place(self) -> None:
+        # ``None`` = span the edge between the two corner grips.
+        w, h = self._sub.width(), self._sub.height()
+        c = _GRIP_CORNER_PX
+        gw = self._size[0] if self._size[0] is not None else max(w - 2 * c, 0)
+        gh = self._size[1] if self._size[1] is not None else max(h - 2 * c, 0)
+        e = self._edges
+        x = 0 if e & _LEFT else (w - gw if e & _RIGHT else c)
+        y = 0 if e & _TOP else (h - gh if e & _BOTTOM else c)
+        self.setGeometry(x, y, gw, gh)
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        # The subwindow still sends events while its destructor runs.
+        if not isValid(self._sub):
+            return False
+        if event.type() == QEvent.Type.Resize:
+            self._place()
+        elif event.type() == QEvent.Type.WindowStateChange:
+            self.setVisible(not (self._sub.isMaximized() or self._sub.isMinimized()))
+        return False
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        area = self._sub.mdiArea()
+        if area is not None:
+            area.setActiveSubWindow(self._sub)
+        self._press = (event.globalPosition().toPoint(), self._sub.geometry())
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        if self._press is None:
+            return
+        start, geom = self._press
+        delta = event.globalPosition().toPoint() - start
+        minimum = self._sub.minimumSizeHint().expandedTo(self._sub.minimumSize())
+        r = QRect(geom)
+        if self._edges & _LEFT:
+            r.setLeft(min(geom.left() + delta.x(), geom.right() + 1 - minimum.width()))
+        if self._edges & _RIGHT:
+            r.setRight(max(geom.right() + delta.x(), geom.left() - 1 + minimum.width()))
+        if self._edges & _TOP:
+            r.setTop(min(geom.top() + delta.y(), geom.bottom() + 1 - minimum.height()))
+        if self._edges & _BOTTOM:
+            r.setBottom(max(geom.bottom() + delta.y(), geom.top() - 1 + minimum.height()))
+        self._sub.setGeometry(r)
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        self._press = None
+
+
+def _install_resize_grips(sub: QMdiSubWindow) -> None:
+    for edges in (
+        _LEFT,
+        _RIGHT,
+        _TOP,
+        _BOTTOM,
+        _LEFT | _TOP,
+        _RIGHT | _TOP,
+        _LEFT | _BOTTOM,
+        _RIGHT | _BOTTOM,
+    ):
+        _ResizeGrip(sub, edges)
 
 
 def _blank_icon() -> QIcon:
@@ -285,6 +400,8 @@ class WindowManager(QObject):
         sub.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         sub.setWindowTitle(view.windowTitle())
         sub.setWindowIcon(_blank_icon())
+        # After setWidget so the grips stack above the view.
+        _install_resize_grips(sub)
         sub.installEventFilter(self)
         # Keep the sub-window title bar in sync with view renames.
         view.windowTitleChanged.connect(sub.setWindowTitle)

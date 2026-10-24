@@ -7,10 +7,18 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from PySide6.QtCore import QSize
-from PySide6.QtWidgets import QLabel, QMdiArea, QVBoxLayout, QWidget
+from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, QSize, Qt
+from PySide6.QtGui import QMouseEvent
+from PySide6.QtWidgets import (
+    QApplication,
+    QLabel,
+    QMdiArea,
+    QMdiSubWindow,
+    QVBoxLayout,
+    QWidget,
+)
 
-from ithildin.ui.window_manager import WindowManager
+from ithildin.ui.window_manager import WindowManager, _ResizeGrip
 from ithildin.workspace.schema import ViewState
 
 
@@ -240,3 +248,89 @@ def test_snapshot_views_captures_state(qapp, qtbot, tmp_path: Path) -> None:  # 
     assert by_iid["iid-1"]["params"] == {"channel": "CAN_1"}
     # _FakeView does not override save_state, so the default empty dict is returned.
     assert by_iid["iid-1"]["state"] == {}
+
+
+def _open_normal_sub(qtbot, tmp_path: Path) -> QMdiSubWindow:  # type: ignore[no-untyped-def]
+    mgr, area = _build(qtbot, tmp_path)
+    area.resize(1000, 800)
+    area.show()
+    mgr.open("message_trace", params={"channel": "CAN_1"})
+    sub = mgr.list_windows()[0].subwindow
+    sub.setGeometry(QRect(50, 50, 400, 300))
+    qtbot.waitUntil(sub.isVisible, timeout=1000)
+    return sub
+
+
+def _drag(widget: QWidget, dx: int, dy: int) -> None:
+    start = QPointF(widget.mapToGlobal(QPoint(1, 1)))
+    end = start + QPointF(dx, dy)
+    left = Qt.MouseButton.LeftButton
+    for etype, gpos, buttons in (
+        (QEvent.Type.MouseButtonPress, start, left),
+        (QEvent.Type.MouseMove, end, left),
+        (QEvent.Type.MouseButtonRelease, end, Qt.MouseButton.NoButton),
+    ):
+        event = QMouseEvent(
+            etype, widget.mapFromGlobal(gpos), gpos, left, buttons, Qt.KeyboardModifier.NoModifier
+        )
+        QApplication.sendEvent(widget, event)
+
+
+def _grip_at(sub: QMdiSubWindow, x: int, y: int) -> _ResizeGrip:
+    child = sub.childAt(QPoint(x, y))
+    assert isinstance(child, _ResizeGrip)
+    return child
+
+
+def test_resize_grips_extend_past_the_thin_frame(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    """The grab zone reaches well inside the 2 px frame, so edges aren't pixel hunts."""
+    sub = _open_normal_sub(qtbot, tmp_path)
+    w, h = sub.width(), sub.height()
+
+    assert _grip_at(sub, w - 6, h // 2).cursor().shape() == Qt.CursorShape.SizeHorCursor
+    assert _grip_at(sub, 5, h // 2).cursor().shape() == Qt.CursorShape.SizeHorCursor
+    assert _grip_at(sub, w // 2, h - 6).cursor().shape() == Qt.CursorShape.SizeVerCursor
+    assert _grip_at(sub, w // 2, 2).cursor().shape() == Qt.CursorShape.SizeVerCursor
+    assert _grip_at(sub, w - 3, h - 3).cursor().shape() == Qt.CursorShape.SizeFDiagCursor
+    assert _grip_at(sub, 3, h - 3).cursor().shape() == Qt.CursorShape.SizeBDiagCursor
+    # Corners are L-shaped: the square's inner part still belongs to the view.
+    assert not isinstance(sub.childAt(QPoint(w - 12, h - 12)), _ResizeGrip)
+    # The top band stays thin so the title bar still moves the window.
+    assert not isinstance(sub.childAt(QPoint(w // 2, 6)), _ResizeGrip)
+    assert not isinstance(sub.childAt(QPoint(w // 2, h // 2)), _ResizeGrip)
+
+
+def test_dragging_grips_resizes_subwindow(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    sub = _open_normal_sub(qtbot, tmp_path)
+    w, h = sub.width(), sub.height()
+
+    _drag(_grip_at(sub, w - 4, h // 2), 60, 0)
+    assert sub.geometry() == QRect(50, 50, 460, 300)
+
+    _drag(_grip_at(sub, 4, h // 2), -30, 0)
+    assert sub.geometry() == QRect(20, 50, 490, 300)
+
+    w, h = sub.width(), sub.height()
+    _drag(_grip_at(sub, w - 3, h - 3), 10, 20)
+    assert sub.geometry() == QRect(20, 50, 500, 320)
+
+
+def test_left_grip_stops_at_minimum_size(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    sub = _open_normal_sub(qtbot, tmp_path)
+    right = sub.geometry().right()
+
+    _drag(_grip_at(sub, 4, sub.height() // 2), 1000, 0)
+    assert sub.width() == sub.minimumSizeHint().width()
+    assert sub.geometry().right() == right
+
+
+def test_resize_grips_hidden_while_maximized(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    sub = _open_normal_sub(qtbot, tmp_path)
+    grips = sub.findChildren(_ResizeGrip)
+    assert len(grips) == 8
+
+    sub.showMaximized()
+    qtbot.waitUntil(lambda: all(g.isHidden() for g in grips), timeout=1000)
+
+    sub.showNormal()
+    qtbot.waitUntil(lambda: not any(g.isHidden() for g in grips), timeout=1000)
