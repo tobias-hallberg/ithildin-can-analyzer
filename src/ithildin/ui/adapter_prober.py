@@ -29,6 +29,7 @@ the dock indefinitely.
 from __future__ import annotations
 
 import concurrent.futures
+import logging
 import os
 from dataclasses import dataclass
 
@@ -37,6 +38,8 @@ from PySide6.QtWidgets import QApplication
 
 from ithildin.ui.adapter_enrich import ChannelInfo, DeviceInfo, enrich
 from ithildin.workspace.schema import SupportedInterface
+
+_log = logging.getLogger(__name__)
 
 _SUPPORTED_BACKENDS: tuple[str, ...] = (
     "pcan",
@@ -202,6 +205,7 @@ class AdapterProber(QObject):
                 self.backend_failed.emit(backend, "timeout")
                 return []
             except Exception as exc:
+                _log.warning("Probe of %s failed", backend, exc_info=True)
                 self.backend_failed.emit(backend, str(exc))
                 return []
         finally:

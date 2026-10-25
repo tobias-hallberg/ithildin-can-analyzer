@@ -18,6 +18,7 @@ avoids opening a second ``Bus`` instance on a physical channel.
 
 from __future__ import annotations
 
+import logging
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -27,6 +28,8 @@ from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot
 
 SendCallable = Callable[[can.Message], None]
 """Anything that takes a single ``can.Message`` synchronously."""
+
+_log = logging.getLogger(__name__)
 
 
 class ReplayWorker(QObject):
@@ -77,6 +80,7 @@ class ReplayWorker(QObject):
                     if sent % 100 == 0:
                         self.progress.emit(sent)
         except Exception as exc:
+            _log.warning("Replay of %s failed", self._log_path, exc_info=True)
             self.error.emit(f"Replay error: {exc}")
         finally:
             self.progress.emit(sent)

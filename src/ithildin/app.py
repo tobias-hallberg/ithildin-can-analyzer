@@ -17,15 +17,17 @@ Usage:
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 from importlib.resources import files
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QGuiApplication, QIcon, QSurfaceFormat
 from PySide6.QtWidgets import QApplication
 
+from ithildin.app_state import diagnostics
 from ithildin.app_state.bus_reader import BusReader
 from ithildin.app_state.context import AppContext
 from ithildin.app_state.database import Database
@@ -45,6 +47,7 @@ from ithildin.ui.window_manager import WindowManager
 
 
 def main(argv: list[str] | None = None) -> int:
+    log_file = diagnostics.install()
     args = list(argv) if argv is not None else list(sys.argv)
     # Strip the ``--no-prompt`` flag before handing argv to QApplication.
     # Qt would otherwise warn about an unknown option. Bool, not stored
@@ -88,6 +91,10 @@ def main(argv: list[str] | None = None) -> int:
     app.setApplicationName("Ithildin")
     app.setApplicationDisplayName("Ithildin")
     app.setOrganizationName("Ithildin")
+    # Stopped by the first aboutToQuit slot, so the slow joins connected
+    # later never read as a GUI stall.
+    watchdog = diagnostics.StallWatchdog(log_file)
+    app.aboutToQuit.connect(watchdog.stop)
 
     _apply_default_font(app)
 
@@ -160,6 +167,9 @@ def main(argv: list[str] | None = None) -> int:
     main_window = MainWindow(
         bus_reader=bus_reader, database=database, prompt_on_close=not no_prompt
     )
+    relay = diagnostics.ReportRelay(Path(log_file.name))
+    main_window.bind_log_relay(relay)
+    logging.getLogger().addHandler(relay.handler)
     window_manager = WindowManager(main_window.mdi_area, project.layout_path, make_factory(ctx))
     main_window.set_window_manager(window_manager)
     main_window.set_recent_store(recent)
@@ -185,7 +195,11 @@ def main(argv: list[str] | None = None) -> int:
     app.aboutToQuit.connect(window_manager.flush)
     app.aboutToQuit.connect(lambda: mcp_bridge.stop())
     app.aboutToQuit.connect(audit.close)
+    # Armed once the loop runs: synchronous startup (layout restore,
+    # open_all) is not a stall.
+    QTimer.singleShot(0, watchdog.start)
     rc = app.exec()
+    logging.getLogger().removeHandler(relay.handler)
     bus_reader.close()
     return rc
 

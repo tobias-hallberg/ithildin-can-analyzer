@@ -30,6 +30,9 @@ Process-level singletons live in `app_state/`:
 - `Project` (`project.py`) — `.itp` file loader + legacy migration.
 - `AppContext` (`context.py`) — **frozen** dataclass bundling the above
   + `AllowlistStore`, audit path, `McpServerBridge`, and MCP host/port.
+- `diagnostics.py` — process-wide logging: `install()` (per-launch log
+  file + crash hooks), `ReportRelay` (log records → Report dock),
+  `StallWatchdog` (GUI-stall stack dumps).
 
 MCP layer (`src/ithildin/mcp/`):
 
@@ -90,6 +93,23 @@ MCP layer (`src/ithildin/mcp/`):
   depending on it would cap the project at Python 3.12. python-can
   returns no configs when the module is absent, so the probe degrades to
   "no CANtact devices" — don't write code that assumes it imports.
+- **Diagnostics go through `logging`.** `diagnostics.install()` is the
+  first statement of `app.main`: one log file per launch in
+  `~/.ithildin/logs` (newest 10 kept), `None` stdio (the windowed frozen
+  build) redirected into it, `sys` / `threading` / unraisable excepthooks,
+  `faulthandler`, and a Qt message handler. Use
+  `logging.getLogger(__name__)` with %-style templates and args — every
+  handler rate-limits per (logger, level, template, exception site), so a
+  repeating message coalesces only if its template is constant. Never log
+  per frame. **Rule B:** a failure already surfaced through a Qt `error`
+  signal logs its traceback at WARNING (file only); ERROR is for failures
+  with no other surface. `ReportRelay` mirrors ERROR and above from every
+  logger except `can.bcm` into the Report dock, rate-limited 3 per 30 s;
+  `can.*` warnings stay in the file and console. `MainWindow.report()`
+  also writes each entry to the `ithildin.report` logger. Never call
+  `basicConfig` / `dictConfig` or add handlers anywhere else; uvicorn runs
+  with `log_config=None`. `StallWatchdog` (always on) dumps every thread's
+  stack into the log when the GUI thread stalls for 5 s.
 
 ## UI patterns
 
@@ -201,6 +221,10 @@ widget (drops on the inner GraphicsView don't propagate reliably).
   `tests/conftest.py::_DBC_SOURCE`). Don't construct `cantools.Signal`
   objects programmatically — that constructor has shifted across
   cantools major versions.
+- Never call `diagnostics.install()` in the test process: it rewires the
+  root logger, stdio, excepthooks and faulthandler, and defaults to the
+  real `~/.ithildin/logs`. Run it in a subprocess against `tmp_path` (see
+  `tests/test_diagnostics.py`); assert log output with `caplog`.
 
 ## Common file locations
 
@@ -217,6 +241,8 @@ widget (drops on the inner GraphicsView don't propagate reliably).
 | Add or re-enable a CAN backend | `ui/adapter_prober.py::_SUPPORTED_BACKENDS` + `workspace/schema.py::SupportedInterface` (must update both) |
 | Add a vendor dep that limits the Python range | `[project.optional-dependencies]` in `pyproject.toml` + the `--extra` in `.github/workflows/release.yml` |
 | Persist user-private state | `~/.ithildin/<project>/` (allowlist, audit, layout) |
+| Log a diagnostic | `logging.getLogger(__name__)`; levels and dock mirroring in `app_state/diagnostics.py` |
+| Read the diagnostic logs | `~/.ithildin/logs/` (app-global, one file per launch) |
 | Persist project state | the `.itp` file (TOML schema v2) |
 
 ## What this project is *not*

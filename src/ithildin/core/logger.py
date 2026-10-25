@@ -18,6 +18,7 @@ would re-read it forever) but the frame isn't written, and a parallel
 
 from __future__ import annotations
 
+import logging
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -32,6 +33,7 @@ if TYPE_CHECKING:
 
     from ithildin.core.types import FrameRecord
 
+_log = logging.getLogger(__name__)
 
 _IDLE_SLEEP_S = 0.05
 
@@ -70,6 +72,7 @@ class TeeWorker(QObject):
         try:
             writer = can.Logger(str(self._path))
         except Exception as exc:
+            _log.warning("Failed to open log file %s", self._path, exc_info=True)
             self.error.emit(f"Failed to open log file {self._path!s}: {exc}")
             self.stopped.emit()
             return
@@ -129,12 +132,13 @@ class TeeWorker(QObject):
                     writer.on_message_received(msg)
                     count += 1
         except Exception as exc:
+            _log.warning("Logger error writing %s", self._path, exc_info=True)
             self.error.emit(f"Logger error: {exc}")
         finally:
             try:
                 writer.stop()
             except Exception:
-                pass
+                _log.error("Failed to finalize log file %s", self._path, exc_info=True)
             self.frame_count.emit(count)
             self.dropped_count.emit(dropped)
             self.stopped.emit()

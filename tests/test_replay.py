@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import logging
 import time
 import uuid
 from pathlib import Path
@@ -112,3 +113,22 @@ def test_finished_waits_for_the_replay_thread(qapp, qtbot, tmp_path: Path) -> No
         controller.start()
 
     assert joined == [True]
+
+
+def test_replay_failure_logs_traceback(qapp, qtbot, tmp_path: Path, caplog) -> None:  # type: ignore[no-untyped-def]
+    log_path = tmp_path / "in.asc"
+    _write_log(log_path)
+
+    def send(_msg: can.Message) -> None:
+        raise can.CanOperationError("bus gone")
+
+    controller = ReplayController(log_path, send, speed=100.0)
+    with qtbot.waitSignal(controller.error, timeout=5000) as blocker:
+        controller.start()
+    assert "bus gone" in blocker.args[0]
+    assert controller.stop(wait_ms=2000)
+
+    (record,) = [r for r in caplog.records if r.name == "ithildin.core.replay"]
+    assert record.levelno == logging.WARNING
+    assert record.getMessage() == f"Replay of {log_path} failed"
+    assert record.exc_info is not None

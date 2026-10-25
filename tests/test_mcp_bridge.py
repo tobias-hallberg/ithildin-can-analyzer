@@ -16,7 +16,9 @@ and ``test_mcp_tools.py``.
 
 from __future__ import annotations
 
+import logging
 import socket
+import sys
 from pathlib import Path
 
 import pytest
@@ -86,6 +88,22 @@ def test_double_start_is_a_noop(qtbot, bridge: McpServerBridge) -> None:  # type
     # must not retry the bind (which would fail with EADDRINUSE).
     bridge.start(host="127.0.0.1", port=port)
     assert bridge.is_running is True
+
+
+def test_starts_without_stdio(qtbot, bridge: McpServerBridge, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """The windowed frozen build has no stdout/stderr. uvicorn's default log
+    config calls ``sys.stdout.isatty()``, so the server failed to start."""
+    monkeypatch.setattr(sys, "stdout", None)
+    monkeypatch.setattr(sys, "stderr", None)
+    errors: list[str] = []
+    bridge.error.connect(errors.append)
+
+    with qtbot.waitSignal(bridge.started, timeout=5000):
+        bridge.start(host="127.0.0.1", port=_free_port())
+
+    assert errors == []
+    # No dictConfig ran: uvicorn records propagate to the app's root handlers.
+    assert logging.getLogger("uvicorn").handlers == []
 
 
 def test_stop_when_never_started_is_safe(bridge: McpServerBridge) -> None:

@@ -13,6 +13,7 @@ app one thing to start/stop.
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import can
@@ -21,6 +22,8 @@ from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot
 from ithildin.core.ringbuf import RingBuffer
 from ithildin.core.types import FrameRecord
 from ithildin.workspace.schema import BusConfig
+
+_log = logging.getLogger(__name__)
 
 _RECV_TIMEOUT_S = 0.1
 """Worst-case shutdown latency. Bus polls recv() at this cadence and checks
@@ -58,6 +61,7 @@ class BusWorker(QObject):
         try:
             self._bus = self._open_bus()
         except Exception as exc:
+            _log.warning("Failed to open bus %r", self._name, exc_info=True)
             self.error.emit(f"Failed to open bus {self._name!r}: {exc}")
             self.stopped.emit()
             return
@@ -85,6 +89,7 @@ class BusWorker(QObject):
                 if count % 100 == 0:
                     self.frame_count.emit(count)
         except Exception as exc:
+            _log.warning("Capture error on %r", self._name, exc_info=True)
             self.error.emit(f"Capture error on {self._name!r}: {exc}")
         finally:
             self.frame_count.emit(count)
@@ -92,7 +97,7 @@ class BusWorker(QObject):
                 try:
                     self._bus.shutdown()
                 except Exception:
-                    pass
+                    _log.warning("Shutdown of bus %r failed", self._name, exc_info=True)
                 self._bus = None
             self.stopped.emit()
 

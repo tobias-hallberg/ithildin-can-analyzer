@@ -4,10 +4,12 @@
 
 from __future__ import annotations
 
+import logging
 import uuid
 
 import can
 import pytest
+from can.interfaces.virtual import VirtualBus
 
 from ithildin.core.bus import BusController
 from ithildin.core.ringbuf import RingBuffer
@@ -54,7 +56,7 @@ def test_capture_lifecycle(qapp, qtbot, virtual_channel: str) -> None:  # type: 
     assert all(f.bus_name == "Test" for f in frames)
 
 
-def test_open_failure_emits_error(qapp, qtbot) -> None:  # type: ignore[no-untyped-def]
+def test_open_failure_emits_error(qapp, qtbot, caplog) -> None:  # type: ignore[no-untyped-def]
     cfg = BusConfig(
         name="Bad",
         interface="virtual",
@@ -73,6 +75,54 @@ def test_open_failure_emits_error(qapp, qtbot) -> None:  # type: ignore[no-untyp
         controller.start()
     assert "simulated driver failure" in blocker.args[0]
     assert controller.stop(wait_ms=2000)
+    (record,) = [r for r in caplog.records if r.name == "ithildin.core.bus"]
+    assert record.levelno == logging.WARNING
+    assert record.getMessage() == "Failed to open bus 'Bad'"
+    assert record.exc_info is not None
+
+
+class _ShutdownFails(VirtualBus):
+    def shutdown(self) -> None:
+        super().shutdown()
+        raise RuntimeError("driver gone")
+
+
+class _RecvFails(VirtualBus):
+    def recv(self, timeout: float | None = None) -> can.Message | None:
+        raise can.CanOperationError("adapter gone")
+
+
+def test_shutdown_failure_is_logged(qapp, qtbot, caplog, virtual_channel: str) -> None:  # type: ignore[no-untyped-def]
+    cfg = BusConfig(name="Test", interface="virtual", channel=virtual_channel, bitrate=500000)
+    controller = BusController(cfg, RingBuffer(8))
+    controller.worker._open_bus = lambda: _ShutdownFails(channel=virtual_channel)  # type: ignore[method-assign]
+
+    with qtbot.waitSignal(controller.started, timeout=2000):
+        controller.start()
+    assert controller.stop(wait_ms=2000)
+
+    (record,) = [r for r in caplog.records if r.name == "ithildin.core.bus"]
+    assert record.levelno == logging.WARNING
+    assert record.getMessage() == "Shutdown of bus 'Test' failed"
+    assert record.exc_info is not None
+    assert str(record.exc_info[1]) == "driver gone"
+
+
+def test_capture_error_logs_traceback(qapp, qtbot, caplog, virtual_channel: str) -> None:  # type: ignore[no-untyped-def]
+    cfg = BusConfig(name="Test", interface="virtual", channel=virtual_channel, bitrate=500000)
+    controller = BusController(cfg, RingBuffer(8))
+    controller.worker._open_bus = lambda: _RecvFails(channel=virtual_channel)  # type: ignore[method-assign]
+
+    with qtbot.waitSignal(controller.error, timeout=2000) as blocker:
+        controller.start()
+    assert "adapter gone" in blocker.args[0]
+    assert controller.stop(wait_ms=2000)
+
+    (record,) = [r for r in caplog.records if r.name == "ithildin.core.bus"]
+    assert record.levelno == logging.WARNING
+    assert record.getMessage() == "Capture error on 'Test'"
+    assert record.exc_info is not None
+    assert isinstance(record.exc_info[1], can.CanOperationError)
 
 
 @pytest.mark.parametrize(

@@ -21,6 +21,7 @@ can run either, only the bridge's ``_main`` would change.
 from __future__ import annotations
 
 import asyncio
+import logging
 import secrets
 import threading
 from typing import TYPE_CHECKING
@@ -36,6 +37,7 @@ if TYPE_CHECKING:
 
     from ithildin.mcp.tools import McpReadContext, McpWriteContext
 
+_log = logging.getLogger(__name__)
 
 # How long uvicorn gets to unwind connections + ASGI lifespan on stop
 # before we stop waiting. Must stay under ``stop()``'s thread-join budget.
@@ -138,6 +140,7 @@ class McpServerBridge(QObject):
                 f"(address already in use?) — exit {exc.code}"
             )
         except Exception as exc:
+            _log.warning("MCP loop error", exc_info=True)
             self._emit_error(f"MCP loop error: {exc}")
         finally:
             try:
@@ -150,11 +153,11 @@ class McpServerBridge(QObject):
                 if pending:
                     loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
             except Exception:
-                pass
+                _log.warning("MCP loop teardown failed", exc_info=True)
             try:
                 loop.close()
             except Exception:
-                pass
+                _log.warning("MCP loop teardown failed", exc_info=True)
             self._emit_stopped()
 
     async def _main(self) -> None:
@@ -177,6 +180,10 @@ class McpServerBridge(QObject):
             host=self._mcp.settings.host,
             port=self._mcp.settings.port,
             log_level="warning",
+            # uvicorn's default dictConfig would close our root handlers and
+            # call sys.stdout.isatty(), which raises when the windowed build
+            # has no stdout.
+            log_config=None,
             lifespan="on",
         )
         server = uvicorn.Server(config)
@@ -206,6 +213,7 @@ class McpServerBridge(QObject):
             except asyncio.CancelledError:
                 continue
             if exc is not None:
+                _log.warning("MCP server task failed", exc_info=exc)
                 self._emit_error(f"MCP server stopped: {exc}")
 
         # Ask uvicorn to unwind its own accept loop, live connections and
@@ -219,6 +227,7 @@ class McpServerBridge(QObject):
             except (TimeoutError, asyncio.CancelledError):
                 pass
             except Exception as exc:
+                _log.warning("MCP server task failed during shutdown", exc_info=exc)
                 self._emit_error(f"task crash during shutdown: {exc}")
         if not stop_task.done():
             stop_task.cancel()

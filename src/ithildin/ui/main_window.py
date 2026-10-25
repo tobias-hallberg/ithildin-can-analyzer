@@ -27,10 +27,11 @@ closes every declared bus in one click.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from PySide6.QtCore import QSize, Qt
+from PySide6.QtCore import QSize, Qt, Slot
 from PySide6.QtGui import QAction, QActionGroup
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from PySide6.QtWidgets import (
@@ -66,10 +67,13 @@ if TYPE_CHECKING:
     from ithildin.app_state.bus_reader import BusReader
     from ithildin.app_state.context import AppContext
     from ithildin.app_state.database import Database
+    from ithildin.app_state.diagnostics import ReportRelay
 
 from ithildin.ui.window_manager import WindowManager
 
 _DEFAULT_SIZE = (1280, 800)
+
+_REPORT_LOG = logging.getLogger("ithildin.report")
 
 
 class MainWindow(QMainWindow):
@@ -455,11 +459,29 @@ class MainWindow(QMainWindow):
 
         Public so callers (Trace banner, McpDialog) can write into the
         same shared log surface. Routine info messages append silently
-        so the dock doesn't pop up on every successful operation.
+        so the dock doesn't pop up on every successful operation. Every
+        entry also lands in the log file.
         """
+        # Formatted up front: each distinct message keeps its own rate-limit
+        # key in the log.
+        _REPORT_LOG.info(f"[{kind}] {message}")
         self._report_widget.append(message, kind=kind)  # type: ignore[arg-type]
         if kind in ("warn", "error"):
             self._report_dock.setVisible(True)
+
+    def bind_log_relay(self, relay: ReportRelay) -> None:
+        """Show the relay's mirrored log records in the Report dock.
+
+        Queued explicitly: records are logged on capture, cyclic, MCP and
+        Qt threads, and the dock must only be touched on the GUI thread.
+        """
+        relay.message.connect(self._on_log_message, Qt.ConnectionType.QueuedConnection)
+
+    @Slot(str)
+    def _on_log_message(self, message: str) -> None:
+        # Not via report(): the record is already in the log file.
+        self._report_widget.append(message, kind="error")
+        self._report_dock.setVisible(True)
 
     def _build_status_bar(self) -> None:
         bar = self.statusBar()
