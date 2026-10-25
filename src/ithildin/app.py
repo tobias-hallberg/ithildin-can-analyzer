@@ -200,7 +200,16 @@ def main(argv: list[str] | None = None) -> int:
     QTimer.singleShot(0, watchdog.start)
     rc = app.exec()
     logging.getLogger().removeHandler(relay.handler)
-    bus_reader.close()
+    stuck = bus_reader.shutdown()
+    if stuck:
+        # Destroying a running QThread aborts the process and joining a hung
+        # vendor call never returns, so leave without tearing anything down.
+        # Layout, audit and settings are already flushed by aboutToQuit.
+        logging.getLogger(__name__).error(
+            "Bus worker(s) %s still running at exit; forcing exit", stuck
+        )
+        logging.shutdown()
+        os._exit(rc)
     return rc
 
 

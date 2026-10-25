@@ -137,11 +137,12 @@ class TeeWorker(QObject):
         finally:
             try:
                 writer.stop()
-            except Exception:
+            except BaseException:
                 _log.error("Failed to finalize log file %s", self._path, exc_info=True)
-            self.frame_count.emit(count)
-            self.dropped_count.emit(dropped)
-            self.stopped.emit()
+            finally:
+                self.frame_count.emit(count)
+                self.dropped_count.emit(dropped)
+                self.stopped.emit()
 
     @Slot()
     def request_stop(self) -> None:
@@ -153,6 +154,8 @@ class TeeLogger(QObject):
 
     error = Signal(str)
     started = Signal()
+    # After the thread has exited and been joined, so a consumer may drop
+    # its last reference to the logger from this signal.
     stopped = Signal()
     frame_count = Signal(int)
     dropped_count = Signal(int)
@@ -172,9 +175,9 @@ class TeeLogger(QObject):
         self._worker.stopped.connect(self._thread.quit, Qt.ConnectionType.DirectConnection)
         self._worker.error.connect(self.error)
         self._worker.started.connect(self.started)
-        self._worker.stopped.connect(self.stopped)
         self._worker.frame_count.connect(self.frame_count)
         self._worker.dropped_count.connect(self.dropped_count)
+        self._thread.finished.connect(self._on_thread_finished)
 
     def set_admit(self, admit: Callable[[FrameRecord], bool] | None) -> None:
         self._worker.set_admit(admit)
@@ -185,3 +188,10 @@ class TeeLogger(QObject):
     def stop(self, wait_ms: int = 5000) -> bool:
         self._worker.request_stop()
         return self._thread.wait(wait_ms)
+
+    @Slot()
+    def _on_thread_finished(self) -> None:
+        # Relaying the worker's own ``stopped`` let the consumer delete the
+        # QThread while it was still unwinding (see ReplayController).
+        self._thread.wait()
+        self.stopped.emit()

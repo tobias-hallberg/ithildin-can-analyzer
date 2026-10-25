@@ -722,22 +722,6 @@ def test_banner_taken_by_another_message_frees_the_health_banner(  # type: ignor
     assert win._banner._label.text().startswith("Bus CAN_1: bus-off.")
 
 
-def test_reconnect_left_pending_is_dropped_when_the_bus_starts_or_fails(  # type: ignore[no-untyped-def]
-    qapp, qtbot, tmp_path: Path
-) -> None:
-    ctx = make_app_context(tmp_path)
-    win = TraceWindow(instance_id="t1")
-    qtbot.addWidget(win)
-    win.bind(ctx)
-
-    win._reopen_bus = "CAN_1"
-    ctx.bus_reader.bus_started.emit("CAN_1")
-    assert win._reopen_bus is None
-    win._reopen_bus = "CAN_1"
-    ctx.bus_reader.bus_failed.emit("CAN_1", "adapter disconnected")
-    assert win._reopen_bus is None
-
-
 def test_bus_off_banner_reconnects_the_bus(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
     ctx, win = _trace_on_open_bus(qtbot, tmp_path)
 

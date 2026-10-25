@@ -33,7 +33,7 @@ from typing import Any, cast
 
 import can
 from can.broadcastmanager import ThreadBasedCyclicSendTask
-from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot
+from PySide6.QtCore import QDeadlineTimer, QObject, Qt, QThread, Signal, Slot
 
 from ithildin.core.ringbuf import RingBuffer
 from ithildin.core.types import HEALTH_RANK, BusHealth, FrameRecord
@@ -128,20 +128,24 @@ class BusWorker(QObject):
 
     @Slot()
     def start_capture(self) -> None:
-        try:
-            bus = self._open_bus()
-        except Exception as exc:
-            _log.warning("Failed to open bus %r", self._name, exc_info=True)
-            self.error.emit(f"Failed to open bus {self._name!r}: {exc}")
-            self.stopped.emit()
-            return
-        with self._send_lock:
-            self._bus = bus
-        self._next_tick = time.monotonic() + _HEALTH_TICK_S
-
-        self.started.emit()
         count = 0
+        # BaseException at this boundary: vendor bindings can raise panics
+        # and SystemExit. Report them through ``error``, so the reader sees a
+        # failure, instead of letting them escape the slot.
         try:
+            try:
+                bus = self._open_bus()
+            except BaseException as exc:
+                _log.warning("Failed to open bus %r", self._name, exc_info=True)
+                self.error.emit(f"Failed to open bus {self._name!r}: {exc}")
+                return
+            with self._send_lock:
+                self._bus = bus
+            # Stopped during a slow vendor open: never report it as started.
+            if self._stop:
+                return
+            self._next_tick = time.monotonic() + _HEALTH_TICK_S
+            self.started.emit()
             while not self._stop:
                 if self._flush_requested:
                     self._flush_requested = False
@@ -182,13 +186,15 @@ class BusWorker(QObject):
                 count += 1
                 if count % 100 == 0:
                     self.frame_count.emit(count)
-        except Exception as exc:
+        except BaseException as exc:
             _log.warning("Capture error on %r", self._name, exc_info=True)
             self.error.emit(f"Capture error on {self._name!r}: {exc}")
         finally:
-            self.frame_count.emit(count)
-            self._close_bus()
-            self.stopped.emit()
+            try:
+                self.frame_count.emit(count)
+                self._close_bus()
+            finally:
+                self.stopped.emit()
 
     @Slot()
     def request_stop(self) -> None:
@@ -367,7 +373,7 @@ class BusWorker(QObject):
                 cast(Any, bus).reset()
             elif self._config.interface == "kvaser":
                 bus.flush_tx_buffer()
-        except Exception:
+        except BaseException:
             _log.warning("TX flush on %r failed", self._name, exc_info=True)
 
     def _close_bus(self) -> None:
@@ -396,7 +402,7 @@ class BusWorker(QObject):
                 self._flush_tx(bus)
             try:
                 bus.shutdown()
-            except Exception:
+            except BaseException:
                 _log.warning("Shutdown of bus %r failed", self._name, exc_info=True)
 
     def _open_bus(self) -> can.BusABC:
@@ -505,6 +511,8 @@ class BusController(QObject):
     error = Signal(str)
     started = Signal()
     stopped = Signal()
+    # The thread has exited and been joined; deleting the controller is safe.
+    finished = Signal()
     frame_count = Signal(int)
     cyclic_failed = Signal(int, str)
     health = Signal(str, str)
@@ -524,7 +532,7 @@ class BusController(QObject):
         # DirectConnection so the worker thread itself calls thread.quit()
         # synchronously when capture stops. Otherwise the queued slot would
         # be delivered to the main thread, which is blocked in thread.wait()
-        # during BusController.stop().
+        # during BusReader.close().
         self._worker.stopped.connect(self._thread.quit, Qt.ConnectionType.DirectConnection)
         self._worker.error.connect(self.error)
         self._worker.started.connect(self.started)
@@ -532,6 +540,7 @@ class BusController(QObject):
         self._worker.frame_count.connect(self.frame_count)
         self._worker.cyclic_failed.connect(self.cyclic_failed)
         self._worker.health.connect(self.health)
+        self._thread.finished.connect(self._on_thread_finished)
 
     @property
     def name(self) -> str:
@@ -544,7 +553,23 @@ class BusController(QObject):
     def start(self) -> None:
         self._thread.start()
 
+    def request_stop(self) -> None:
+        """Ask the worker to stop without waiting for it."""
+        self._worker.request_stop()
+
+    def wait(self, deadline: QDeadlineTimer) -> bool:
+        """Wait for the thread to exit, up to ``deadline``. Returns whether it did."""
+        return self._thread.wait(deadline)
+
     def stop(self, wait_ms: int = 2000) -> bool:
         """Signal stop and wait for the thread to exit. Returns whether it did."""
-        self._worker.request_stop()
-        return self._thread.wait(wait_ms)
+        self.request_stop()
+        return self.wait(QDeadlineTimer(wait_ms))
+
+    @Slot()
+    def _on_thread_finished(self) -> None:
+        # The owner deletes the controller, and with it the QThread, from
+        # ``finished``. Join first: QThread.finished is emitted while the
+        # thread is still unwinding (see ReplayController).
+        self._thread.wait()
+        self.finished.emit()

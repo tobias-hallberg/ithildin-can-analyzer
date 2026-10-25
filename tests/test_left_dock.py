@@ -342,6 +342,7 @@ def test_bus_row_live_indicator_when_bus_reader_open(qapp, qtbot, tmp_path: Path
     row_body = dock._bus_tree.bus_row("Body")
     assert row_engine is not None and row_engine.state == "live"
     assert row_body is not None and row_body.state == "unavailable"
+    ctx.bus_reader._controllers = {}
 
 
 def test_bus_row_unavailable_when_no_matching_adapter(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
@@ -821,3 +822,48 @@ def test_bus_row_follows_health(qapp, qtbot, tmp_path: Path) -> None:  # type: i
     reader.bus_stopped.emit("Engine")
     assert item().text().startswith("✕  Engine")
     assert "Adapter lost" in item().toolTip()
+
+
+def test_remove_live_bus_closes_and_forgets(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    project = _make_project(tmp_path, ["Engine"])
+    ctx = make_app_context(tmp_path, project=project)
+    dock = LeftDockWidget()
+    qtbot.addWidget(dock)
+    dock.bind(ctx)
+    with qtbot.waitSignal(ctx.bus_reader.bus_started, timeout=2000):
+        ctx.bus_reader.open(ctx.project.workspace.bus[0])
+
+    dock._on_remove_bus("Engine")
+
+    assert not ctx.bus_reader.is_open
+    assert ctx.bus_reader.last_config_for("Engine") is None
+
+
+def test_closing_glyph_for_retiring_bus(qapp, qtbot, monkeypatch, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    import threading
+
+    from tests.fake_bus import FakeBus, use_fake_bus
+
+    fake = FakeBus()
+    fake.block = threading.Event()
+    use_fake_bus(monkeypatch, fake)
+    project = _make_project(tmp_path, ["Engine"])
+    ctx = make_app_context(tmp_path, project=project)
+    dock = LeftDockWidget()
+    qtbot.addWidget(dock)
+    dock.bind(ctx)
+    reader = ctx.bus_reader
+    with qtbot.waitSignal(reader.bus_started, timeout=2000):
+        reader.open(ctx.project.workspace.bus[0])
+
+    def item():  # type: ignore[no-untyped-def]
+        return dock._bus_tree._tree_model.item(0)
+
+    try:
+        reader.close(wait_ms=50)
+        assert item().text().startswith("◐  Engine")
+        assert item().toolTip().startswith("Closing")
+    finally:
+        with qtbot.waitSignal(reader.bus_released, timeout=2000):
+            fake.block.set()
+    assert item().text().startswith("◌  Engine")

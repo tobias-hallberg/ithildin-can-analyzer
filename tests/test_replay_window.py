@@ -90,3 +90,35 @@ def _speed_index_for(win: ReplayWindow, factor: float) -> int:
         if abs(float(win._speed_combo.itemData(i)) - factor) < 1e-6:
             return i
     return 1
+
+
+def test_quit_stops_replay(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    """Child views get no closeEvent on quit; aboutToQuit stops the replay."""
+    ctx = make_app_context(tmp_path)
+    cfg = BusConfig(
+        name="CAN_1", interface="virtual", channel=f"rp-{uuid.uuid4().hex[:8]}", bitrate=500000
+    )
+    with qtbot.waitSignal(ctx.bus_reader.bus_started, timeout=2000):
+        ctx.bus_reader.open(cfg)
+    win = ReplayWindow(instance_id="rp1")
+    qtbot.addWidget(win)
+    win.bind(ctx)
+    log = tmp_path / "in.asc"
+    writer = can.Logger(str(log))
+    try:
+        for i in range(50):
+            writer.on_message_received(
+                can.Message(timestamp=1000.0 + 0.1 * i, arbitration_id=0x300, channel="A")
+            )
+    finally:
+        writer.stop()
+    win._path_edit.setText(str(log))
+    win._speed_combo.setCurrentIndex(_speed_index_for(win, 1.0))
+    win._on_action_clicked()
+    controller = win._controller
+    assert controller is not None
+    qtbot.waitUntil(lambda: win._status_lbl.text().startswith("Playing"), timeout=2000)
+
+    qapp.aboutToQuit.emit()
+
+    assert controller._thread.isFinished()

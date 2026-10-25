@@ -86,3 +86,15 @@ def test_append_orders_newest_first(qapp) -> None:  # type: ignore[no-untyped-de
     # Row 0 = newest (ts=3.0, aid=0x300).
     assert model.data(model.index(0, TraceTreeModel.COL_ID)) == "300"
     assert model.data(model.index(2, TraceTreeModel.COL_ID)) == "100"
+
+
+def test_model_is_not_retained_by_the_theme(qapp) -> None:  # type: ignore[no-untyped-def]
+    """A replaced model must be freed, with its rows and the rings it holds."""
+    import gc
+    import weakref
+
+    model = TraceTreeModel({"A": RingBuffer(8)})
+    ref = weakref.ref(model)
+    del model
+    gc.collect()
+    assert ref() is None

@@ -20,10 +20,11 @@ from __future__ import annotations
 
 import logging
 import threading
+from typing import cast
 
 import can
 from can.broadcastmanager import ThreadBasedCyclicSendTask
-from PySide6.QtCore import QObject, QTimer, Signal
+from PySide6.QtCore import QDeadlineTimer, QObject, QTimer, Signal, Slot
 
 from ithildin.core.bus import BusController, BusWorker
 from ithildin.core.ringbuf import RingBuffer
@@ -51,11 +52,17 @@ class BusReader(QObject):
     # open() registered the bus; bus_started follows once the adapter is up.
     bus_opening = Signal(str)  # bus name
     bus_started = Signal(str)
+    # Exactly once per open, when the name leaves bus_names(): inside
+    # close(), or when the worker exits on its own. The ring's tail has
+    # been fanned out by then.
     bus_stopped = Signal(str)
     # Fires only when the worker died on its own (hardware unplug,
-    # backend error). Carries the last error message. Explicit close()
-    # never triggers this — see _close_one which clears _last_errors.
+    # backend error), just before bus_stopped. Carries the last error
+    # message. Explicit close() never triggers this.
     bus_failed = Signal(str, str)  # bus_name, error_message
+    # A bus whose close timed out has finally let go of its adapter; the
+    # name and channel can be opened again.
+    bus_released = Signal(str)
     # A periodic task died on a send error and has stopped.
     cyclic_failed = Signal(str, int, str)  # bus_name, arbitration_id, error
     # A send_message_async one-shot failed. Emitted from the send thread.
@@ -81,8 +88,12 @@ class BusReader(QObject):
         self._last_errors: dict[str, str] = {}
         # Health per bus: set to OK on bus_started, absent while opening.
         # LOST outlives the failure that follows it, so the UI can say why
-        # the bus went away; open() and close(name) clear it.
+        # the bus went away; open(), close(name) and forget() clear it.
         self._health: dict[str, tuple[BusHealth, str]] = {}
+        # Controllers whose close timed out, with the config they hold the
+        # adapter for. Kept until their thread exits; open() refuses their
+        # name and channel meanwhile.
+        self._retiring: dict[str, tuple[BusController, BusConfig]] = {}
         # Anchor for "elapsed" time across the UI. Set on the first
         # frame received while no buses had been open; reset to None
         # once the last bus closes. Views read this lazily to convert
@@ -163,11 +174,19 @@ class BusReader(QObject):
         cfg = self._last_configs.get(name)
         return bool(cfg and cfg.listen_only)
 
+    def is_closing(self, name: str) -> bool:
+        """Whether the named bus's close timed out and its thread still runs."""
+        return name in self._retiring
+
+    def closing_names(self) -> list[str]:
+        """Buses whose close timed out and whose thread still runs, forgotten or not."""
+        return list(self._retiring)
+
     def health(self, name: str) -> tuple[BusHealth, str] | None:
         """``(state, detail)`` of the named bus; ``None`` while it is opening or closed.
 
         A bus lost with its adapter keeps ``LOST`` after closing, until it is
-        opened again or closed by name. Any state but ``OK`` counts as
+        opened again, closed by name or forgotten. Any state but ``OK`` counts as
         degraded.
         Callable from any thread.
         """
@@ -194,22 +213,43 @@ class BusReader(QObject):
         the bus *name* — if a controller is already running under that
         name, ``open`` is a no-op (it does not reconfigure on the fly).
         Caller must ``close(name)`` first if they want to reopen with a
-        different ``BusConfig``.
+        different ``BusConfig``. Refused, with ``error``, while a bus of
+        that name or on that channel is still closing.
         """
-        if config.name in self._controllers:
+        name = config.name
+        if name in self._controllers:
+            return
+        holder = next(
+            (
+                n
+                for n, (_controller, c) in self._retiring.items()
+                if n == name or (c.interface, c.channel) == (config.interface, config.channel)
+            ),
+            None,
+        )
+        if holder is not None:
+            if holder == name:
+                reason = f"Bus {name!r} is still closing: its adapter has not released the channel"
+            else:
+                reason = (
+                    f"Bus {name!r} can't open: bus {holder!r} on the same channel is still "
+                    "closing and its adapter has not released the channel"
+                )
+            self.error.emit(f"{reason} yet. Try again once it has, or unplug the adapter.")
             return
         ring = RingBuffer(_RING_CAPACITY)
         controller = BusController(config, ring, parent=self)
-        name = config.name
-        controller.error.connect(lambda msg, n=name: self._on_controller_error(n, msg))
-        controller.started.connect(lambda n=name: self._on_controller_started(n))
-        controller.stopped.connect(lambda n=name: self._on_controller_stopped(n))
-        controller.cyclic_failed.connect(
-            lambda mid, err, n=name: self.cyclic_failed.emit(n, mid, err)
-        )
-        controller.health.connect(
-            lambda state, detail, n=name: self._on_controller_health(n, state, detail)
-        )
+        # The slots tell controllers apart by sender(), not by bus name: a
+        # late signal from a closed controller must not act on a bus reopened
+        # under the same name. Bound methods, not lambdas capturing self: a
+        # deleted controller would release the last reference to this
+        # reader mid-destruction.
+        controller.error.connect(self._on_controller_error)
+        controller.started.connect(self._on_controller_started)
+        controller.stopped.connect(self._on_controller_stopped)
+        controller.finished.connect(self._on_controller_finished)
+        controller.cyclic_failed.connect(self._on_controller_cyclic_failed)
+        controller.health.connect(self._on_controller_health)
         self._controllers[name] = controller
         self._rings[name] = ring
         self._cursors[name] = -1
@@ -235,74 +275,135 @@ class BusReader(QObject):
                 self.error.emit(f"Failed to open bus {cfg.name!r}: {exc}")
 
     def close(self, name: str | None = None, *, wait_ms: int = 2000) -> None:
-        """Close one bus by name, or every open bus when ``name`` is ``None``."""
-        if name is None:
-            for bus_name in list(self._controllers.keys()):
-                self._close_one(bus_name, wait_ms=wait_ms)
-        else:
-            self._close_one(name, wait_ms=wait_ms)
-        # Drain anything still pending so consumers see a final batch.
+        """Close one bus by name, or every open bus when ``name`` is ``None``.
+
+        Every target is asked to stop first, then all are waited on against
+        one ``wait_ms`` deadline. The ring tails are fanned out and
+        ``bus_stopped`` fires for each before this returns. A bus that
+        misses the deadline still counts as closed, but stays closing
+        (``is_closing``) until its thread exits, then ``bus_released``.
+        Closing by name also clears a held LOST health.
+        """
+        targets = [(n, c) for n, c in self._controllers.items() if name in (None, n)]
+        for _n, c in targets:
+            c.request_stop()
+        deadline = QDeadlineTimer(wait_ms)
+        stuck = [(n, c) for n, c in targets if not c.wait(deadline)]
         self._fan_out()
-        if not self._controllers:
-            self._timer.stop()
+        if name is not None:
+            self._health.pop(name, None)
+        for n, _c in targets:
+            self._health.pop(n, None)
+            self._drop(n)
+        for n, c in stuck:
+            self._retiring[n] = (c, self._last_configs[n])
+            _log.warning("Bus %r did not stop within %.1f s", n, wait_ms / 1000)
+            self.error.emit(
+                f"Bus {n!r} did not stop within {wait_ms / 1000:.1f} s: its adapter "
+                "has not released the channel. It can be opened again once it does."
+            )
+        for n, _c in targets:
+            self.bus_stopped.emit(n)
 
     def close_all(self, *, wait_ms: int = 2000) -> None:
         """Convenience alias for ``close(name=None)``."""
         self.close(None, wait_ms=wait_ms)
 
-    def _close_one(self, name: str, *, wait_ms: int) -> None:
-        # Drop any pending error so the soon-to-arrive worker stopped
-        # signal can't fire bus_failed for a bus the user is closing.
-        self._last_errors.pop(name, None)
-        self._health.pop(name, None)
-        controller = self._controllers.pop(name, None)
+    def shutdown(self, *, wait_ms: int = 2000) -> list[str]:
+        """Close every bus for quit; return the names whose thread still runs.
+
+        Waits ``wait_ms`` for the open buses, then up to ``wait_ms`` more
+        for those still closing. A running thread must not be destroyed
+        (Qt aborts the process), so the caller has to exit around it.
+        """
+        self.close(wait_ms=wait_ms)
+        deadline = QDeadlineTimer(wait_ms)
+        return [n for n, (c, _cfg) in self._retiring.items() if not c.wait(deadline)]
+
+    def forget(self, name: str | None = None) -> None:
+        """Drop what is remembered about a closed bus, or about every bus when
+        ``name`` is ``None``: the config that Reconnect and the project
+        snapshot reuse, and a held LOST health. For buses that left the
+        project; call after :meth:`close`.
+        """
+        names = list(self._last_configs) if name is None else [name]
+        for n in names:
+            self._last_configs.pop(n, None)
+            self._health.pop(n, None)
+
+    def _drop(self, name: str) -> str | None:
+        """Unregister a running bus; returns its last error, if any."""
+        del self._controllers[name]
         self._rings.pop(name, None)
         self._cursors.pop(name, None)
-        if controller is not None:
-            controller.stop(wait_ms=wait_ms)
-        if not self._controllers and self._session_t0 is not None:
-            self._session_t0 = None
-            self.session_t0_changed.emit(None)
+        last_error = self._last_errors.pop(name, None)
+        if not self._controllers:
+            self._timer.stop()
+            if self._session_t0 is not None:
+                self._session_t0 = None
+                self.session_t0_changed.emit(None)
+        return last_error
 
-    def _on_controller_started(self, name: str) -> None:
-        if name in self._controllers:
-            self._health[name] = (BusHealth.OK, "")
-        self.bus_started.emit(name)
+    def _sender_if_current(self) -> BusController | None:
+        """The controller that sent the signal being handled, if still registered."""
+        controller = cast(BusController, self.sender())
+        return controller if self._controllers.get(controller.name) is controller else None
 
-    def _on_controller_health(self, name: str, state: str, detail: str) -> None:
-        if name not in self._controllers:
+    @Slot()
+    def _on_controller_started(self) -> None:
+        controller = self._sender_if_current()
+        if controller is None:
             return
-        self._health[name] = (BusHealth(state), detail)
-        self.bus_health_changed.emit(name, state, detail)
+        self._health[controller.name] = (BusHealth.OK, "")
+        self.bus_started.emit(controller.name)
 
-    def _on_controller_error(self, name: str, msg: str) -> None:
-        self._last_errors[name] = msg
+    @Slot(str, str)
+    def _on_controller_health(self, state: str, detail: str) -> None:
+        controller = self._sender_if_current()
+        if controller is None:
+            return
+        self._health[controller.name] = (BusHealth(state), detail)
+        self.bus_health_changed.emit(controller.name, state, detail)
+
+    @Slot(int, str)
+    def _on_controller_cyclic_failed(self, message_id: int, error: str) -> None:
+        controller = self._sender_if_current()
+        if controller is not None:
+            self.cyclic_failed.emit(controller.name, message_id, error)
+
+    @Slot(str)
+    def _on_controller_error(self, msg: str) -> None:
+        controller = self._sender_if_current()
+        if controller is not None:
+            self._last_errors[controller.name] = msg
         self.error.emit(msg)
 
-    def _on_controller_stopped(self, name: str) -> None:
-        """Worker exited. If close() hasn't already cleaned up, do it now.
-
-        ``was_running=True`` here means the worker stopped on its own
-        (no _close_one in between); in that case we may also emit
-        ``bus_failed`` if an error was recorded for this bus.
-        """
-        was_running = name in self._controllers
-        if was_running:
-            self._controllers.pop(name, None)
-            self._rings.pop(name, None)
-            self._cursors.pop(name, None)
-            health = self._health.get(name)
-            if health is not None and health[0] is not BusHealth.LOST:
-                del self._health[name]
-            if not self._controllers:
-                self._timer.stop()
-                if self._session_t0 is not None:
-                    self._session_t0 = None
-                    self.session_t0_changed.emit(None)
-        last_error = self._last_errors.pop(name, None)
-        if was_running and last_error is not None:
+    @Slot()
+    def _on_controller_stopped(self) -> None:
+        """The worker exited on its own; close() has dealt with every other stop."""
+        controller = self._sender_if_current()
+        if controller is None:
+            return
+        name = controller.name
+        self._fan_out()
+        health = self._health.get(name)
+        if health is not None and health[0] is not BusHealth.LOST:
+            del self._health[name]
+        last_error = self._drop(name)
+        if last_error is not None:
             self.bus_failed.emit(name, last_error)
         self.bus_stopped.emit(name)
+
+    @Slot()
+    def _on_controller_finished(self) -> None:
+        controller = cast(BusController, self.sender())
+        name = controller.name
+        entry = self._retiring.get(name)
+        if entry is not None and entry[0] is controller:
+            del self._retiring[name]
+            _log.info("Bus %r released its adapter", name)
+            self.bus_released.emit(name)
+        controller.deleteLater()
 
     # ---- Send ----
 

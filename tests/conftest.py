@@ -19,25 +19,31 @@ from ithildin.mcp.tools import McpReadContext
 from ithildin.ui.ui_events import UiEvents
 
 _open_bus_readers: list[BusReader] = []
+# Freeing a reader whose worker outlived shutdown() would destroy a running
+# QThread, and Qt would abort the run before the fixture's assertion reports.
+_stuck_bus_readers: list[BusReader] = []
 
 
 @pytest.fixture(autouse=True)
 def _close_leaked_bus_readers():  # type: ignore[no-untyped-def]
-    """Close every BusReader a test built via ``make_app_context``.
+    """Shut down every BusReader a test built via ``make_app_context``.
 
     ``BusController`` runs its RX loop on a QThread. A test that opens a
     bus but never closes it leaves that thread running; at interpreter
     shutdown Qt aborts the process ("QThread: Destroyed while thread is
     still running"), which would fail CI even though the tests passed.
-    ``close()`` is idempotent and a no-op when nothing is open.
+    A worker still running after ``shutdown()`` fails the test here
+    instead.
     """
     yield
+    stuck: list[str] = []
     while _open_bus_readers:
         reader = _open_bus_readers.pop()
-        try:
-            reader.close()
-        except Exception:
-            pass
+        names = reader.shutdown()
+        if names:
+            _stuck_bus_readers.append(reader)
+            stuck += names
+    assert stuck == []
 
 
 def make_app_context(

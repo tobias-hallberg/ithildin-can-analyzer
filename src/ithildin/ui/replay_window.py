@@ -13,6 +13,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from PySide6.QtCore import QCoreApplication
 from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
@@ -61,6 +62,11 @@ class ReplayWindow(ChildView):
 
     def bind(self, ctx: AppContext) -> None:
         self._ctx = ctx
+        # Child views get no closeEvent when the main window closes; stop
+        # here so the replay thread is joined before exit.
+        app = QCoreApplication.instance()
+        assert app is not None
+        app.aboutToQuit.connect(self._stop)
 
     # ---- Build ----
 

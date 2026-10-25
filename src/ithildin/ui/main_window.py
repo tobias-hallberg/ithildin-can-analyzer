@@ -503,6 +503,7 @@ class MainWindow(QMainWindow):
             self._bus.bus_opening.connect(self._on_bus_state_changed)
             self._bus.bus_started.connect(self._on_bus_state_changed)
             self._bus.bus_stopped.connect(self._on_bus_state_changed)
+            self._bus.bus_released.connect(self._on_bus_state_changed)
             self._bus.bus_health_changed.connect(self._on_bus_health_changed)
             self._bus.error.connect(lambda msg: self.report(msg, kind="error"))
             # Bound slots, so the off-GUI-thread send_failed is queued here.
@@ -537,17 +538,21 @@ class MainWindow(QMainWindow):
             self.report(f"Bus {name}: live again", kind="info")
 
     def _refresh_status_left(self) -> None:
-        """One segment per open bus, plus buses whose adapter was lost."""
+        """One segment per open bus, plus buses still closing or whose adapter was lost."""
         if self._bus is None:
             return
         tokens = ThemeManager.instance().current_tokens()
         open_names = set(self._bus.bus_names())
+        closing = self._bus.closing_names()
         segments: list[str] = []
         lines: list[str] = []
-        for cfg in self._bus.last_configs():
-            health = self._bus.health(cfg.name)
+        # A forgotten bus that is still closing keeps its segment: its channel
+        # stays refused until it is released.
+        names = dict.fromkeys([*(cfg.name for cfg in self._bus.last_configs()), *closing])
+        for name in names:
+            health = self._bus.health(name)
             tint: str | None = None
-            if cfg.name in open_names:
+            if name in open_names:
                 if health is None:
                     text = "opening"
                 elif health[0] is BusHealth.OK:
@@ -555,12 +560,15 @@ class MainWindow(QMainWindow):
                 else:
                     text = health[0].describe(health[1])
                     tint = "warn" if health[0] is BusHealth.ERRORS else "err"
+            elif name in closing:
+                text = "closing"
+                tint = "warn"
             elif health is not None and health[0] is BusHealth.LOST:
                 text = health[0].label
                 tint = "err"
             else:
                 continue
-            line = f"{cfg.name} · {text}"
+            line = f"{name} · {text}"
             lines.append(line)
             segment = html.escape(line)
             if tint is not None:
@@ -592,6 +600,8 @@ class MainWindow(QMainWindow):
         self._ctx = ctx
         self._current_project = ctx.project
         ctx.events.buses_changed.connect(self._refresh_connect_action)
+        # A removed bus is forgotten, which emits nothing on the bus reader.
+        ctx.events.buses_changed.connect(self._refresh_status_left)
         ctx.events.report_requested.connect(self._on_report_requested)
         bridge = ctx.mcp_bridge
         bridge.started.connect(self._on_mcp_started)
@@ -873,6 +883,11 @@ class MainWindow(QMainWindow):
         if self._db is not None:
             for p in list(self._db.loaded_paths()):
                 self._db.remove_dbc(p)
+        # After the views, so the TX scheduler shuts down before its buses.
+        if self._bus is not None:
+            self._bus.close()
+            self._bus.forget()
+            self._refresh_status_left()
 
     # ---- Lifecycle ----
 

@@ -24,6 +24,8 @@ class FakeBus(can.BusABC):
 
     * ``send_exc`` / ``recv_exc``: raised by every ``send`` / ``recv``
       while set.
+    * ``open_gate``: opening waits for this event (a slow vendor open).
+    * ``block``: every ``recv`` waits for this event (a hung vendor call).
     * ``rx``: scripted receive. Each queued message is returned once, each
       queued exception raised once, in order; an empty queue times out.
     * ``status_code``: what PCAN's ``status()`` reports (0 is OK);
@@ -33,7 +35,8 @@ class FakeBus(can.BusABC):
       ``flush_exc`` makes either raise.
     * ``recv_calls`` counts polls; once it moves past a reading taken
       after a request flag cleared, the worker has acted on the request.
-    * ``shutdown_calls`` counts ``shutdown``.
+    * ``shutdown_calls`` counts ``shutdown``; ``shutdown_exc`` makes it
+      raise after counting.
 
     ``lock`` is the owning worker's send lock, set by ``use_fake_bus``.
     """
@@ -43,7 +46,9 @@ class FakeBus(can.BusABC):
         self.channel_info = "fake"
         self.lock: threading.Lock | None = None
         self.send_exc: Exception | None = None
-        self.recv_exc: Exception | None = None
+        self.recv_exc: BaseException | None = None
+        self.open_gate: threading.Event | None = None
+        self.block: threading.Event | None = None
         self.rx: queue.SimpleQueue[can.Message | Exception] = queue.SimpleQueue()
         self.status_code = 0
         self.flush_exc: Exception | None = None
@@ -52,6 +57,7 @@ class FakeBus(can.BusABC):
         self.flushes = 0
         self.recv_calls = 0
         self.shutdown_calls = 0
+        self.shutdown_exc: BaseException | None = None
 
     def send(self, msg: can.Message, timeout: float | None = None) -> None:
         if self.send_exc is not None:
@@ -61,6 +67,8 @@ class FakeBus(can.BusABC):
 
     def _recv_internal(self, timeout: float | None) -> tuple[can.Message | None, bool]:
         self.recv_calls += 1
+        if self.block is not None:
+            self.block.wait()
         if self.recv_exc is not None:
             raise self.recv_exc
         try:
@@ -94,6 +102,8 @@ class FakeBus(can.BusABC):
     def shutdown(self) -> None:
         self.shutdown_calls += 1
         super().shutdown()
+        if self.shutdown_exc is not None:
+            raise self.shutdown_exc
 
 
 def pcan_error(code: int) -> str:
@@ -106,6 +116,8 @@ def use_fake_bus(monkeypatch: pytest.MonkeyPatch, fake: FakeBus | None = None) -
 
     def _open(worker: BusWorker) -> can.BusABC:
         bus.lock = worker._send_lock
+        if bus.open_gate is not None:
+            bus.open_gate.wait()
         return bus
 
     monkeypatch.setattr(BusWorker, "_open_bus", _open)

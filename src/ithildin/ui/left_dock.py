@@ -239,7 +239,15 @@ class MessagesModel(QAbstractListModel):
 
 
 LiveState = Literal[
-    "live", "opening", "errors", "bus_off", "lost", "stopped", "available", "unavailable"
+    "live",
+    "opening",
+    "errors",
+    "bus_off",
+    "lost",
+    "closing",
+    "stopped",
+    "available",
+    "unavailable",
 ]
 """Per-row liveness:
 
@@ -248,6 +256,8 @@ LiveState = Literal[
 - ``errors`` / ``bus_off`` — capturing, but the bus is degraded.
 - ``lost`` — the adapter went away; holds until the bus is opened or
   closed again.
+- ``closing`` — Disconnect timed out: the driver has not released the
+  channel, and connecting is refused until it does.
 - ``stopped`` — this bus was opened earlier in this session but its
   worker has exited (user disconnect, or hardware unplug / error).
 - ``available`` — a detected adapter matches this row's
@@ -261,6 +271,7 @@ _DOT_FOR_STATE: dict[LiveState, str] = {
     "errors": "▲",
     "bus_off": "■",
     "lost": "✕",
+    "closing": "◐",
     "stopped": "◌",
     "available": "○",
     "unavailable": "⊘",
@@ -287,6 +298,11 @@ _STATE_HINTS: dict[LiveState, tuple[str, str | None]] = {
         "err",
     ),
     "lost": ("Adapter lost — plug it back in, then connect the bus again.", "err"),
+    "closing": (
+        "Closing — the adapter has not released the channel yet. "
+        "Connecting is refused until it does.",
+        "warn",
+    ),
 }
 
 
@@ -665,6 +681,7 @@ class LeftDockWidget(QWidget):
         ctx.bus_reader.bus_opening.connect(self._on_bus_state_changed)
         ctx.bus_reader.bus_started.connect(self._on_bus_state_changed)
         ctx.bus_reader.bus_stopped.connect(self._on_bus_state_changed)
+        ctx.bus_reader.bus_released.connect(self._on_bus_state_changed)
         ctx.bus_reader.bus_health_changed.connect(self._on_bus_health_changed)
         if self._bus_tree is not None:
             self._bus_tree.set_signal_centric_getter(ctx.database.is_signal_centric)
@@ -1055,6 +1072,8 @@ class LeftDockWidget(QWidget):
             health = bus_reader.health(cfg.name)
             if cfg.name in live_names:
                 state = "opening" if health is None else _STATE_FOR_HEALTH[health[0]]
+            elif bus_reader.is_closing(cfg.name):
+                state = "closing"
             elif health is not None and health[0] is BusHealth.LOST:
                 state = "lost"
             elif cfg.name in ever_opened:
@@ -1181,6 +1200,10 @@ class LeftDockWidget(QWidget):
     def _on_remove_bus(self, bus_name: str) -> None:
         if self._ctx is None:
             return
+        # A removed bus must not keep running, nor be reopened by a
+        # Reconnect from a remembered config.
+        self._ctx.bus_reader.close(bus_name)
+        self._ctx.bus_reader.forget(bus_name)
         project = self._ctx.project
         project.workspace.bus = [b for b in project.workspace.bus if b.name != bus_name]
         # Cascade: drop any DBC bindings that referenced the removed bus.

@@ -42,6 +42,7 @@ from PySide6.QtGui import QColor
 
 from ithildin.core.ringbuf import RingBuffer
 from ithildin.core.types import FrameRecord
+from ithildin.ui.icons import themed_callback
 from ithildin.ui.theme import ThemeManager
 
 if TYPE_CHECKING:
@@ -128,8 +129,9 @@ class TraceTreeModel(QAbstractItemModel):
         # Direction-column tints; refreshed on theme change.
         self._rx_color = QColor()
         self._tx_color = QColor()
-        self._refresh_direction_colors()
-        ThemeManager.instance().theme_changed.connect(lambda _t: self._refresh_direction_colors())
+        # Held weakly: a lambda on the app-lifetime ThemeManager would keep
+        # every replaced model, and its rows and rings, alive.
+        themed_callback(self._refresh_direction_colors)
         self._timer = QTimer(self)
         self._timer.setInterval(max(1, 1000 // update_hz))
         self._timer.timeout.connect(self._drain)

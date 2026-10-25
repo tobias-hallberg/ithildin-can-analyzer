@@ -5,9 +5,11 @@
 from __future__ import annotations
 
 import logging
+import time
 from pathlib import Path
 
 import can
+from PySide6.QtCore import Qt
 
 from ithildin.core.logger import TeeLogger
 from ithildin.core.ringbuf import RingBuffer
@@ -80,3 +82,37 @@ def test_finalize_failure_logged_as_error(qapp, qtbot, tmp_path: Path, caplog, m
     assert record.levelno == logging.ERROR
     assert record.getMessage() == f"Failed to finalize log file {tmp_path / 'out.mf4'}"
     assert record.exc_info is not None
+
+
+def test_stopped_after_thread_finished(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    """The Record window drops its last reference to the logger from ``stopped``.
+    A blocking slot on the worker's own ``stopped`` holds the thread open."""
+    logger = TeeLogger(tmp_path / "out.unsupported_ext", {"A": RingBuffer(8)})
+    logger._worker.stopped.connect(lambda: time.sleep(0.2), Qt.ConnectionType.DirectConnection)
+    joined: list[bool] = []
+    logger.stopped.connect(lambda: joined.append(logger._thread.isFinished()))
+
+    with qtbot.waitSignal(logger.stopped, timeout=5000):
+        logger.start()
+    assert joined == [True]
+
+
+class _Panic(BaseException):
+    pass
+
+
+class _FinalizePanics(_FinalizeFails):
+    def stop(self) -> None:
+        raise _Panic("writer panicked")
+
+
+def test_stopped_when_writer_stop_raises(qapp, qtbot, tmp_path: Path, caplog, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setattr(can, "Logger", _FinalizePanics)
+    logger = TeeLogger(tmp_path / "out.mf4", {"A": RingBuffer(8)})
+
+    with qtbot.waitSignal(logger.started, timeout=2000):
+        logger.start()
+    with qtbot.waitSignal(logger.stopped, timeout=5000):
+        assert logger.stop(wait_ms=5000)
+    (record,) = [r for r in caplog.records if r.name == "ithildin.core.logger"]
+    assert record.levelno == logging.ERROR

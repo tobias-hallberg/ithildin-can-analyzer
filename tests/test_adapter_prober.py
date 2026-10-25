@@ -279,3 +279,25 @@ def test_register_prober_retains_until_thread_finished(qtbot) -> None:  # type: 
             t.start()
 
     assert (p, t) not in prober_mod._INFLIGHT_PROBES
+
+
+def test_hung_probe_helper_is_daemon(qtbot) -> None:  # type: ignore[no-untyped-def]
+    """A timed-out probe thread is abandoned; it must not hold up interpreter exit."""
+    import threading
+
+    release = threading.Event()
+
+    def _hang(_backend: str) -> list[dict[str, object]]:
+        release.wait()
+        return []
+
+    p = AdapterProber(timeout_s=0.1)
+    before = set(threading.enumerate())
+    try:
+        with patch.object(prober_mod, "_detect_configs", _stub_per_backend({"pcan": _hang})):
+            with qtbot.waitSignal(p.finished, timeout=2000):
+                p.run()
+        (helper,) = [t for t in threading.enumerate() if t.name == "probe-pcan" and t not in before]
+        assert helper.daemon
+    finally:
+        release.set()

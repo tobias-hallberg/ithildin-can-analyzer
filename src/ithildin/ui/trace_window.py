@@ -192,10 +192,6 @@ class TraceWindow(ChildView):
         self._health_bus: str | None = None
         # Last health per running bus; absent means OK.
         self._health_seen: dict[str, tuple[BusHealth, str]] = {}
-        # Bus the bus-off Reconnect closed, to open again once it stopped.
-        # Dropped if the bus starts or fails meanwhile, so a stop that never
-        # came can't reopen it later.
-        self._reopen_bus: str | None = None
         layout.addWidget(self._banner)
 
         self._splitter = QSplitter(Qt.Orientation.Horizontal, self)
@@ -440,8 +436,6 @@ class TraceWindow(ChildView):
     def _on_bus_failed(self, bus_name: str, message: str) -> None:
         self._failed_bus_name = bus_name
         self._health_bus = None
-        if self._reopen_bus == bus_name:
-            self._reopen_bus = None
         self._banner.show_message(
             f"Bus {bus_name} disconnected: {message}",
             kind="error",
@@ -449,8 +443,6 @@ class TraceWindow(ChildView):
         )
 
     def _on_bus_started_clear_banner(self, bus_name: str) -> None:
-        if self._reopen_bus == bus_name:
-            self._reopen_bus = None
         if self._failed_bus_name == bus_name:
             self._failed_bus_name = None
             self._banner.hide()
@@ -459,11 +451,6 @@ class TraceWindow(ChildView):
         self._health_seen.pop(bus_name, None)
         if self._health_bus == bus_name:
             self._show_worst_health()
-        if self._reopen_bus == bus_name and self._ctx is not None:
-            self._reopen_bus = None
-            cfg = self._ctx.bus_reader.last_config_for(bus_name)
-            if cfg is not None:
-                self._ctx.bus_reader.open(cfg)
 
     def _on_bus_health_changed(self, bus_name: str, state: str, detail: str) -> None:
         health = BusHealth(state)
@@ -529,11 +516,8 @@ class TraceWindow(ChildView):
             return
         if bus_name == self._health_bus:
             # Bus-off: the bus is still open, and reopening resets the
-            # controller. Open once its stop has arrived: a stop that lands
-            # after the new open would take the new bus down with it.
-            self._reopen_bus = bus_name
+            # controller.
             self._ctx.bus_reader.close(bus_name)
-            return
         cfg = self._ctx.bus_reader.last_config_for(bus_name)
         if cfg is None:
             return

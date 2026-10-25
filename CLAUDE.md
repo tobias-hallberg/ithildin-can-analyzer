@@ -63,7 +63,33 @@ MCP layer (`src/ithildin/mcp/`):
   deny outcomes.
 - **Bus worker shutdown** uses `Qt.ConnectionType.DirectConnection` for
   `worker.stopped → thread.quit`. The main thread blocks on
-  `thread.wait()`; a queued slot can't fire there.
+  `thread.wait()`; a queued slot can't fire there. `start_capture` catches
+  `BaseException` at its boundary (vendor panics) and emits `stopped` from
+  a nested `finally`, so it can't be skipped; a stop requested during a
+  slow open shuts the bus without ever emitting `started`.
+- **`bus_stopped` is synchronous and fires once per open.** `BusReader.close()`
+  asks every target to stop, waits on one shared deadline, fans out the
+  rings' tails, then emits `bus_stopped(name)` as `name` leaves
+  `bus_names()` — so a `bus_stopped` slot runs inside the caller's
+  `close()` (don't call `close()`/`open()` back from it). A worker that
+  exits on its own does the same from its `stopped`, with `bus_failed`
+  just before. Open / New Project and removing a bus from the dock close
+  and `forget()` it.
+- **Controller signals are routed by identity.** `BusReader` tells
+  controllers apart by `sender()`, never by bus name, and ignores any
+  that is no longer registered, so a late signal can't act on a bus
+  reopened under the same name. Connect them to bound slots: a lambda
+  capturing the reader frees it mid-destruction when the controller is
+  deleted. A close that misses its deadline leaves the controller
+  *retiring* (`is_closing`, dock "closing"); `open()` refuses its name
+  and channel until its thread exits and `bus_released` fires.
+- **Delete a thread's owner only after the thread is joined.**
+  `BusController.finished`, `TeeLogger.stopped` and
+  `ReplayController.finished` fire after `QThread.finished` + `wait()`;
+  `BusReader` `deleteLater`s a controller only from `finished`. Child
+  views get no `closeEvent` on quit, so Record and Replay stop from
+  `aboutToQuit`. Quit calls `bus_reader.shutdown()` and `os._exit`s only
+  when a worker is still stuck (a running QThread can't be destroyed).
 - **One send lock per bus.** `BusWorker._send_lock` serialises every
   touch of a python-can bus other than `recv()`: `send` (from any
   thread), cyclic tasks, task creation, the TX flush and `_close_bus`.
@@ -108,11 +134,12 @@ MCP layer (`src/ithildin/mcp/`):
   `health(state, detail)` fires only on a change. A lost adapter raises
   into the normal failure path. Never add a sleep when `recv` returns
   `None`. `BusReader.health(name)` is `None` while opening, OK from
-  `bus_started`; LOST outlives the failure until the bus is opened again
-  or closed by name. **Degraded means `health is not BusHealth.OK`**, one rule
-  everywhere. Known gaps: Kvaser bus-off shows only through the error-frame
-  rate (python-can doesn't wrap `canReadStatus`); an IXXAT bus in error
-  keeps up to 16 stale queued frames (its flush waits INFINITE).
+  `bus_started`; LOST outlives the failure until the bus is opened again,
+  closed by name or forgotten. **Degraded means `health is not
+  BusHealth.OK`**, one rule everywhere. Known gaps: Kvaser bus-off shows
+  only through the error-frame rate (python-can doesn't wrap
+  `canReadStatus`); an IXXAT bus in error keeps up to 16 stale queued
+  frames (its flush waits INFINITE).
 - **Error frames are coalesced in `BusWorker`.** The ring gets at most ~10
   per second per bus, each with `FrameRecord.coalesced` = how many it
   stands for; data frames are never dropped. Bus state comes from
@@ -282,8 +309,12 @@ widget (drops on the inner GraphicsView don't propagate reliably).
   makes every `BusWorker` open a scriptable `FakeBus` (raising
   `send`/`recv`, flush counters, the sending thread and lock state per
   frame), so a `pcan` / `kvaser` / `ixxat` config runs that backend's
-  branches without importing a vendor module. Extend it rather than
-  writing another fake.
+  branches without importing a vendor module. `open_gate` / `block`
+  hang the open or `recv` like a stuck vendor call until the event is
+  set; set it before the test ends. Extend it rather than writing
+  another fake.
+- The conftest fails a test whose `make_app_context` reader still has a
+  worker running after `shutdown()`.
 - For Qt signals fired during a method call, use
   `with qtbot.waitSignal(sig, timeout=…):` not `QSignalSpy().wait()` —
   the spy can miss signals fired before `wait()` returns.

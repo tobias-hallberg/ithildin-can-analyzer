@@ -705,3 +705,101 @@ def test_status_bar_and_report_follow_bus_health(  # type: ignore[no-untyped-def
     texts = [win._report_widget.item(i).text() for i in range(win._report_widget.count())]
     assert "adapter disconnected" in texts[0]
     assert not any("adapter lost" in text for text in texts)
+
+
+def test_connect_action_resets_after_timed_out_close(  # type: ignore[no-untyped-def]
+    qapp, qtbot, monkeypatch, tmp_path: Path
+) -> None:
+    import threading
+
+    from tests.fake_bus import FakeBus, use_fake_bus
+
+    fake = FakeBus()
+    fake.block = threading.Event()
+    use_fake_bus(monkeypatch, fake)
+    project = new_unsaved()
+    project.workspace.bus = [
+        BusConfig(name="CAN_1", interface="virtual", channel="hung", bitrate=500000)
+    ]
+    ctx = make_app_context(tmp_path, project=project)
+    win = MainWindow(bus_reader=ctx.bus_reader, database=ctx.database, prompt_on_close=False)
+    qtbot.addWidget(win)
+    win.bind_events(ctx)
+    with qtbot.waitSignal(ctx.bus_reader.bus_started, timeout=2000):
+        win._on_connect_toggled()
+
+    try:
+        ctx.bus_reader.close(wait_ms=50)
+        assert win._connect_action.text() == "Connect"
+        tokens = ThemeManager.instance().current_tokens()
+        assert win._status_left.text() == (
+            f'<span style="color: {tokens["warn"]}">CAN_1 · closing</span>'
+        )
+    finally:
+        with qtbot.waitSignal(ctx.bus_reader.bus_released, timeout=2000):
+            fake.block.set()
+    assert win._status_left.text() == "Disconnected"
+
+
+def test_status_bar_keeps_forgotten_closing_bus(  # type: ignore[no-untyped-def]
+    qapp, qtbot, monkeypatch, tmp_path: Path
+) -> None:
+    import threading
+
+    from tests.fake_bus import FakeBus, use_fake_bus
+
+    fake = FakeBus()
+    fake.block = threading.Event()
+    use_fake_bus(monkeypatch, fake)
+    project = new_unsaved()
+    project.workspace.bus = [
+        BusConfig(name="CAN_1", interface="virtual", channel="hung", bitrate=500000)
+    ]
+    ctx = make_app_context(tmp_path, project=project)
+    win = MainWindow(bus_reader=ctx.bus_reader, database=ctx.database, prompt_on_close=False)
+    qtbot.addWidget(win)
+    win.bind_events(ctx)
+    with qtbot.waitSignal(ctx.bus_reader.bus_started, timeout=2000):
+        win._on_connect_toggled()
+
+    try:
+        ctx.bus_reader.close(wait_ms=50)
+        win._new_project()
+        assert ctx.bus_reader.last_configs() == []
+        tokens = ThemeManager.instance().current_tokens()
+        assert win._status_left.text() == (
+            f'<span style="color: {tokens["warn"]}">CAN_1 · closing</span>'
+        )
+    finally:
+        with qtbot.waitSignal(ctx.bus_reader.bus_released, timeout=2000):
+            fake.block.set()
+    assert win._status_left.text() == "Disconnected"
+
+
+def test_new_project_closes_and_forgets_buses(  # type: ignore[no-untyped-def]
+    qapp, qtbot, tmp_path: Path
+) -> None:
+    import uuid
+
+    project = new_unsaved()
+    project.workspace.bus = [
+        BusConfig(
+            name="CAN_1",
+            interface="virtual",
+            channel=f"np-{uuid.uuid4().hex[:8]}",
+            bitrate=500000,
+        )
+    ]
+    ctx = make_app_context(tmp_path, project=project)
+    win = MainWindow(bus_reader=ctx.bus_reader, database=ctx.database, prompt_on_close=False)
+    qtbot.addWidget(win)
+    win.bind_events(ctx)
+    with qtbot.waitSignal(ctx.bus_reader.bus_started, timeout=2000):
+        win._on_connect_toggled()
+
+    win._new_project()
+
+    assert not ctx.bus_reader.is_open
+    assert ctx.bus_reader.last_configs() == []
+    assert win._status_left.text() == "Disconnected"
+    assert win._connect_action.text() == "Connect"

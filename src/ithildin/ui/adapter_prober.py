@@ -28,9 +28,9 @@ the dock indefinitely.
 
 from __future__ import annotations
 
-import concurrent.futures
 import logging
 import os
+import threading
 from dataclasses import dataclass
 
 from PySide6.QtCore import QObject, QThread, Signal, Slot
@@ -54,7 +54,7 @@ vendor modules we don't intend to support."""
 BACKEND_TIMEOUT_S = 3.0
 """Hard ceiling per backend probe. A hung vendor import past this is
 reported via ``backend_failed`` and the worker thread carries on; the
-hung helper thread is left to die when the process exits."""
+hung helper thread is a daemon, left to die when the process exits."""
 
 
 @dataclass(frozen=True)
@@ -183,33 +183,37 @@ class AdapterProber(QObject):
     def _probe_with_timeout(self, backend: str) -> list[DeviceInfo]:
         """Run one enriched probe with a hard timeout.
 
-        Off-thread on a single-worker pool. ``shutdown(wait=False)``
-        on timeout: we don't try to kill the worker (Python has no
-        clean way to), we just stop waiting on it and move on. The
-        enrichment runs inside the worker so any backend-specific
-        deepen is covered by the same timeout.
+        On a daemon thread: Python can't kill a hung vendor call, so on
+        timeout we stop waiting and move on, and the abandoned thread can't
+        hold up interpreter exit the way a joined pool worker would. The
+        enrichment runs inside the thread so any backend-specific deepen is
+        covered by the same timeout.
         """
-        executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix=f"probe-{backend}"
-        )
+        outcome: list[list[DeviceInfo] | BaseException] = []
+
+        def probe() -> None:
+            try:
+                outcome.append(_detect_and_enrich(backend))
+            except BaseException as exc:
+                outcome.append(exc)
+
+        thread = threading.Thread(target=probe, name=f"probe-{backend}", daemon=True)
         try:
-            try:
-                future = executor.submit(_detect_and_enrich, backend)
-            except RuntimeError:
-                # Interpreter is shutting down ("cannot schedule new
-                # futures after interpreter shutdown"). Bail quietly.
-                return []
-            try:
-                return future.result(timeout=self._timeout_s)
-            except concurrent.futures.TimeoutError:
-                self.backend_failed.emit(backend, "timeout")
-                return []
-            except Exception as exc:
-                _log.warning("Probe of %s failed", backend, exc_info=True)
-                self.backend_failed.emit(backend, str(exc))
-                return []
-        finally:
-            executor.shutdown(wait=False)
+            thread.start()
+        except RuntimeError:
+            # Interpreter is shutting down ("can't create new thread at
+            # interpreter shutdown"). Bail quietly.
+            return []
+        thread.join(self._timeout_s)
+        if not outcome:
+            self.backend_failed.emit(backend, "timeout")
+            return []
+        result = outcome[0]
+        if isinstance(result, BaseException):
+            _log.warning("Probe of %s failed", backend, exc_info=result)
+            self.backend_failed.emit(backend, str(result))
+            return []
+        return result
 
 
 # --------------------------------------------------------------------------
@@ -252,7 +256,7 @@ def _stop_all_probes() -> None:
 
 
 def _detect_and_enrich(backend: str) -> list[DeviceInfo]:
-    """Importable target for the per-backend worker thread.
+    """Target for the per-backend probe thread.
 
     Runs the raw probe and the enrichment together so both are bounded
     by ``_probe_with_timeout``'s ceiling.
@@ -263,10 +267,10 @@ def _detect_and_enrich(backend: str) -> list[DeviceInfo]:
 def _detect_configs(backend: str) -> list[dict[str, object]]:
     """Raw ``detect_available_configs`` call for one backend.
 
-    Module-level so ThreadPoolExecutor can pickle/marshal it cleanly,
-    and so the eager ``import can`` happens off whoever's calling — the
-    first import of python-can pulls in the full backend registry and
-    can take 100+ ms even on a warm machine.
+    Module-level so tests can patch it, and so the eager ``import can``
+    happens off whoever's calling — the first import of python-can
+    pulls in the full backend registry and can take 100+ ms even on a
+    warm machine.
     """
     import can
 
