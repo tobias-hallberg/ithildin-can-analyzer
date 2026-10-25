@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import can
 import pytest
+import usb.core
 from can.interfaces.pcan import basic
 from can.interfaces.pcan.pcan import PcanCanOperationError
 
@@ -303,12 +304,39 @@ def test_kvaser_hardware_error_is_lost(qapp, qtbot, monkeypatch, reader, code) -
     assert reader.health("CAN_1") == (BusHealth.LOST, "")
 
 
-# ---- SocketCAN ----
-
-
-def test_socketcan_error_frames_drive_the_state(qapp, qtbot, monkeypatch, reader) -> None:  # type: ignore[no-untyped-def]
+@pytest.mark.parametrize(
+    ("cause", "health"),
+    [
+        (
+            usb.core.USBError("No such device (it may have been disconnected)", -4, 19),
+            (BusHealth.LOST, ""),
+        ),
+        (None, None),
+    ],
+)
+def test_gs_usb_recv_error_is_lost_only_from_usb(  # type: ignore[no-untyped-def]
+    qapp, qtbot, monkeypatch, reader, cause, health
+) -> None:
+    """GsUsbBus raises from a USBError when its probe finds the adapter gone."""
     fake = use_fake_bus(monkeypatch)
-    _open(reader, qtbot, "socketcan")
+    _open(reader, qtbot, "gs_usb")
+    exc = can.CanOperationError("gs_usb adapter lost")
+    exc.__cause__ = cause
+
+    with qtbot.waitSignal(reader.bus_failed, timeout=2000):
+        fake.rx.put(exc)
+    assert reader.health("CAN_1") == health
+
+
+# ---- SocketCAN / gs_usb error frames ----
+
+
+@pytest.mark.parametrize("interface", ["socketcan", "gs_usb"])
+def test_error_frames_drive_the_controller_state(  # type: ignore[no-untyped-def]
+    qapp, qtbot, monkeypatch, reader, interface
+) -> None:
+    fake = use_fake_bus(monkeypatch)
+    _open(reader, qtbot, interface)
 
     with qtbot.waitSignal(reader.bus_health_changed, timeout=2000) as blocker:
         fake.rx.put(_error_frame(_CRTL, bytes([0, 0x20])))

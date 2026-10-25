@@ -142,9 +142,10 @@ MCP layer (`src/ithildin/mcp/`):
 - **TX flush runs on the worker thread.** `BusReader.flush_tx(bus)` →
   `BusWorker.request_flush()` sets a flag the capture loop services under
   the send lock: pcan `reset()` (also empties the RX queue), kvaser
-  `flush_tx_buffer()`; never IXXAT (its flush waits INFINITE), never a
-  listen-only bus. Flush on master OFF, on every disarm and on scheduler
-  shutdown only — not when a row stops. The worker also flushes by itself
+  `flush_tx_buffer()`, gs_usb `flush_tx_buffer()` (a controller restart);
+  never IXXAT (its flush waits INFINITE), never a listen-only bus. Flush
+  on master OFF, on every disarm and on scheduler shutdown only — not
+  when a row stops. The worker also flushes by itself
   when health worsens into bus errors / bus-off, which covers MCP and
   Replay frames.
 - **TX disarms and never resumes implicitly.** `TxScheduler._disarm(reason)`
@@ -163,7 +164,9 @@ MCP layer (`src/ithildin/mcp/`):
   `recv` `CanOperationError` instead of dying on it: pcan by `status()`
   (a raise the status doesn't explain, clean or error warning, is fatal
   unless its text is an overrun's), IXXAT by its exact message strings,
-  Kvaser −15/−26 → lost; anything else stays fatal. A 0.5 s tick (it runs on an idle bus too)
+  Kvaser −15/−26 → lost, gs_usb caused by an `OSError` (its in-bus probe)
+  → lost; anything else stays fatal. SocketCAN and gs_usb error frames
+  carry the controller state. A 0.5 s tick (it runs on an idle bus too)
   probes pcan `status()`, which is how a pulled PCAN-USB is noticed (`recv`
   only times out), and counts error frames (≥50/s → bus errors); pcan's
   error warning counts only while error frames arrive, since the
@@ -203,10 +206,10 @@ MCP layer (`src/ithildin/mcp/`):
   still does no vendor work; adapter detection runs on a background
   `QThread` (`ui/adapter_prober.py::AdapterProber`) kicked off from
   `LeftDockWidget.start_adapter_probe()` after `MainWindow.show()`. The
-  supported set is deliberately narrow (`pcan`, `kvaser`, `cantact`,
+  supported set is deliberately narrow (`pcan`, `kvaser`, `gs_usb`,
   `socketcan`, `ixxat`) — every name in `_SUPPORTED_BACKENDS` is a
-  vendor module python-can will eagerly import during
-  `detect_available_configs(interfaces=[name])`, so
+  vendor module the probe imports (python-can's
+  `detect_available_configs(interfaces=[name])`, or `_detect_gs_usb`), so
   adding one is paying real startup cost. Each per-backend probe runs
   in a sub-thread with a hard `BACKEND_TIMEOUT_S` ceiling; a vendor
   module that hangs on import is reported via `backend_failed` and the
@@ -215,11 +218,22 @@ MCP layer (`src/ithildin/mcp/`):
   Create-bus dialog **only** when `adapter_prober.dev_mode()` is on
   (`ITHILDIN_DEV` env / `--dev` launch flag). Normal users never see it;
   the test suite still uses the `virtual` backend directly (it stays a
-  valid `SupportedInterface`). `cantact` is an **optional extra**, not a
-  hard dependency: upstream ships no wheel past cp312 and no sdist, so
-  depending on it would cap the project at Python 3.12. python-can
-  returns no configs when the module is absent, so the probe degrades to
-  "no CANtact devices" — don't write code that assumes it imports.
+  valid `SupportedInterface`).
+- **gs_usb (CANable / CANtact / candleLight) goes through `GsUsbBus`.**
+  `gs-usb`, `pyusb` and `libusb-package` (which bundles libusb) are hard
+  dependencies. Open the adapter with `core/gs_usb_bus.py::GsUsbBus`,
+  never `can.Bus(interface="gs_usb")`: it adds listen-only (refused when
+  the firmware lacks it, since gs_usb drops the flag silently), an in-bus
+  probe that raises "adapter lost" within ~1 s of an unplug (gs_usb's
+  read swallows USB errors, so `recv` would spin), epoch timestamps across
+  the device counter's 71.6 min wrap, a listen-only-safe shutdown and
+  `flush_tx_buffer`. python-can can't enumerate gs_usb, so
+  `adapter_prober._detect_gs_usb` scans on Windows only (on Linux the
+  kernel driver owns the adapter: use SocketCAN) and reads no string
+  descriptors — opening a WinUSB device is exclusive and would race a bus
+  opening on it. Call `libusb_package.get_libusb1_backend()` before
+  `GsUsb.scan()` so pyusb loads the bundled libusb. `BusConfig` migrates
+  saved `cantact` buses (0.1.0 / 0.1.1) to `gs_usb`.
 - **Diagnostics go through `logging`.** `diagnostics.install()` is the
   first statement of `app.main`: one log file per launch in
   `~/.ithildin/logs` (newest 10 kept), `None` stdio (the windowed frozen
@@ -346,11 +360,12 @@ widget (drops on the inner GraphicsView don't propagate reliably).
 - For bus fault paths, `tests/fake_bus.py`: `use_fake_bus(monkeypatch)`
   makes every `BusWorker` open a scriptable `FakeBus` (raising
   `send`/`recv`, flush counters, the sending thread and lock state per
-  frame), so a `pcan` / `kvaser` / `ixxat` config runs that backend's
-  branches without importing a vendor module. `open_gate` / `block`
-  hang the open or `recv` like a stuck vendor call until the event is
-  set; set it before the test ends. Extend it rather than writing
-  another fake.
+  frame), so a `pcan` / `kvaser` / `ixxat` / `gs_usb` config runs that
+  backend's branches without importing a vendor module. `open_gate` /
+  `block` hang the open or `recv` like a stuck vendor call until the
+  event is set; set it before the test ends. Extend it rather than
+  writing another fake. `GsUsbBus` itself runs against a fake `GsUsb`
+  adapter in `tests/test_gs_usb_bus.py`.
 - The conftest fails a test whose `make_app_context` reader still has a
   worker running after `shutdown()`.
 - For Qt signals fired during a method call, use
@@ -377,7 +392,7 @@ widget (drops on the inner GraphicsView don't propagate reliably).
 | Add an MCP read tool | implement in `mcp/tools.py`, register in `mcp/server.py::register_read_tools` |
 | Add an MCP write tool | same split; register in `mcp/server.py::register_write_tools` (must go through `AllowlistStore.check_*`) |
 | Wire a `BusReader` error display | `MainWindow.report()` and per-view banners |
-| Add or re-enable a CAN backend | `ui/adapter_prober.py::_SUPPORTED_BACKENDS` + `workspace/schema.py::SupportedInterface` (must update both) |
+| Add or re-enable a CAN backend | `ui/adapter_prober.py::_SUPPORTED_BACKENDS` + `workspace/schema.py::SupportedInterface` (must update both); for listen-only also `LISTEN_ONLY_INTERFACES` + `core/bus.py::_apply_listen_only_kwargs` |
 | Add a vendor dep that limits the Python range | `[project.optional-dependencies]` in `pyproject.toml` + the `--extra` in `.github/workflows/release.yml` |
 | Persist user-private state | `~/.ithildin/<project>/` (allowlist, audit, layout) |
 | Log a diagnostic | `logging.getLogger(__name__)`; levels and dock mirroring in `app_state/diagnostics.py` |

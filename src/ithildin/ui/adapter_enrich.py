@@ -85,7 +85,7 @@ Enricher = Callable[[str, list[dict[str, object]]], list[DeviceInfo]]
 _TRANSPORTS: dict[str, Transport] = {
     "kvaser": "USB",
     "pcan": "USB",
-    "cantact": "USB",
+    "gs_usb": "USB",
     "ixxat": "USB",
     "socketcan": "Kernel",
     "virtual": "Software",
@@ -94,7 +94,7 @@ _TRANSPORTS: dict[str, Transport] = {
 _VENDORS: dict[str, str] = {
     "kvaser": "Kvaser",
     "pcan": "PEAK-System",
-    "cantact": "CANtact",
+    "gs_usb": "candleLight",
     "ixxat": "IXXAT",
     "socketcan": "Linux SocketCAN",
     "virtual": "Ithildin",
@@ -212,6 +212,29 @@ def _enrich_pcan(backend: str, configs: list[dict[str, object]]) -> list[DeviceI
     return out
 
 
+def _enrich_gs_usb(backend: str, configs: list[dict[str, object]]) -> list[DeviceInfo]:
+    """One single-channel device per adapter.
+
+    The scan reads no descriptors, so there is no serial or product name;
+    the index in the model keeps two identical adapters apart.
+    """
+    out: list[DeviceInfo] = []
+    for cfg in configs:
+        channel = cfg.get("channel")
+        if not isinstance(channel, int):
+            continue
+        out.append(
+            DeviceInfo(
+                interface="gs_usb",
+                vendor="candleLight",
+                model=f"gs_usb adapter #{channel}",
+                transport="USB",
+                channels=(ChannelInfo(channel=channel, label="ch0"),),
+            )
+        )
+    return out
+
+
 def _pcan_status(condition: object) -> ChannelStatus:
     if not isinstance(condition, int):
         return "free"
@@ -225,4 +248,5 @@ def _pcan_status(condition: object) -> ChannelStatus:
 _ENRICHERS: dict[str, Enricher] = {
     "kvaser": _enrich_kvaser,
     "pcan": _enrich_pcan,
+    "gs_usb": _enrich_gs_usb,
 }

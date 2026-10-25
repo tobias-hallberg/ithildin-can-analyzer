@@ -297,6 +297,9 @@ class BusWorker(QObject):
             return _IXXAT_LEVELS.get(str(exc))
         if interface == "kvaser" and exc.error_code in _KVASER_LOST_CODES:
             return _LOST
+        if interface == "gs_usb" and isinstance(exc.__cause__, OSError):
+            # GsUsbBus's probe found the adapter gone.
+            return _LOST
         return None
 
     def _probe(self, bus: can.BusABC) -> _Level:
@@ -344,7 +347,7 @@ class BusWorker(QObject):
         """Count an error frame; how many the ring record stands for, 0 to drop it."""
         self._err_tick += 1
         self._err_unsampled += 1
-        if self._config.interface == "socketcan":
+        if self._config.interface in ("socketcan", "gs_usb"):
             level = _socketcan_level(msg)
             if level is not None:
                 self._sticky = level
@@ -371,7 +374,7 @@ class BusWorker(QObject):
         try:
             if self._config.interface == "pcan":
                 cast(Any, bus).reset()
-            elif self._config.interface == "kvaser":
+            elif self._config.interface in ("kvaser", "gs_usb"):
                 bus.flush_tx_buffer()
         except BaseException:
             _log.warning("TX flush on %r failed", self._name, exc_info=True)
@@ -396,8 +399,8 @@ class BusWorker(QObject):
             bus, self._bus = self._bus, None
             if bus is None:
                 return
-            # PCAN's Uninitialize already discards the queue; Kvaser would
-            # spend up to 100 ms of shutdown trying to send it.
+            # PCAN's Uninitialize and gs_usb's stop already discard the
+            # queue; Kvaser would spend up to 100 ms of shutdown sending it.
             if self._config.interface == "kvaser":
                 self._flush_tx(bus)
             try:
@@ -406,6 +409,14 @@ class BusWorker(QObject):
                 _log.warning("Shutdown of bus %r failed", self._name, exc_info=True)
 
     def _open_bus(self) -> can.BusABC:
+        if self._config.interface == "gs_usb":
+            from ithildin.core.gs_usb_bus import GsUsbBus
+
+            return GsUsbBus(
+                channel=int(self._config.channel),
+                bitrate=self._config.bitrate,
+                listen_only=self._config.listen_only,
+            )
         kwargs: dict[str, Any] = {
             "interface": self._config.interface,
             "channel": self._config.channel,
@@ -490,19 +501,18 @@ def _apply_listen_only_kwargs(kwargs: dict[str, Any], interface: str) -> None:
 
     Each python-can backend names its silent/passive mode differently:
     PCAN takes ``state=BusState.PASSIVE``, Kvaser takes ``driver_mode=False``
-    (``DRIVER_MODE_SILENT``), cantact takes ``monitor=True``. The
-    ``virtual`` backend has no transceiver and intentionally falls through
-    with no kwarg — the app-level guard in ``BusReader.send_message`` covers
-    that case. ``socketcan`` and ``ixxat`` never reach here: they have no
-    python-can silent kwarg, so ``BusConfig`` rejects them at validation
-    (see ``LISTEN_ONLY_INTERFACES``).
+    (``DRIVER_MODE_SILENT``); gs_usb never gets here, since ``GsUsbBus``
+    takes ``listen_only=`` itself. The ``virtual`` backend has no
+    transceiver and intentionally falls through with no kwarg — the
+    app-level guard in ``BusReader.send_message`` covers that case.
+    ``socketcan`` and ``ixxat`` never reach here: they have no python-can
+    silent kwarg, so ``BusConfig`` rejects them at validation (see
+    ``LISTEN_ONLY_INTERFACES``).
     """
     if interface == "pcan":
         kwargs["state"] = can.BusState.PASSIVE
     elif interface == "kvaser":
         kwargs["driver_mode"] = False
-    elif interface == "cantact":
-        kwargs["monitor"] = True
 
 
 class BusController(QObject):

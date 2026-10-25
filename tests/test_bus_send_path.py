@@ -110,9 +110,11 @@ def test_close_stops_tasks_under_lock_before_shutdown(qapp, qtbot, monkeypatch, 
     [
         ("pcan", False, 1, 0),
         ("kvaser", False, 0, 1),
+        ("gs_usb", False, 0, 1),
         # IXXAT's flush waits INFINITE; a listen-only bus has nothing queued.
         ("ixxat", False, 0, 0),
         ("pcan", True, 0, 0),
+        ("gs_usb", True, 0, 0),
         ("virtual", False, 0, 0),
     ],
 )

@@ -13,7 +13,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_submodules
+from PyInstaller.utils.hooks import collect_dynamic_libs, collect_submodules
 
 SPEC_DIR = Path(SPECPATH).resolve()
 REPO_ROOT = SPEC_DIR.parent
@@ -30,12 +30,20 @@ datas = [(str(RESOURCES), "ithildin/resources")]
 hiddenimports = [
     "can.interfaces.pcan",
     "can.interfaces.kvaser",
-    "can.interfaces.cantact",
+    "can.interfaces.gs_usb",
     "can.interfaces.socketcan",
     "can.interfaces.ixxat",
     "can.interfaces.virtual",
-    "cantact",
+    "gs_usb",
+    "usb.backend.libusb1",
+    "libusb_package",
 ]
+
+# The libusb DLL gs_usb runs on, where libusb_package looks for it: inside
+# its own package directory. libusb_package's own hook copies it to the
+# bundle root, and pyinstaller-hooks-contrib's usb hook only bundles a
+# libusb installed on the build machine, which CI has none of.
+binaries = collect_dynamic_libs("libusb_package")
 
 # mcp uses dynamic dispatch in a few places; pull in its submodules
 # wholesale rather than chase individual misses at runtime. Skip
@@ -71,7 +79,7 @@ block_cipher = None
 a = Analysis(
     [str(SRC / "ithildin" / "app.py")],
     pathex=[str(SRC)],
-    binaries=[],
+    binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],

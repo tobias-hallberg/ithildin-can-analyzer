@@ -129,3 +129,20 @@ def test_missing_optional_keys_do_not_raise() -> None:
 
 def test_config_with_bad_channel_type_is_skipped() -> None:
     assert enrich("pcan", [{"interface": "pcan", "channel": None, "device_id": 1}]) == []
+
+
+def test_gs_usb_one_device_per_adapter() -> None:
+    """The scan reads no descriptors, so the index keeps two identical
+    adapters apart (the dialog de-duplicates devices by ``key``)."""
+    devices = enrich(
+        "gs_usb",
+        [{"interface": "gs_usb", "channel": 0}, {"interface": "gs_usb", "channel": 1}],
+    )
+    assert len({d.key for d in devices}) == 2
+    assert [d.vendor for d in devices] == ["candleLight", "candleLight"]
+    assert [[(c.channel, c.label) for c in d.channels] for d in devices] == [
+        [(0, "ch0")],
+        [(1, "ch0")],
+    ]
+    assert all(d.transport == "USB" for d in devices)
+    assert all(d.status is None and d.capabilities is None for d in devices)

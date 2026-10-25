@@ -228,7 +228,6 @@ def test_finished_waits_for_the_capture_thread(qapp, qtbot, virtual_channel: str
     [
         ("pcan", "state", can.BusState.PASSIVE),
         ("kvaser", "driver_mode", False),
-        ("cantact", "monitor", True),
     ],
 )
 def test_listen_only_dispatches_backend_kwarg(

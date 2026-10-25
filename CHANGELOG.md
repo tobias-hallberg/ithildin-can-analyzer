@@ -7,6 +7,25 @@ once it reaches 1.0.
 
 ## [Unreleased]
 
+### Changed
+
+- CANable / CANtact / candleLight adapters run on python-can's `gs_usb`
+  backend instead of `cantact`, as a regular dependency (with libusb
+  bundled), so the project is no longer capped at Python 3.12. A project
+  saved with a `cantact` bus opens with that bus moved to `gs_usb`, and is
+  written back that way on the next save. On Windows the adapters are
+  found by a USB scan; on Linux use SocketCAN. Listen-only refuses to open
+  on firmware without a listen-only mode instead of ACKing on the wire.
+
+### Fixed
+
+- A CANtact-family bus created from the UI opens (the `cantact` backend
+  was handed its `ch:N` channel name as the device index).
+- Receiving or transmitting on a CANtact-family adapter no longer freezes
+  the whole UI while the adapter waits.
+- An unplugged `gs_usb` adapter is reported as lost within about a second,
+  and its frames carry wall-clock timestamps like every other backend's.
+
 ## [0.1.1] - 2026-10-24
 
 ### Added

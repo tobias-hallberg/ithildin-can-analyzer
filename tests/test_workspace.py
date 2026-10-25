@@ -135,10 +135,61 @@ def test_listen_only_round_trip(tmp_path: Path) -> None:
     assert reloaded.bus[0].listen_only is True
 
 
-@pytest.mark.parametrize("interface", ["pcan", "kvaser", "cantact", "virtual"])
+@pytest.mark.parametrize("interface", ["pcan", "kvaser", "gs_usb", "virtual"])
 def test_listen_only_accepted_for_capable_interfaces(interface: str) -> None:
     cfg = BusConfig(name="ro", interface=interface, channel="0", bitrate=500000, listen_only=True)
     assert cfg.listen_only is True
+
+
+@pytest.mark.parametrize(("channel", "index"), [("ch:0", 0), (0, 0), ("1", 1)])
+def test_cantact_bus_migrates_to_gs_usb(channel: str | int, index: int) -> None:
+    """0.1.0 / 0.1.1 saved CANtact buses with ``ch:N`` channels; gs_usb
+    addresses the same adapter by index."""
+    cfg = BusConfig.model_validate(
+        {"name": "CAN_1", "interface": "cantact", "channel": channel, "bitrate": 500000}
+    )
+    assert (cfg.interface, cfg.channel) == ("gs_usb", index)
+
+
+def test_cantact_listen_only_survives_migration() -> None:
+    cfg = BusConfig.model_validate(
+        {
+            "name": "CAN_1",
+            "interface": "cantact",
+            "channel": "ch:0",
+            "bitrate": 500000,
+            "listen_only": True,
+        }
+    )
+    assert cfg.interface == "gs_usb"
+    assert cfg.listen_only is True
+
+
+_CANTACT_BUS_TOML = """\
+[[bus]]
+name = "CAN_1"
+interface = "cantact"
+channel = "ch:0"
+bitrate = 500000
+"""
+
+
+def test_project_with_cantact_bus_loads_and_saves_as_gs_usb(tmp_path: Path) -> None:
+    path = tmp_path / "old.itp"
+    path.write_text('schema_version = 2\nname = "Old"\n\n' + _CANTACT_BUS_TOML, encoding="utf-8")
+
+    save_workspace(load_workspace(path), path)
+    text = path.read_text(encoding="utf-8")
+    assert 'interface = "gs_usb"' in text
+    assert "channel = 0" in text
+
+
+def test_v1_project_with_cantact_bus_migrates(tmp_path: Path) -> None:
+    path = tmp_path / "old_v1.itp"
+    path.write_text('schema_version = 1\nname = "Old"\n\n' + _CANTACT_BUS_TOML, encoding="utf-8")
+
+    legacy = load_workspace_v1(path)
+    assert (legacy.bus[0].interface, legacy.bus[0].channel) == ("gs_usb", 0)
 
 
 @pytest.mark.parametrize("interface", ["socketcan", "ixxat"])

@@ -16,11 +16,11 @@ Open-source CAN bus analyser with a built-in MCP server.
 A cross-platform (Windows + Linux) CAN bus analyser aimed at the gap
 between [BusMaster](https://rbei-etas.github.io/busmaster/) (free but
 dated UX) and [CAN Easy](https://www.ixxat.com/can-easy) (better UX but
-proprietary). It captures CAN traffic from PEAK, Kvaser, CANtact, and
-IXXAT hardware (plus SocketCAN on Linux), decodes via DBC files, logs and
-replays sessions, and ships a built-in MCP server so AI agents can
-observe traffic and (under strict per-message/per-signal allowlists)
-transmit frames.
+proprietary). It captures CAN traffic from PEAK, Kvaser, CANable /
+CANtact / candleLight, and IXXAT hardware (plus SocketCAN on Linux),
+decodes via DBC files, logs and replays sessions, and ships a built-in MCP
+server so AI agents can observe traffic and (under strict
+per-message/per-signal allowlists) transmit frames.
 
 |  |  |
 |---|---|
@@ -35,9 +35,10 @@ onto the virtual bus. Regenerate with `scripts/make_screenshots.py`.</sub>
 What works today:
 
 - **Live capture** from the supported `python-can` backends — PEAK
-  (`pcan`), Kvaser, CANtact, IXXAT, SocketCAN on real hardware, plus
-  `virtual` for tests and demos. Single bus in v0.1. Listen-only is
-  available on PEAK, Kvaser, CANtact, and `virtual`; SocketCAN (silent
+  (`pcan`), Kvaser, CANable / CANtact / candleLight (`gs_usb`), IXXAT,
+  SocketCAN on real hardware, plus `virtual` for tests and demos. Single
+  bus in v0.1. Listen-only is available on PEAK, Kvaser, `gs_usb` (when
+  the adapter's firmware supports it), and `virtual`; SocketCAN (silent
   mode is an OS-level `ip link` property) and IXXAT (the VCI wrapper
   hardcodes its opmode) expose no python-can kwarg for it, so that
   combination is rejected rather than left ACKing on the wire.
@@ -127,14 +128,12 @@ the one matching your adapter:
   [peak-system.com](https://www.peak-system.com/Drivers.523.0.html).
 - **Kvaser** (Leaf, USBcan, …) —
   [kvaser.com/download](https://www.kvaser.com/download/).
-- **CANtact** — Linux ships the needed CDC-ACM driver; on Windows you
-  may need to bind the device to WinUSB via
-  [Zadig](https://zadig.akeo.ie/). The Python `cantact` package is an
-  optional extra rather than a hard dependency: upstream publishes no
-  wheel past CPython 3.12 and no sdist, so requiring it would cap the
-  whole project at 3.12. The pre-built installers bundle it; from source,
-  add `--extra cantact`. Without it the adapter probe simply reports no
-  CANtact devices.
+- **CANable / CANtact / candleLight** (`gs_usb` firmware) — on Windows
+  10/11 the adapter binds WinUSB by itself; if it shows up without a
+  driver, bind WinUSB with [Zadig](https://zadig.akeo.ie/). libusb ships
+  with Ithildin. On Linux the kernel's `gs_usb` driver exposes the adapter
+  as SocketCAN (`can0`), so use the `socketcan` backend there. Adapters
+  running slcan firmware are not supported.
 
 The built-in `virtual` backend works with no driver and is handy for
 trying the UI without hardware.
@@ -142,7 +141,7 @@ trying the UI without hardware.
 ## Run from source
 
 ```sh
-uv sync                               # add --extra cantact for CANtact hardware
+uv sync
 uv run ithildin                       # opens with no project loaded
 uv run ithildin path/to/project.itp   # opens that project
 ```

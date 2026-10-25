@@ -21,7 +21,7 @@ Schema versions:
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -33,18 +33,20 @@ LOOPBACK_HOSTS: frozenset[str] = frozenset({"127.0.0.1", "localhost", "::1"})
 SupportedInterface = Literal[
     "pcan",
     "kvaser",
-    "cantact",
+    "gs_usb",
     "socketcan",
     "virtual",
     "ixxat",
 ]
 """python-can backends ithildin officially supports."""
 
-LISTEN_ONLY_INTERFACES: frozenset[str] = frozenset({"pcan", "kvaser", "cantact", "virtual"})
+LISTEN_ONLY_INTERFACES: frozenset[str] = frozenset({"pcan", "kvaser", "gs_usb", "virtual"})
 """Interfaces for which ``listen_only=True`` is honored.
 
-``pcan`` / ``kvaser`` / ``cantact`` receive a native silent kwarg (see
-``core.bus._apply_listen_only_kwargs``); ``virtual`` has no wire so the
+``pcan`` / ``kvaser`` receive a native silent kwarg (see
+``core.bus._apply_listen_only_kwargs``); ``gs_usb`` takes
+``GsUsbBus(listen_only=True)``, which refuses to open when the adapter's
+firmware has no listen-only mode; ``virtual`` has no wire so the
 app-level send block alone is sufficient. ``socketcan`` (silent mode is an
 OS-level ``ip link ... listen-only`` netlink property, not a python-can
 constructor kwarg) and ``ixxat`` (the VCI wrapper hardcodes its opmode) have
@@ -66,8 +68,8 @@ class BusConfig(BaseModel):
     """Open the bus in receive-only mode.
 
     The backend is initialised with its native silent/passive kwarg
-    (PCAN ``state=PASSIVE``, Kvaser ``driver_mode=SILENT``, cantact
-    ``monitor=True``) so the transceiver does not ACK or transmit; the
+    (PCAN ``state=PASSIVE``, Kvaser ``driver_mode=SILENT``, gs_usb
+    ``GS_CAN_MODE_LISTEN_ONLY``) so the transceiver does not ACK or transmit; the
     app additionally blocks every send path at ``BusReader.send_message``.
 
     Not all backends expose a silent kwarg: ``virtual`` has no
@@ -88,13 +90,23 @@ class BusConfig(BaseModel):
     migration.
     """
 
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_cantact(cls, data: Any) -> Any:
+        # 0.1.0 and 0.1.1 shipped a ``cantact`` backend, with channels saved
+        # as "ch:N"; gs_usb drives the same adapters, addressed by index.
+        if isinstance(data, dict) and data.get("interface") == "cantact":
+            channel = str(data.get("channel", 0)).removeprefix("ch:")
+            data = {**data, "interface": "gs_usb", "channel": int(channel)}
+        return data
+
     @model_validator(mode="after")
     def _reject_unsupported_listen_only(self) -> BusConfig:
         if self.listen_only and self.interface not in LISTEN_ONLY_INTERFACES:
             raise ValueError(
                 f"{self.interface!r} cannot enforce listen-only mode "
                 "(no silent kwarg ithildin can set); open a non-listen-only "
-                "bus or use a pcan/kvaser/cantact adapter."
+                "bus or use a pcan/kvaser/gs_usb adapter."
             )
         return self
 

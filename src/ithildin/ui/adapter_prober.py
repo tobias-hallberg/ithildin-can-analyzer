@@ -20,16 +20,18 @@ The no-hardware virtual loopback is emitted last, but only in dev mode
 
 Per-backend probing (one ``detect_available_configs(interfaces=[name])``
 call per backend) lets adapters appear in the dock progressively rather
-than as a single batch at the end. Each per-backend call is wrapped in
-its own thread with a hard timeout: a misbehaving vendor module (PCAN
-without the driver, Kvaser with stale CANlib) must not be able to wedge
-the dock indefinitely.
+than as a single batch at the end. python-can can't enumerate ``gs_usb``
+adapters, so :func:`_detect_gs_usb` scans for them itself. Each
+per-backend call is wrapped in its own thread with a hard timeout: a
+misbehaving vendor module (PCAN without the driver, Kvaser with stale
+CANlib) must not be able to wedge the dock indefinitely.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import sys
 import threading
 from dataclasses import dataclass
 
@@ -44,7 +46,7 @@ _log = logging.getLogger(__name__)
 _SUPPORTED_BACKENDS: tuple[str, ...] = (
     "pcan",
     "kvaser",
-    "cantact",
+    "gs_usb",
     "socketcan",
     "ixxat",
 )
@@ -272,6 +274,11 @@ def _detect_configs(backend: str) -> list[dict[str, object]]:
     pulls in the full backend registry and can take 100+ ms even on a
     warm machine.
     """
+    if backend == "gs_usb":
+        # On Linux the kernel's gs_usb driver owns the adapter, which shows
+        # up as SocketCAN; pyusb would detach it.
+        return _detect_gs_usb() if sys.platform == "win32" else []
+
     import can
 
     # python-can types this as ``Sequence[AutoDetectedConfig]`` (a
@@ -281,6 +288,20 @@ def _detect_configs(backend: str) -> list[dict[str, object]]:
     if backend == "kvaser":
         _add_kvaser_firmware(configs)
     return configs
+
+
+def _detect_gs_usb() -> list[dict[str, object]]:
+    """One config per connected gs_usb adapter, by its ``GsUsb.scan()`` index.
+
+    Reads no string descriptors: that opens the device, which WinUSB grants
+    to one handle at a time, so it would race a bus opening on the adapter.
+    ``GsUsbBus`` opens the adapter at the same index of the same scan.
+    """
+    import libusb_package
+    from gs_usb.gs_usb import GsUsb
+
+    libusb_package.get_libusb1_backend()
+    return [{"interface": "gs_usb", "channel": index} for index in range(len(GsUsb.scan()))]
 
 
 def _add_kvaser_firmware(configs: list[dict[str, object]]) -> None:

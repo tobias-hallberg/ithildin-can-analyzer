@@ -17,8 +17,6 @@ jobs:
   windows:
     name: Build Windows installer
     runs-on: windows-latest
-    # Shipped binaries bundle the CANtact backend, and upstream ships no
-    # cantact wheel past cp312, so the release builds stay on 3.12.
     env:
       UV_PYTHON: "3.12"
 
@@ -35,7 +33,7 @@ jobs:
       - uses: astral-sh/setup-uv@v3
 
       - name: Sync dependencies (runtime + packaging)
-        run: uv sync --group packaging --extra cantact
+        run: uv sync --group packaging
 
       - name: Run PyInstaller
         run: uv run pyinstaller packaging/ithildin.spec --noconfirm
@@ -63,8 +61,6 @@ jobs:
   linux:
     name: Build Linux AppImage
     runs-on: ubuntu-22.04
-    # Shipped binaries bundle the CANtact backend, and upstream ships no
-    # cantact wheel past cp312, so the release builds stay on 3.12.
     env:
       UV_PYTHON: "3.12"
 
@@ -80,7 +76,7 @@ jobs:
       - uses: astral-sh/setup-uv@v3
 
       - name: Sync dependencies (runtime + packaging)
-        run: uv sync --group packaging --extra cantact
+        run: uv sync --group packaging
 
       - name: Run PyInstaller
         run: uv run pyinstaller packaging/ithildin.spec --noconfirm

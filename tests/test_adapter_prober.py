@@ -18,6 +18,7 @@ python-can backends.
 
 from __future__ import annotations
 
+import sys
 import time
 from unittest.mock import patch
 
@@ -124,7 +125,7 @@ def test_per_backend_timeout_fires_within_limit(qtbot) -> None:  # type: ignore[
     """A hung backend probe must time out, not block the whole run.
 
     Use a short timeout so this test stays fast. Make ``pcan`` hang by
-    sleeping past it; ``kvaser`` and ``cantact`` return immediately.
+    sleeping past it; the other backends return immediately.
     """
     failed: list[tuple[str, str]] = []
     found: list[AdapterChoice] = []
@@ -234,6 +235,28 @@ def test_add_kvaser_firmware_is_a_noop_without_canlib() -> None:
     prober_mod._add_kvaser_firmware(configs)
     assert "firmware" not in configs[0]
     assert "firmware" not in configs[1]
+
+
+def test_detect_gs_usb_lists_scanned_adapters_without_opening_them(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """One config per scanned adapter, by index. The fakes have no attributes,
+    so reading a descriptor (which opens the device) would raise."""
+    import libusb_package
+    from gs_usb.gs_usb import GsUsb
+
+    monkeypatch.setattr(libusb_package, "get_libusb1_backend", lambda: None)
+    monkeypatch.setattr(GsUsb, "scan", staticmethod(lambda: [object(), object()]))
+    assert prober_mod._detect_gs_usb() == [
+        {"interface": "gs_usb", "channel": 0},
+        {"interface": "gs_usb", "channel": 1},
+    ]
+
+
+def test_gs_usb_is_scanned_on_windows_only(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """On Linux the kernel driver owns the adapter and it shows up as SocketCAN."""
+    scanned: list[bool] = []
+    monkeypatch.setattr(prober_mod, "_detect_gs_usb", lambda: scanned.append(True) or [])
+    assert prober_mod._detect_configs("gs_usb") == []
+    assert scanned == ([True] if sys.platform == "win32" else [])
 
 
 def test_adapter_choice_back_compat_equality() -> None:
