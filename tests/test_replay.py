@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -104,11 +105,13 @@ def test_finished_waits_for_the_replay_thread(qapp, qtbot, tmp_path: Path) -> No
 
     controller = ReplayController(log_path, lambda msg: None, speed=100.0)
     controller._worker.finished.connect(
-        lambda _sent: time.sleep(0.2), Qt.ConnectionType.DirectConnection
+        lambda _sent, _outcome: time.sleep(0.2), Qt.ConnectionType.DirectConnection
     )
 
     joined: list[bool] = []
-    controller.finished.connect(lambda _sent: joined.append(controller._thread.isFinished()))
+    controller.finished.connect(
+        lambda _sent, _outcome: joined.append(controller._thread.isFinished())
+    )
     with qtbot.waitSignal(controller.finished, timeout=5000):
         controller.start()
 
@@ -132,3 +135,67 @@ def test_replay_failure_logs_traceback(qapp, qtbot, tmp_path: Path, caplog) -> N
     assert record.levelno == logging.WARNING
     assert record.getMessage() == f"Replay of {log_path} failed"
     assert record.exc_info is not None
+
+
+def _write_gapped_log(path: Path, gap_s: float) -> None:
+    """Two frames ``gap_s`` apart."""
+    writer = can.Logger(str(path))
+    try:
+        for i, ts in enumerate((1000.0, 1000.0 + gap_s)):
+            writer.on_message_received(
+                can.Message(timestamp=ts, arbitration_id=0x300 + i, channel="A")
+            )
+    finally:
+        writer.stop()
+
+
+class _Sender:
+    """Records sends; raises from the ``fail_from``-th one (0-based) on."""
+
+    def __init__(self, fail_from: int | None = None) -> None:
+        self.sent: list[int] = []
+        self.first = threading.Event()
+        self._fail_from = fail_from
+
+    def __call__(self, msg: can.Message) -> None:
+        if self._fail_from is not None and len(self.sent) >= self._fail_from:
+            raise can.CanOperationError("bus gone")
+        self.sent.append(msg.arbitration_id)
+        self.first.set()
+
+
+def test_outcome_done_stopped_failed(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    log_path = tmp_path / "in.asc"
+    _write_log(log_path)
+
+    done = ReplayController(log_path, _Sender(), speed=100.0)
+    with qtbot.waitSignal(done.finished, timeout=5000) as blocker:
+        done.start()
+    assert blocker.args == [6, "done"]
+
+    failed = ReplayController(log_path, _Sender(fail_from=2), speed=100.0)
+    with qtbot.waitSignal(failed.finished, timeout=5000) as blocker:
+        failed.start()
+    assert blocker.args == [2, "failed"]
+
+    gapped = tmp_path / "gapped.asc"
+    _write_gapped_log(gapped, 30.0)
+    sender = _Sender()
+    stopped = ReplayController(gapped, sender, speed=1.0)
+    stopped.start()
+    assert sender.first.wait(5)
+    with qtbot.waitSignal(stopped.finished, timeout=5000) as blocker:
+        assert stopped.stop(wait_ms=2000)
+    assert blocker.args == [1, "stopped"]
+
+
+def test_stop_interrupts_long_gap(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    log_path = tmp_path / "in.asc"
+    _write_gapped_log(log_path, 30.0)
+    sender = _Sender()
+    controller = ReplayController(log_path, sender, speed=1.0)
+    controller.start()
+    assert sender.first.wait(5)
+
+    assert controller.stop(wait_ms=500)
+    assert sender.sent == [0x300]

@@ -19,6 +19,7 @@ avoids opening a second ``Bus`` instance on a physical channel.
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -36,7 +37,8 @@ class ReplayWorker(QObject):
     """Plays a log file through a caller-supplied send callable."""
 
     started = Signal()
-    finished = Signal(int)  # total frames sent
+    # Total frames sent, and the outcome: "done", "stopped" or "failed".
+    finished = Signal(int, str)
     error = Signal(str)
     progress = Signal(int)  # frames sent so far
 
@@ -54,11 +56,14 @@ class ReplayWorker(QObject):
         self._send = send
         self._speed = speed
         self._stop = False
+        # Wakes the wait between frames, so Stop doesn't sit out a long gap.
+        self._wake = threading.Event()
 
     @Slot()
     def start_replay(self) -> None:
         self.started.emit()
         sent = 0
+        failed = False
         try:
             with can.LogReader(str(self._log_path)) as reader:
                 start_real: float | None = None
@@ -74,21 +79,25 @@ class ReplayWorker(QObject):
                         target = start_real + (msg.timestamp - start_ts) / self._speed
                         delay = target - time.monotonic()
                         if delay > 0:
-                            time.sleep(delay)
+                            self._wake.wait(delay)
+                            if self._stop:
+                                break
                     self._send(msg)
                     sent += 1
                     if sent % 100 == 0:
                         self.progress.emit(sent)
         except Exception as exc:
+            failed = True
             _log.warning("Replay of %s failed", self._log_path, exc_info=True)
             self.error.emit(f"Replay error: {exc}")
         finally:
             self.progress.emit(sent)
-            self.finished.emit(sent)
+            self.finished.emit(sent, "failed" if failed else "stopped" if self._stop else "done")
 
     @Slot()
     def request_stop(self) -> None:
         self._stop = True
+        self._wake.set()
 
 
 class ReplayController(QObject):
@@ -96,7 +105,7 @@ class ReplayController(QObject):
 
     error = Signal(str)
     started = Signal()
-    finished = Signal(int)
+    finished = Signal(int, str)  # frames sent, outcome
     progress = Signal(int)
 
     def __init__(
@@ -108,6 +117,7 @@ class ReplayController(QObject):
     ) -> None:
         super().__init__(parent)
         self._sent = 0
+        self._outcome = ""
         self._worker = ReplayWorker(log_path, send, speed)
         self._thread = QThread()
         self._worker.moveToThread(self._thread)
@@ -125,9 +135,10 @@ class ReplayController(QObject):
         self._worker.request_stop()
         return self._thread.wait(wait_ms)
 
-    @Slot(int)
-    def _on_worker_finished(self, sent: int) -> None:
+    @Slot(int, str)
+    def _on_worker_finished(self, sent: int, outcome: str) -> None:
         self._sent = sent
+        self._outcome = outcome
         self._thread.quit()
 
     @Slot()
@@ -138,4 +149,4 @@ class ReplayController(QObject):
         # `finished` let that delete land while the thread was still unwinding
         # its C++ teardown, which is an access violation on Windows.
         self._thread.wait()
-        self.finished.emit(self._sent)
+        self.finished.emit(self._sent, self._outcome)

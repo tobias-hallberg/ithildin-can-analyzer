@@ -12,10 +12,15 @@ that subset, mutable live while a recording is in flight.
 The main area is intentionally minimal for v0.1 (file picker, status,
 start/stop). The eventual richer recording UI replaces this region;
 the surrounding shell stays.
+
+A recording keeps going through a bus loss or a Disconnect and follows
+the buses as they reopen, so one file spans the outage; stopping it on
+its own would let a restart to the same path overwrite what was captured.
 """
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -54,6 +59,7 @@ _FILE_FILTER = (
 )
 
 _DEFAULT_LEFT_PANE_WIDTH = 220
+_STAT_INTERVAL_S = 1.0
 
 
 class RecordWindow(ChildView):
@@ -76,6 +82,13 @@ class RecordWindow(ChildView):
         self._pending_state: dict[str, object] | None = None
         self._written = 0
         self._dropped = 0
+        self._lost = 0
+        self._out_path: Path | None = None
+        # The file size shown while recording, stat'ed at most once a second.
+        self._size_kb: float | None = None
+        self._stat_at = float("-inf")
+        # Bus the loss banner names, so its reconnect can take it down.
+        self._lost_bus: str | None = None
         self._build_body()
 
     def _format_title(self, params: dict[str, object]) -> str:
@@ -91,6 +104,9 @@ class RecordWindow(ChildView):
         self._splitter.setSizes([_DEFAULT_LEFT_PANE_WIDTH, 700])
 
         ctx.bus_reader.error.connect(self._on_bus_error)
+        ctx.bus_reader.bus_started.connect(self._on_bus_started)
+        ctx.bus_reader.bus_stopped.connect(self._on_bus_topology_changed)
+        ctx.bus_reader.bus_failed.connect(self._on_bus_failed)
         # Child views get no closeEvent when the main window closes; stop
         # here so the file is finalised and the thread joined before exit.
         app = QCoreApplication.instance()
@@ -332,11 +348,15 @@ class RecordWindow(ChildView):
         self._banner.hide()
         self._written = 0
         self._dropped = 0
+        self._lost = 0
+        self._out_path = Path(path_str)
+        self._stat_at = float("-inf")
         self._refresh_counts_label()
-        self._logger = TeeLogger(Path(path_str), rings, admit=self._admit)
+        self._logger = TeeLogger(self._out_path, rings, admit=self._admit)
         self._logger.started.connect(self._on_started)
         self._logger.frame_count.connect(self._on_frame_count)
         self._logger.dropped_count.connect(self._on_dropped_count)
+        self._logger.lost_count.connect(self._on_lost_count)
         self._logger.error.connect(self._on_error)
         self._logger.stopped.connect(self._on_stopped)
         self._logger.start()
@@ -369,22 +389,37 @@ class RecordWindow(ChildView):
         self._dropped = count
         self._refresh_counts_label()
 
+    def _on_lost_count(self, count: int) -> None:
+        self._lost = count
+        self._refresh_counts_label()
+
     def _refresh_counts_label(self) -> None:
-        self._counts_label.setText(f"WRITTEN {self._written}   DROPPED {self._dropped}")
+        text = f"WRITTEN {self._written}   DROPPED {self._dropped}"
+        if self._lost:
+            text += f"   LOST {self._lost}"
+            self._counts_label.setToolTip(
+                "LOST: frames overwritten in the capture buffer before the recorder wrote them"
+            )
+        else:
+            self._counts_label.setToolTip("")
+        self._counts_label.setText(text)
 
     def _refresh_status_running(self) -> None:
-        path_str = self._path_edit.text().strip()
-        size_kb: float | None = None
-        if path_str:
+        if self._ctx is not None and not self._ctx.bus_reader.is_open:
+            self._status_label.setText("Recording · no bus open — waiting for a bus")
+            return
+        now = time.monotonic()
+        if self._out_path is not None and now - self._stat_at >= _STAT_INTERVAL_S:
+            self._stat_at = now
             try:
-                size_kb = Path(path_str).stat().st_size / 1024.0
+                self._size_kb = self._out_path.stat().st_size / 1024.0
             except OSError:
-                size_kb = None
-        if size_kb is None:
+                self._size_kb = None
+        if self._size_kb is None:
             self._status_label.setText(f"Recording · {self._written} frames written")
         else:
             self._status_label.setText(
-                f"Recording · {self._written} frames written · {size_kb:.1f} kB on disk"
+                f"Recording · {self._written} frames written · {self._size_kb:.1f} kB on disk"
             )
 
     def _on_error(self, message: str) -> None:
@@ -394,11 +429,38 @@ class RecordWindow(ChildView):
     def _on_stopped(self) -> None:
         self._idle_btn.setChecked(True)
         self._action_btn.setText("Start recording")
+        if self._banner.kind == "warn":
+            self._banner.hide()
+            self._lost_bus = None
         if self._logger is not None and not self._banner.isVisible():
             self._status_label.setText(
                 f"Stopped · {self._written} frames written" if self._written else "Stopped"
             )
+        if self._lost and self._ctx is not None:
+            self._ctx.events.report_requested.emit(
+                f"Recording to {self._out_path} finished with {self._lost} frames lost", "warn"
+            )
         self._logger = None
+
+    def _on_bus_started(self, bus_name: str) -> None:
+        if bus_name == self._lost_bus and self._banner.kind == "warn":
+            self._banner.hide()
+        self._on_bus_topology_changed(bus_name)
+
+    def _on_bus_topology_changed(self, _bus_name: str) -> None:
+        if self._logger is None or self._ctx is None:
+            return
+        self._logger.set_rings(self._ctx.bus_reader.rings)
+        self._refresh_status_running()
+
+    def _on_bus_failed(self, bus_name: str, _message: str) -> None:
+        if self._logger is None:
+            return
+        self._lost_bus = bus_name
+        self._banner.show_message(
+            f"Bus {bus_name} lost — recording continues and resumes when it reconnects",
+            kind="warn",
+        )
 
     def _on_bus_error(self, message: str) -> None:
         self._banner.show_message(message, kind="error")

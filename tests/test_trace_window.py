@@ -10,6 +10,8 @@ from pathlib import Path
 import can
 from PySide6.QtCore import Qt
 
+from ithildin.app_state.context import AppContext
+from ithildin.app_state.project import Project, new_unsaved
 from ithildin.ui._drag_payload import (
     BusPayload,
     DbcPayload,
@@ -18,7 +20,7 @@ from ithildin.ui._drag_payload import (
 from ithildin.ui.trace_view import TraceTreeModel
 from ithildin.ui.trace_window import TraceWindow
 from ithildin.workspace.schema import BusConfig
-from tests.conftest import make_app_context
+from tests.conftest import kill_capture, make_app_context
 
 
 def test_empty_default_records_nothing(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
@@ -734,3 +736,185 @@ def test_bus_off_banner_reconnects_the_bus(qapp, qtbot, tmp_path: Path) -> None:
         win._banner._action_btn.click()
     assert ctx.bus_reader.bus_names() == ["CAN_1"]
     assert win._banner.isHidden()
+
+
+# ---- Continuity across bus stop, failure and reconnect ----
+
+
+def _send_ids(channel: str, *ids: int) -> None:
+    sender = can.Bus(interface="virtual", channel=channel)
+    try:
+        for aid in ids:
+            sender.send(can.Message(arbitration_id=aid, data=b"\x00", is_extended_id=False))
+    finally:
+        sender.shutdown()
+
+
+def _trace_recording_bus(  # type: ignore[no-untyped-def]
+    qtbot, tmp_path: Path, project: Project | None = None
+) -> tuple[AppContext, TraceWindow, BusConfig]:
+    """A Trace subscribed to bus CAN_1, open, with three rows in it."""
+    ctx = make_app_context(tmp_path, project=project)
+    win = TraceWindow(instance_id="t1")
+    qtbot.addWidget(win)
+    win.bind(ctx)
+    cfg = BusConfig(
+        name="CAN_1", interface="virtual", channel=f"tr-{uuid.uuid4().hex[:8]}", bitrate=500000
+    )
+    with qtbot.waitSignal(ctx.bus_reader.bus_started, timeout=2000):
+        ctx.bus_reader.open(cfg)
+    assert win._tracked_pane is not None
+    win._tracked_pane.add_payload(BusPayload(bus_name="CAN_1"))
+    _send_ids(str(cfg.channel), 0x100, 0x101, 0x102)
+    model = win._model
+    assert model is not None
+    qtbot.waitUntil(lambda: model.rowCount() == 3, timeout=2000)
+    return ctx, win, cfg
+
+
+def test_bus_failure_keeps_trace_rows(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    ctx, win, _cfg = _trace_recording_bus(qtbot, tmp_path)
+    model = win._model
+    assert model is not None
+
+    with qtbot.waitSignal(ctx.bus_reader.bus_failed, timeout=2000):
+        kill_capture(ctx.bus_reader, "CAN_1")
+    assert win._model is model
+    assert model.rowCount() == 3
+    fg = model.data(model.index(0, TraceTreeModel.COL_ID), Qt.ItemDataRole.ForegroundRole)
+    assert fg == model._dim_color
+
+
+def test_reconnect_appends_without_replay_or_skip(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    ctx, win, cfg = _trace_recording_bus(qtbot, tmp_path)
+    model = win._model
+    assert model is not None
+    with qtbot.waitSignal(ctx.bus_reader.bus_failed, timeout=2000):
+        kill_capture(ctx.bus_reader, "CAN_1")
+    t0 = ctx.bus_reader.session_t0
+
+    with qtbot.waitSignal(ctx.bus_reader.bus_started, timeout=2000):
+        win._banner._action_btn.click()
+    _send_ids(str(cfg.channel), 0x200, 0x201)
+    qtbot.waitUntil(lambda: model.rowCount() == 5, timeout=2000)
+    qtbot.wait(150)
+    assert model.rowCount() == 5
+    assert ctx.bus_reader.session_t0 == t0
+    assert model.data(model.index(4, TraceTreeModel.COL_ID), Qt.ItemDataRole.ForegroundRole) is None
+
+
+def test_second_reconnect_click_leaves_the_opening_bus_alone(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    ctx, win, _cfg = _trace_recording_bus(qtbot, tmp_path)
+    with qtbot.waitSignal(ctx.bus_reader.bus_failed, timeout=2000):
+        kill_capture(ctx.bus_reader, "CAN_1")
+    stopped: list[str] = []
+    ctx.bus_reader.bus_stopped.connect(stopped.append)
+
+    with qtbot.waitSignal(ctx.bus_reader.bus_started, timeout=2000):
+        win._banner._action_btn.click()
+        win._banner._action_btn.click()
+    assert stopped == []
+    assert ctx.bus_reader.bus_names() == ["CAN_1"]
+
+
+def test_pinned_inspector_follows_a_reconnected_bus(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    """The reopened bus's new ring restarts seq at 0."""
+    ctx, win, cfg = _trace_recording_bus(qtbot, tmp_path)
+    model = win._model
+    inspector = win._detail_view
+    assert model is not None and inspector is not None
+    win._latest_btn.click()
+    sender = can.Bus(interface="virtual", channel=cfg.channel)
+    try:
+        sender.send(can.Message(arbitration_id=0x100, data=b"\xde\xad", is_extended_id=False))
+        qtbot.waitUntil(lambda: model.rowCount() == 1, timeout=2000)
+        sel = win._tree.selectionModel()
+        assert sel is not None
+        sel.setCurrentIndex(
+            win._proxy.index(0, 0), sel.SelectionFlag.ClearAndSelect | sel.SelectionFlag.Rows
+        )
+        qtbot.waitUntil(lambda: "DE" in inspector._byte_cells[0].text(), timeout=1000)
+        with qtbot.waitSignal(ctx.bus_reader.bus_failed, timeout=2000):
+            kill_capture(ctx.bus_reader, "CAN_1")
+
+        with qtbot.waitSignal(ctx.bus_reader.bus_started, timeout=2000):
+            win._banner._action_btn.click()
+        sender.send(can.Message(arbitration_id=0x100, data=b"\xbe\xef", is_extended_id=False))
+        qtbot.waitUntil(lambda: "BE" in inspector._byte_cells[0].text(), timeout=2000)
+    finally:
+        sender.shutdown()
+
+
+def test_reconnect_opens_the_workspace_config(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    """The bus's declaration may have changed since it was opened."""
+    project = new_unsaved(user_root=tmp_path)
+    ctx, win, cfg = _trace_recording_bus(qtbot, tmp_path, project=project)
+    project.workspace.bus = [cfg.model_copy(update={"bitrate": 250000})]
+    with qtbot.waitSignal(ctx.bus_reader.bus_failed, timeout=2000):
+        kill_capture(ctx.bus_reader, "CAN_1")
+
+    with qtbot.waitSignal(ctx.bus_reader.bus_started, timeout=2000):
+        win._banner._action_btn.click()
+    reopened = ctx.bus_reader.last_config_for("CAN_1")
+    assert reopened is not None
+    assert reopened.bitrate == 250000
+
+
+def test_new_session_clears_trace(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    ctx, win, cfg = _trace_recording_bus(qtbot, tmp_path)
+    model = win._model
+    assert model is not None
+
+    ctx.bus_reader.close()
+    assert model.rowCount() == 3
+    with qtbot.waitSignal(ctx.bus_reader.bus_started, timeout=2000):
+        ctx.bus_reader.open(cfg)
+        assert model.rowCount() == 0
+    assert win._counts_label.text() == "RX 0   ERR 0"
+
+
+def test_paused_trace_keeps_rows_on_bus_stop(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    ctx, win, _cfg = _trace_recording_bus(qtbot, tmp_path)
+    model = win._model
+    assert model is not None
+
+    win._paused_btn.click()
+    ctx.bus_reader.close()
+    assert win._model is model
+    assert model.rowCount() == 3
+
+
+def test_stopping_one_bus_does_not_replay_the_other(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    ctx = make_app_context(tmp_path)
+    win = TraceWindow(instance_id="t1")
+    qtbot.addWidget(win)
+    win.bind(ctx)
+    channels = {}
+    for name in ("A", "B"):
+        channels[name] = f"tr-{uuid.uuid4().hex[:8]}"
+        cfg = BusConfig(name=name, interface="virtual", channel=channels[name], bitrate=500000)
+        with qtbot.waitSignal(ctx.bus_reader.bus_started, timeout=2000):
+            ctx.bus_reader.open(cfg)
+        assert win._tracked_pane is not None
+        win._tracked_pane.add_payload(BusPayload(bus_name=name))
+    _send_ids(channels["A"], 0x100, 0x101)
+    _send_ids(channels["B"], 0x200, 0x201)
+    model = win._model
+    assert model is not None
+    qtbot.waitUntil(lambda: model.rowCount() == 4, timeout=2000)
+
+    ctx.bus_reader.close("B")
+    qtbot.wait(150)
+    assert model.rowCount() == 4
+    ids = {model.data(model.index(r, TraceTreeModel.COL_ID)) for r in range(4)}
+    assert ids == {"100", "101", "200", "201"}
+
+
+def test_restored_latest_mode_reaches_the_model(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    """The model is built once in bind, before restore_state runs."""
+    win = TraceWindow(instance_id="t1")
+    qtbot.addWidget(win)
+    win.bind(make_app_context(tmp_path))
+    win.restore_state({"mode": "overwrite"})
+    assert win._model is not None
+    assert win._model.mode() == "overwrite"

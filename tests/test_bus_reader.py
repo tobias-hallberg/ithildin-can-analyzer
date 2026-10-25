@@ -15,6 +15,7 @@ from PySide6.QtCore import QDeadlineTimer
 from ithildin.app_state.bus_reader import BusReader, BusReadOnlyError
 from ithildin.core.bus import BusController
 from ithildin.workspace.schema import BusConfig
+from tests.conftest import kill_capture
 from tests.fake_bus import FakeBus, use_fake_bus
 
 
@@ -386,3 +387,116 @@ def test_forget_drops_config_and_lost_health(qapp, qtbot, reader) -> None:  # ty
     assert reader.last_config_for("B") is not None
     reader.forget()
     assert reader.last_configs() == []
+
+
+# ---- Capture session ----
+
+
+def _session_with_t0(reader: BusReader, qtbot) -> tuple[BusConfig, float]:  # type: ignore[no-untyped-def]
+    cfg = _virtual()
+    _open(reader, qtbot, cfg)
+    _send(str(cfg.channel), 0x100)
+    qtbot.waitUntil(lambda: reader.session_t0 is not None, timeout=2000)
+    t0 = reader.session_t0
+    assert t0 is not None
+    return cfg, t0
+
+
+def test_session_t0_survives_worker_failure(qapp, qtbot, reader) -> None:  # type: ignore[no-untyped-def]
+    _cfg, t0 = _session_with_t0(reader, qtbot)
+    emitted: list[object] = []
+    reader.session_t0_changed.connect(emitted.append)
+
+    with qtbot.waitSignal(reader.bus_failed, timeout=2000):
+        kill_capture(reader, "CAN_1")
+    assert reader.session_t0 == t0
+    assert emitted == []
+
+
+def test_reopen_after_failure_continues_session(qapp, qtbot, reader) -> None:  # type: ignore[no-untyped-def]
+    cfg, t0 = _session_with_t0(reader, qtbot)
+    with qtbot.waitSignal(reader.bus_failed, timeout=2000):
+        kill_capture(reader, "CAN_1")
+    emitted: list[object] = []
+    reader.session_t0_changed.connect(emitted.append)
+    received: list[int] = []
+    reader.frames_received.connect(lambda batch: received.extend(f.arbitration_id for f in batch))
+
+    with qtbot.waitSignal(reader.bus_started, timeout=2000):
+        reader.reopen(cfg)
+    _send(str(cfg.channel), 0x200)
+    qtbot.waitUntil(lambda: 0x200 in received, timeout=2000)
+    assert reader.session_t0 == t0
+    assert emitted == []
+
+
+def test_reopen_of_the_last_open_bus_keeps_the_session(qapp, qtbot, reader) -> None:  # type: ignore[no-untyped-def]
+    """The bus-off Reconnect closes and opens the only bus, still one session."""
+    cfg, t0 = _session_with_t0(reader, qtbot)
+    emitted: list[object] = []
+    reader.session_t0_changed.connect(emitted.append)
+
+    with qtbot.waitSignal(reader.bus_started, timeout=2000):
+        reader.reopen(cfg)
+    assert reader.session_t0 == t0
+    assert emitted == []
+
+
+def test_explicit_close_keeps_t0_until_next_open(qapp, qtbot, reader) -> None:  # type: ignore[no-untyped-def]
+    cfg, t0 = _session_with_t0(reader, qtbot)
+    emitted: list[object] = []
+    reader.session_t0_changed.connect(emitted.append)
+
+    reader.close()
+    assert reader.session_t0 == t0
+    assert emitted == []
+    with qtbot.waitSignal(reader.bus_started, timeout=2000):
+        reader.open(cfg)
+        assert emitted == [None]
+        assert reader.session_t0 is None
+
+
+def test_close_after_a_failure_ends_the_session(qapp, qtbot, reader) -> None:  # type: ignore[no-untyped-def]
+    """Disconnect with every bus already failed (or Open Project) still ends it."""
+    cfg, _t0 = _session_with_t0(reader, qtbot)
+    with qtbot.waitSignal(reader.bus_failed, timeout=2000):
+        kill_capture(reader, "CAN_1")
+    emitted: list[object] = []
+    reader.session_t0_changed.connect(emitted.append)
+
+    reader.close()
+    with qtbot.waitSignal(reader.bus_started, timeout=2000):
+        reader.open(cfg)
+    assert emitted == [None]
+
+
+def test_closing_a_bus_that_isnt_open_keeps_the_session(qapp, qtbot, reader) -> None:  # type: ignore[no-untyped-def]
+    """Removing an unopened bus from the project while another has failed."""
+    cfg, t0 = _session_with_t0(reader, qtbot)
+    with qtbot.waitSignal(reader.bus_failed, timeout=2000):
+        kill_capture(reader, "CAN_1")
+    emitted: list[object] = []
+    reader.session_t0_changed.connect(emitted.append)
+
+    reader.close("CAN_2")
+    with qtbot.waitSignal(reader.bus_started, timeout=2000):
+        reader.reopen(cfg)
+    assert emitted == []
+    assert reader.session_t0 == t0
+
+
+def test_refused_open_keeps_the_session(qapp, qtbot, monkeypatch, reader) -> None:  # type: ignore[no-untyped-def]
+    """An open refused while the bus is still closing must not wipe the views."""
+    fake = _hung_fake(monkeypatch)
+    cfg = _virtual()
+    _open(reader, qtbot, cfg)
+    emitted: list[object] = []
+    reader.session_t0_changed.connect(emitted.append)
+    try:
+        reader.close(wait_ms=50)
+        reader.open(cfg)
+        assert not reader.is_open
+        assert emitted == []
+    finally:
+        with qtbot.waitSignal(reader.bus_released, timeout=2000):
+            fake.block.set()

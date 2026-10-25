@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from pathlib import Path
 
@@ -116,3 +117,83 @@ def test_stopped_when_writer_stop_raises(qapp, qtbot, tmp_path: Path, caplog, mo
         assert logger.stop(wait_ms=5000)
     (record,) = [r for r in caplog.records if r.name == "ithildin.core.logger"]
     assert record.levelno == logging.ERROR
+
+
+# ---- Following the open buses ----
+
+
+def _append(ring: RingBuffer, *ids: int) -> None:
+    for aid in ids:
+        ring.append(FrameRecord(bus_name="A", timestamp=1000.0 + aid, arbitration_id=aid, data=b""))
+
+
+def _ids_in(path: Path) -> list[int]:
+    with can.LogReader(str(path)) as reader:
+        return [msg.arbitration_id for msg in reader]
+
+
+def test_tee_worker_follows_ring_replacement(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    old = RingBuffer(64)
+    _append(old, 1, 2, 3)
+    log_path = tmp_path / "out.asc"
+    logger = TeeLogger(log_path, {"A": old})
+    with qtbot.waitSignal(logger.started, timeout=2000):
+        logger.start()
+
+    # A reconnect: a new ring under the same name, its seq back at 0.
+    new = RingBuffer(64)
+    logger.set_rings({"A": new})
+    _append(new, 4, 5)
+    assert logger.stop(wait_ms=5000)
+    assert _ids_in(log_path) == [1, 2, 3, 4, 5]
+
+
+def test_tee_worker_drains_removed_ring(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    ring = RingBuffer(64)
+    log_path = tmp_path / "out.asc"
+    logger = TeeLogger(log_path, {"A": ring})
+    with qtbot.waitSignal(logger.started, timeout=2000):
+        logger.start()
+
+    _append(ring, 1, 2, 3)
+    logger.set_rings({})
+    assert logger.stop(wait_ms=5000)
+    assert _ids_in(log_path) == [1, 2, 3]
+
+
+def test_tee_worker_reports_ring_overrun(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    ring = RingBuffer(8)
+    # Overwritten before Start: not lost to this recording.
+    _append(ring, *range(20))
+    log_path = tmp_path / "out.asc"
+    logger = TeeLogger(log_path, {"A": ring})
+    gate = threading.Event()
+    logger._worker.started.connect(lambda: gate.wait(5), Qt.ConnectionType.DirectConnection)
+    lost: list[int] = []
+    logger.lost_count.connect(lost.append)
+    try:
+        with qtbot.waitSignal(logger.started, timeout=2000):
+            logger.start()
+        # The worker holds its Start cursor while 20 more frames overrun the ring.
+        _append(ring, *range(20, 40))
+    finally:
+        gate.set()
+    with qtbot.waitSignal(logger.stopped, timeout=5000):
+        assert logger.stop(wait_ms=5000)
+    assert lost[-1] == 20
+    assert _ids_in(log_path) == list(range(32, 40))
+
+
+def test_tee_worker_reports_no_loss_for_the_start_backlog(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    ring = RingBuffer(8)
+    _append(ring, *range(20))
+    log_path = tmp_path / "out.asc"
+    logger = TeeLogger(log_path, {"A": ring})
+    lost: list[int] = []
+    logger.lost_count.connect(lost.append)
+    with qtbot.waitSignal(logger.started, timeout=2000):
+        logger.start()
+    with qtbot.waitSignal(logger.stopped, timeout=5000):
+        assert logger.stop(wait_ms=5000)
+    assert lost == [0]
+    assert _ids_in(log_path) == list(range(12, 20))

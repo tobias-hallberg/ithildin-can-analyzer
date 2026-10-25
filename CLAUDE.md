@@ -75,6 +75,19 @@ MCP layer (`src/ithildin/mcp/`):
   exits on its own does the same from its `stopped`, with `bus_failed`
   just before. Open / New Project and removing a bus from the dock close
   and `forget()` it.
+- **Capture sessions end only on an explicit close of the last bus.** A
+  worker failure keeps `session_t0` and every view's data, and
+  `BusReader.reopen(config)` (the Trace's Reconnects, given the
+  workspace's config) closes and opens a bus within the same session.
+  `session_t0_changed(None)` means a new session is starting: `open()`
+  emits it after its retiring refusal, before the new ring exists, and
+  views drop old data only then. Views never rebuild their models on bus
+  start or stop: Trace builds `TraceTreeModel` once and swaps rings with
+  `set_rings`, which keeps a cursor only for the same ring object (a
+  reopened bus's seq restarts at 0); Plot breaks the lines of a stopped or
+  degraded bus with a NaN; `TeeLogger.set_rings` keeps one recording
+  across bus loss and reconnects; Monitor and Data view dim stale values.
+  Replay stops when its target bus stops, fails or degrades.
 - **Controller signals are routed by identity.** `BusReader` tells
   controllers apart by `sender()`, never by bus name, and ignores any
   that is no longer registered, so a late signal can't act on a bus

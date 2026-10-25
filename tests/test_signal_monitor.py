@@ -4,10 +4,12 @@
 
 from __future__ import annotations
 
+import uuid
 from pathlib import Path
 
 from ithildin.core.types import FrameRecord
 from ithildin.ui.signal_monitor import SignalMonitorWindow
+from ithildin.workspace.schema import BusConfig
 from tests.conftest import make_app_context
 
 
@@ -271,3 +273,72 @@ def test_end_to_end_open_all_then_can_send(  # type: ignore[no-untyped-def]
     qtbot.waitUntil(lambda: win._rows["EngineCommand.EngineSpeed"].last == 800.0, timeout=3000)
     assert win._rows["EngineCommand.EngineSpeed"].bar.value_label.text() == "800.000"
     ctx.bus_reader.close()
+
+
+# ---- Staleness ----
+
+
+def _speed_frame(ts: float = 0.0) -> FrameRecord:
+    payload = (6400).to_bytes(2, "little") + (700).to_bytes(2, "little") + bytes(4)
+    return FrameRecord(bus_name="CAN_1", timestamp=ts, arbitration_id=0x100, data=payload)
+
+
+def _monitor_on_silent_bus(qtbot, tmp_path: Path, dbc: Path):  # type: ignore[no-untyped-def]
+    ctx = make_app_context(tmp_path)
+    ctx.database.add_dbc(dbc, ["CAN_1"])
+    cfg = BusConfig(
+        name="CAN_1", interface="virtual", channel=f"mon-{uuid.uuid4().hex[:8]}", bitrate=500000
+    )
+    with qtbot.waitSignal(ctx.bus_reader.bus_started, timeout=2000):
+        ctx.bus_reader.open(cfg)
+    win = SignalMonitorWindow(instance_id="m1")
+    qtbot.addWidget(win)
+    win.bind(ctx)
+    win.add_signal("EngineCommand.EngineSpeed")
+    win._on_frames_received([_speed_frame()])
+    return ctx, win, win._rows["EngineCommand.EngineSpeed"]
+
+
+def test_value_dims_when_quiet(qapp, qtbot, tmp_path: Path, example_dbc_path: Path) -> None:  # type: ignore[no-untyped-def]
+    _ctx, win, row = _monitor_on_silent_bus(qtbot, tmp_path, example_dbc_path)
+    assert not row.bar._stale_effect.isEnabled()
+
+    row.updated -= 10
+    win._refresh_staleness()
+    assert row.bar._stale_effect.isEnabled()
+    assert row.bar.toolTip() == "No update for 10 s"
+
+
+def test_value_stays_fresh_within_three_periods(  # type: ignore[no-untyped-def]
+    qapp, qtbot, tmp_path: Path, example_dbc_path: Path
+) -> None:
+    _ctx, win, row = _monitor_on_silent_bus(qtbot, tmp_path, example_dbc_path)
+    win._on_frames_received([_speed_frame(ts=1.0)])
+    assert row.period == 1.0
+
+    row.updated -= 2.5
+    win._refresh_staleness()
+    assert not row.bar._stale_effect.isEnabled()
+    row.updated -= 1.0
+    win._refresh_staleness()
+    assert row.bar._stale_effect.isEnabled()
+
+
+def test_value_dims_when_bus_closes(qapp, qtbot, tmp_path: Path, example_dbc_path: Path) -> None:  # type: ignore[no-untyped-def]
+    ctx, win, row = _monitor_on_silent_bus(qtbot, tmp_path, example_dbc_path)
+
+    ctx.bus_reader.close()
+    win._refresh_staleness()
+    assert row.bar._stale_effect.isEnabled()
+    assert row.bar.value_label.text() == "800.000"
+
+
+def test_fresh_value_undims(qapp, qtbot, tmp_path: Path, example_dbc_path: Path) -> None:  # type: ignore[no-untyped-def]
+    _ctx, win, row = _monitor_on_silent_bus(qtbot, tmp_path, example_dbc_path)
+    row.updated -= 10
+    win._refresh_staleness()
+    assert row.bar._stale_effect.isEnabled()
+
+    win._on_frames_received([_speed_frame(ts=1.0)])
+    assert not row.bar._stale_effect.isEnabled()
+    assert row.bar.toolTip() == ""

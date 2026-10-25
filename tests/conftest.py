@@ -81,6 +81,18 @@ def make_app_context(
     )
 
 
+def kill_capture(reader: BusReader, name: str) -> None:
+    """Fail an open ``virtual`` bus as an unplugged adapter would.
+
+    Shuts its python-can bus down from the test thread: the worker's next
+    ``recv`` raises, and the real failure path runs (``error``, then
+    ``bus_failed`` and ``bus_stopped``).
+    """
+    bus = reader._controllers[name].worker._bus
+    assert bus is not None
+    bus.shutdown()
+
+
 # Minimal hand-written DBC. Two messages, two signals each. Avoids depending
 # on the exact cantools Signal-constructor API which has shifted across
 # major versions.

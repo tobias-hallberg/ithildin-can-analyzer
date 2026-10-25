@@ -11,18 +11,23 @@ can be told apart at a glance.
 Drop target accepts ``application/x-ithildin-signal``. Decode runs per
 ``frames_received`` batch — filter-then-decode so the GUI thread stays
 responsive.
+
+A bar dims while its value is stale: its bus is closed, or no update came
+for ``max(_STALE_MIN_S, _STALE_PERIODS × its period)``.
 """
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Any
 
-from PySide6.QtCore import QPoint, QRect, QSize, Qt
+from PySide6.QtCore import QPoint, QRect, QSize, Qt, QTimer
 from PySide6.QtGui import QColor, QPainter, QPalette
 from PySide6.QtWidgets import (
     QFrame,
+    QGraphicsOpacityEffect,
     QHBoxLayout,
     QLabel,
     QMenu,
@@ -88,6 +93,11 @@ _NAME_POINT_SIZE = 22
 _VALUE_POINT_SIZE = 32
 _UNIT_POINT_SIZE = 20
 _BAR_MIN_HEIGHT = 72
+
+_STALE_MIN_S = 2.0
+_STALE_PERIODS = 3
+_STALE_CHECK_MS = 1000
+_STALE_OPACITY = 0.35
 
 
 class _WrapAnywhereLabel(QLabel):
@@ -191,6 +201,11 @@ class _SignalBar(QFrame):
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.apply_theme(ThemeManager.instance().current_tokens())
 
+        self._stale_effect = QGraphicsOpacityEffect(self)
+        self._stale_effect.setOpacity(_STALE_OPACITY)
+        self._stale_effect.setEnabled(False)
+        self.setGraphicsEffect(self._stale_effect)
+
     def apply_theme(self, tokens: dict[str, str]) -> None:
         bg_hex, fg_hex = _bar_colors(self._color_index, tokens)
         pal = self.palette()
@@ -205,6 +220,12 @@ class _SignalBar(QFrame):
 
     def set_value(self, text: str) -> None:
         self.value_label.setText(text)
+
+    def set_stale(self, age: float | None) -> None:
+        """Dim the bar while its value is stale; ``age`` is the seconds since
+        the last update, ``None`` once fresh."""
+        self._stale_effect.setEnabled(age is not None)
+        self.setToolTip("" if age is None else f"No update for {age:.0f} s")
 
     def path(self) -> str:
         return self._path
@@ -248,6 +269,14 @@ class _Row:
     # to ``_FLOAT_SIGNAL_DECIMALS`` for IEEE-754 float signals.
     decimals: int = 0
     last: int | float | str | None = None
+    # Staleness bookkeeping, set on each value update: the frame's bus and
+    # timestamp, the interval since the previous one, and the monotonic
+    # time of the update.
+    bus: str | None = None
+    ts: float | None = None
+    period: float | None = None
+    updated: float | None = None
+    stale: bool = False
 
 
 class SignalMonitorWindow(ChildView):
@@ -281,6 +310,10 @@ class SignalMonitorWindow(ChildView):
         ctx.bus_reader.frames_received.connect(self._on_frames_received)
         ctx.database.database_changed.connect(self._refresh_origin_tooltips)
         self._refresh_origin_tooltips()
+        self._stale_timer = QTimer(self)
+        self._stale_timer.setInterval(_STALE_CHECK_MS)
+        self._stale_timer.timeout.connect(self._refresh_staleness)
+        self._stale_timer.start()
 
     # ---- Public API ----
 
@@ -472,11 +505,13 @@ class SignalMonitorWindow(ChildView):
         if self._ctx is None or not self._rows:
             return
         wanted_messages = {row.message for row in self._rows.values()}
+        now = time.monotonic()
         for frame in batch:
-            self._ingest_frame(frame, wanted_messages)
+            self._ingest_frame(frame, wanted_messages, now)
         self._render()
+        self._refresh_staleness()
 
-    def _ingest_frame(self, frame: FrameRecord, wanted_messages: set[str]) -> None:
+    def _ingest_frame(self, frame: FrameRecord, wanted_messages: set[str], now: float) -> None:
         if self._ctx is None:
             return
         decoder = self._ctx.database.decoder_for_bus(frame.bus_name)
@@ -497,6 +532,11 @@ class SignalMonitorWindow(ChildView):
             value = decoded.get(row.signal)
             if value is None:
                 continue
+            if row.ts is not None:
+                row.period = frame.timestamp - row.ts
+            row.ts = frame.timestamp
+            row.bus = frame.bus_name
+            row.updated = now
             if isinstance(value, bool):
                 row.last = str(value)
             elif isinstance(value, int):
@@ -509,6 +549,22 @@ class SignalMonitorWindow(ChildView):
                 row.last = value
             else:
                 row.last = str(value)
+
+    def _refresh_staleness(self) -> None:
+        if self._ctx is None:
+            return
+        open_buses = set(self._ctx.bus_reader.bus_names())
+        now = time.monotonic()
+        for row in self._rows.values():
+            if row.updated is None:
+                continue
+            age = now - row.updated
+            stale = row.bus not in open_buses or age > max(
+                _STALE_MIN_S, _STALE_PERIODS * (row.period or 0.0)
+            )
+            if stale or row.stale:
+                row.bar.set_stale(age if stale else None)
+            row.stale = stale
 
     def _render(self) -> None:
         for row in self._rows.values():

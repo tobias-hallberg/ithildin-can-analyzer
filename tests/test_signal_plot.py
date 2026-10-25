@@ -4,10 +4,12 @@
 
 from __future__ import annotations
 
+import math
 import uuid
 from pathlib import Path
 
 import can
+import pytest
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor
 
@@ -20,7 +22,7 @@ from ithildin.ui.signal_plot import (
     _SwatchButton,
 )
 from ithildin.workspace.schema import BusConfig, PreferencesConfig, Workspace
-from tests.conftest import make_app_context
+from tests.conftest import kill_capture, make_app_context
 
 
 def test_add_and_remove_signal_curve(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
@@ -491,3 +493,108 @@ def test_save_and_restore_curve_colors(qapp, qtbot, tmp_path: Path) -> None:  # 
     assert restored.user_color
     assert restored.color() == QColor("#123456")
     assert not dst._curves["EngineCommand.EngineSpeed"].user_color
+
+
+# ---- Continuity across bus stop, failure and reconnect ----
+
+_SPEED = "EngineCommand.EngineSpeed"
+
+
+def _send_speeds(channel: str, *raws: int) -> None:
+    sender = can.Bus(interface="virtual", channel=channel)
+    try:
+        for raw in raws:
+            payload = raw.to_bytes(2, "little") + (700).to_bytes(2, "little") + bytes(4)
+            sender.send(can.Message(arbitration_id=0x100, data=payload, is_extended_id=False))
+    finally:
+        sender.shutdown()
+
+
+def _plot_with_samples(qtbot, tmp_path: Path, dbc: Path):  # type: ignore[no-untyped-def]
+    """A plot of EngineSpeed on open bus CAN_1, holding 800, 850 and 900 rpm."""
+    ctx = make_app_context(tmp_path)
+    ctx.database.add_dbc(dbc, ["CAN_1"])
+    win = SignalPlotWindow(instance_id="p1")
+    qtbot.addWidget(win)
+    win.bind(ctx)
+    win.add_signal(_SPEED)
+    cfg = BusConfig(
+        name="CAN_1", interface="virtual", channel=f"plot-{uuid.uuid4().hex[:8]}", bitrate=500000
+    )
+    with qtbot.waitSignal(ctx.bus_reader.bus_started, timeout=2000):
+        ctx.bus_reader.open(cfg)
+    _send_speeds(str(cfg.channel), 6400, 6800, 7200)
+    curve = win._curves[_SPEED]
+    qtbot.waitUntil(lambda: len(curve.values) == 3, timeout=3000)
+    return ctx, win, cfg, curve
+
+
+def test_plot_keeps_samples_on_bus_failure(  # type: ignore[no-untyped-def]
+    qapp, qtbot, tmp_path: Path, example_dbc_path: Path
+) -> None:
+    ctx, _win, _cfg, curve = _plot_with_samples(qtbot, tmp_path, example_dbc_path)
+
+    with qtbot.waitSignal(ctx.bus_reader.bus_failed, timeout=2000):
+        kill_capture(ctx.bus_reader, "CAN_1")
+    assert [v for v in curve.values if not math.isnan(v)] == [800.0, 850.0, 900.0]
+    assert curve.last_value == 900.0
+
+
+def test_plot_breaks_line_at_bus_loss(  # type: ignore[no-untyped-def]
+    qapp, qtbot, tmp_path: Path, example_dbc_path: Path
+) -> None:
+    ctx, win, cfg, curve = _plot_with_samples(qtbot, tmp_path, example_dbc_path)
+    with qtbot.waitSignal(ctx.bus_reader.bus_failed, timeout=2000):
+        kill_capture(ctx.bus_reader, "CAN_1")
+
+    with qtbot.waitSignal(ctx.bus_reader.bus_started, timeout=2000):
+        ctx.bus_reader.reopen(cfg)
+    _send_speeds(str(cfg.channel), 8000)
+    qtbot.waitUntil(lambda: len(curve.values) == 5, timeout=3000)
+    assert math.isnan(curve.values[3])
+    assert curve.values[4] == 1000.0
+    # The fourth sample starts a new chain instead of joining the third.
+    assert win._plot._curves[_SPEED].segment_count == 2
+
+
+def test_degraded_health_breaks_the_line(  # type: ignore[no-untyped-def]
+    qapp, qtbot, tmp_path: Path, example_dbc_path: Path
+) -> None:
+    ctx, _win, _cfg, curve = _plot_with_samples(qtbot, tmp_path, example_dbc_path)
+
+    ctx.bus_reader.bus_health_changed.emit("CAN_1", "ok", "")
+    assert len(curve.values) == 3
+    ctx.bus_reader.bus_health_changed.emit("CAN_1", "errors", "no ACK")
+    assert len(curve.values) == 4
+    assert math.isnan(curve.values[3])
+
+
+def test_x_axis_advances_while_bus_silent(  # type: ignore[no-untyped-def]
+    qapp, qtbot, tmp_path: Path, example_dbc_path: Path
+) -> None:
+    ctx, win, _cfg, _curve = _plot_with_samples(qtbot, tmp_path, example_dbc_path)
+    gl = win._plot
+    before = gl._x_max
+
+    win._sample_wall -= 5
+    win._refresh_legend_live()
+    assert gl._x_max - before == pytest.approx(5.0, abs=0.5)
+
+    # With no bus open nothing is captured, so the axis stays put.
+    ctx.bus_reader.close()
+    stopped_at = gl._x_max
+    win._sample_wall -= 5
+    win._refresh_legend_live()
+    assert gl._x_max == stopped_at
+
+
+def test_new_session_clears_plot(  # type: ignore[no-untyped-def]
+    qapp, qtbot, tmp_path: Path, example_dbc_path: Path
+) -> None:
+    ctx, _win, cfg, curve = _plot_with_samples(qtbot, tmp_path, example_dbc_path)
+
+    ctx.bus_reader.close()
+    assert [v for v in curve.values if not math.isnan(v)] == [800.0, 850.0, 900.0]
+    with qtbot.waitSignal(ctx.bus_reader.bus_started, timeout=2000):
+        ctx.bus_reader.open(cfg)
+        assert len(curve.values) == 0

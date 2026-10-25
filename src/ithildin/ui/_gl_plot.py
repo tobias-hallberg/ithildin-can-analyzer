@@ -276,8 +276,14 @@ class GLPlotWidget(QOpenGLWidget):
         self.update()
 
     def append_point(self, path: str, x: float, y: float) -> None:
+        """Extend the curve to ``(x, y)``. A non-finite ``y`` breaks the line:
+        the next point starts a new chain."""
         curve = self._curves.get(path)
         if curve is None:
+            return
+        if not math.isfinite(y):
+            curve.has_last = False
+            self.update()
             return
         if curve.has_last:
             if curve.segment_count >= curve.segment_capacity:

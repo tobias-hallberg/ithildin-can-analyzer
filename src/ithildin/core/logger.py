@@ -14,6 +14,11 @@ small closure that consults the live subscription state; when it returns
 False the frame's ring cursor is still advanced (otherwise the next poll
 would re-read it forever) but the frame isn't written, and a parallel
 ``dropped_count`` signal lets the UI surface what was skipped.
+
+The rings follow the open buses through ``set_rings``: a ring that leaves
+or is replaced (a reconnect) is drained to its end first, so one file
+spans bus loss and Disconnect / Connect. Frames a ring overwrote before
+they were written count as ``lost_count``.
 """
 
 from __future__ import annotations
@@ -46,6 +51,7 @@ class TeeWorker(QObject):
     error = Signal(str)
     frame_count = Signal(int)
     dropped_count = Signal(int)
+    lost_count = Signal(int)
 
     def __init__(
         self,
@@ -57,15 +63,25 @@ class TeeWorker(QObject):
         super().__init__(parent)
         self._path = path
         self._rings = dict(rings)
-        self._cursors: dict[str, int] = {name: -1 for name in self._rings}
+        self._cursors: dict[str, int] = {}
         self._stop = False
-        # Single-reference attribute; the GUI thread swaps it via
-        # ``set_admit`` while the worker thread reads it once per frame.
-        # Both ops are atomic under the GIL — no lock required.
+        # Single-reference attributes; the GUI thread swaps them via
+        # ``set_admit`` / ``set_rings`` (always a new dict) while the worker
+        # thread reads each once per pass. Both ops are atomic under the
+        # GIL — no lock required. ``_applied`` is the rings dict the worker
+        # last took over.
         self._admit: Callable[[FrameRecord], bool] | None = admit
+        self._wanted = self._applied = self._rings
+        # Worker thread only.
+        self._count = 0
+        self._dropped = 0
+        self._lost = 0
 
     def set_admit(self, admit: Callable[[FrameRecord], bool] | None) -> None:
         self._admit = admit
+
+    def set_rings(self, rings: Mapping[str, RingBuffer]) -> None:
+        self._wanted = dict(rings)
 
     @Slot()
     def start_logging(self) -> None:
@@ -77,60 +93,25 @@ class TeeWorker(QObject):
             self.stopped.emit()
             return
 
+        # The backlog still in the rings is recorded; what they overwrote
+        # before Start isn't lost to this recording.
+        self._cursors = {
+            name: max(-1, ring.total_seq - ring.capacity - 1) for name, ring in self._rings.items()
+        }
         self.started.emit()
-        count = 0
-        dropped = 0
         try:
             while not self._stop:
+                self._rebind(writer)
                 wrote_any = False
                 for name, ring in self._rings.items():
-                    frames, _dropped_ring = ring.read_since(self._cursors[name])
-                    admit = self._admit
-                    for f in frames:
-                        self._cursors[name] = f.seq
-                        if admit is not None and not admit(f):
-                            dropped += 1
-                            if dropped % 100 == 0:
-                                self.dropped_count.emit(dropped)
-                            continue
-                        msg = can.Message(
-                            timestamp=f.timestamp,
-                            arbitration_id=f.arbitration_id,
-                            data=f.data,
-                            is_extended_id=f.is_extended_id,
-                            is_fd=f.is_fd,
-                            is_error_frame=f.is_error_frame,
-                            is_remote_frame=f.is_remote_frame,
-                            channel=name,
-                        )
-                        writer.on_message_received(msg)
-                        count += 1
+                    if self._drain(name, ring, writer):
                         wrote_any = True
-                        if count % 100 == 0:
-                            self.frame_count.emit(count)
                 if not wrote_any:
                     time.sleep(_IDLE_SLEEP_S)
             # Flush remaining frames once more before closing.
+            self._rebind(writer)
             for name, ring in self._rings.items():
-                frames, _ = ring.read_since(self._cursors[name])
-                admit = self._admit
-                for f in frames:
-                    self._cursors[name] = f.seq
-                    if admit is not None and not admit(f):
-                        dropped += 1
-                        continue
-                    msg = can.Message(
-                        timestamp=f.timestamp,
-                        arbitration_id=f.arbitration_id,
-                        data=f.data,
-                        is_extended_id=f.is_extended_id,
-                        is_fd=f.is_fd,
-                        is_error_frame=f.is_error_frame,
-                        is_remote_frame=f.is_remote_frame,
-                        channel=name,
-                    )
-                    writer.on_message_received(msg)
-                    count += 1
+                self._drain(name, ring, writer)
         except Exception as exc:
             _log.warning("Logger error writing %s", self._path, exc_info=True)
             self.error.emit(f"Logger error: {exc}")
@@ -140,13 +121,61 @@ class TeeWorker(QObject):
             except BaseException:
                 _log.error("Failed to finalize log file %s", self._path, exc_info=True)
             finally:
-                self.frame_count.emit(count)
-                self.dropped_count.emit(dropped)
+                self.frame_count.emit(self._count)
+                self.dropped_count.emit(self._dropped)
+                self.lost_count.emit(self._lost)
                 self.stopped.emit()
 
     @Slot()
     def request_stop(self) -> None:
         self._stop = True
+
+    def _rebind(self, writer: can.Listener) -> None:
+        """Take over the rings from ``set_rings``. A ring that left or was
+        replaced is final once its bus stopped, so it is drained first."""
+        wanted = self._wanted
+        if wanted is self._applied:
+            return
+        for name, ring in self._rings.items():
+            if wanted.get(name) is not ring:
+                self._drain(name, ring, writer)
+        self._cursors = {
+            name: self._cursors[name] if self._rings.get(name) is ring else -1
+            for name, ring in wanted.items()
+        }
+        self._rings = self._applied = wanted
+
+    def _drain(self, name: str, ring: RingBuffer, writer: can.Listener) -> bool:
+        """Write ``ring``'s pending frames; returns whether any was written."""
+        frames, lost = ring.read_since(self._cursors[name])
+        if lost:
+            self._lost += lost
+            self.lost_count.emit(self._lost)
+        admit = self._admit
+        wrote = False
+        for f in frames:
+            self._cursors[name] = f.seq
+            if admit is not None and not admit(f):
+                self._dropped += 1
+                if self._dropped % 100 == 0:
+                    self.dropped_count.emit(self._dropped)
+                continue
+            msg = can.Message(
+                timestamp=f.timestamp,
+                arbitration_id=f.arbitration_id,
+                data=f.data,
+                is_extended_id=f.is_extended_id,
+                is_fd=f.is_fd,
+                is_error_frame=f.is_error_frame,
+                is_remote_frame=f.is_remote_frame,
+                channel=name,
+            )
+            writer.on_message_received(msg)
+            self._count += 1
+            wrote = True
+            if self._count % 100 == 0:
+                self.frame_count.emit(self._count)
+        return wrote
 
 
 class TeeLogger(QObject):
@@ -159,6 +188,7 @@ class TeeLogger(QObject):
     stopped = Signal()
     frame_count = Signal(int)
     dropped_count = Signal(int)
+    lost_count = Signal(int)
 
     def __init__(
         self,
@@ -177,10 +207,15 @@ class TeeLogger(QObject):
         self._worker.started.connect(self.started)
         self._worker.frame_count.connect(self.frame_count)
         self._worker.dropped_count.connect(self.dropped_count)
+        self._worker.lost_count.connect(self.lost_count)
         self._thread.finished.connect(self._on_thread_finished)
 
     def set_admit(self, admit: Callable[[FrameRecord], bool] | None) -> None:
         self._worker.set_admit(admit)
+
+    def set_rings(self, rings: Mapping[str, RingBuffer]) -> None:
+        """Record from these rings from now on: the open buses' current ones."""
+        self._worker.set_rings(rings)
 
     def start(self) -> None:
         self._thread.start()

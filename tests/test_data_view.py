@@ -4,12 +4,17 @@
 
 from __future__ import annotations
 
+import uuid
 from pathlib import Path
 
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import QHeaderView, QProgressBar
 
 from ithildin.core.types import FrameRecord
 from ithildin.ui.data_view import DataViewWindow
+from ithildin.ui.theme import ThemeManager
+from ithildin.workspace.schema import BusConfig
 from tests.conftest import make_app_context
 
 
@@ -160,3 +165,78 @@ def test_value_cell_shows_enum_name(  # type: ignore[no-untyped-def]
     gauge = win._table.cellWidget(0, 3)
     assert isinstance(gauge, QProgressBar)
     assert not gauge.isVisibleTo(win._table)
+
+
+# ---- Staleness ----
+
+
+def _speed_frame(ts: float = 0.0) -> FrameRecord:
+    payload = (6400).to_bytes(2, "little") + (700).to_bytes(2, "little") + bytes(4)
+    return FrameRecord(bus_name="CAN_1", timestamp=ts, arbitration_id=0x100, data=payload)
+
+
+def _data_view_on_silent_bus(qtbot, tmp_path: Path, dbc: Path):  # type: ignore[no-untyped-def]
+    ctx = make_app_context(tmp_path)
+    ctx.database.add_dbc(dbc, ["CAN_1"])
+    cfg = BusConfig(
+        name="CAN_1", interface="virtual", channel=f"dv-{uuid.uuid4().hex[:8]}", bitrate=500000
+    )
+    with qtbot.waitSignal(ctx.bus_reader.bus_started, timeout=2000):
+        ctx.bus_reader.open(cfg)
+    win = DataViewWindow(instance_id="d1")
+    qtbot.addWidget(win)
+    win.bind(ctx)
+    win.add_signal("EngineCommand.EngineSpeed")
+    win._on_frames_received([_speed_frame()])
+    return ctx, win, win._rows["EngineCommand.EngineSpeed"]
+
+
+def _is_dim(win: DataViewWindow) -> bool:
+    item = win._table.item(0, 1)
+    assert item is not None
+    if item.data(Qt.ItemDataRole.ForegroundRole) is None:
+        return False
+    dim = QColor(ThemeManager.instance().current_tokens()["fg_3"])
+    assert item.foreground().color() == dim
+    return True
+
+
+def test_value_dims_when_quiet(qapp, qtbot, tmp_path: Path, example_dbc_path: Path) -> None:  # type: ignore[no-untyped-def]
+    _ctx, win, row = _data_view_on_silent_bus(qtbot, tmp_path, example_dbc_path)
+    assert not _is_dim(win)
+
+    row.updated -= 10
+    win._refresh_staleness()
+    assert _is_dim(win)
+    assert win._table.item(0, 1).toolTip() == "Last update 10 s ago"
+
+
+def test_value_dims_when_bus_closes(qapp, qtbot, tmp_path: Path, example_dbc_path: Path) -> None:  # type: ignore[no-untyped-def]
+    ctx, win, _row = _data_view_on_silent_bus(qtbot, tmp_path, example_dbc_path)
+
+    ctx.bus_reader.close()
+    win._refresh_staleness()
+    assert _is_dim(win)
+    assert win._table.item(0, 1).text() == "800"
+
+
+def test_fresh_value_undims(qapp, qtbot, tmp_path: Path, example_dbc_path: Path) -> None:  # type: ignore[no-untyped-def]
+    _ctx, win, row = _data_view_on_silent_bus(qtbot, tmp_path, example_dbc_path)
+    row.updated -= 10
+    win._refresh_staleness()
+    assert _is_dim(win)
+
+    win._on_frames_received([_speed_frame(ts=1.0)])
+    assert not _is_dim(win)
+
+
+def test_rebuilt_table_reapplies_the_dim(  # type: ignore[no-untyped-def]
+    qapp, qtbot, tmp_path: Path, example_dbc_path: Path
+) -> None:
+    _ctx, win, row = _data_view_on_silent_bus(qtbot, tmp_path, example_dbc_path)
+    row.updated -= 10
+    win._refresh_staleness()
+
+    win.add_signal("BodyStatus.VehicleSpeed")
+    win._refresh_staleness()
+    assert _is_dim(win)

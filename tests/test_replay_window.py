@@ -11,7 +11,7 @@ import can
 
 from ithildin.ui.replay_window import ReplayWindow
 from ithildin.workspace.schema import BusConfig
-from tests.conftest import make_app_context
+from tests.conftest import kill_capture, make_app_context
 
 
 def _write_log(path: Path, n: int = 3) -> None:
@@ -122,3 +122,98 @@ def test_quit_stops_replay(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore
     qapp.aboutToQuit.emit()
 
     assert controller._thread.isFinished()
+
+
+# ---- Target bus loss and failures ----
+
+
+def _replaying_slow_log(qtbot, tmp_path: Path):  # type: ignore[no-untyped-def]
+    """A replay at 1x of frames 1 s apart onto open bus CAN_1, its first frame sent."""
+    ctx = make_app_context(tmp_path)
+    cfg = BusConfig(
+        name="CAN_1", interface="virtual", channel=f"rp-{uuid.uuid4().hex[:8]}", bitrate=500000
+    )
+    with qtbot.waitSignal(ctx.bus_reader.bus_started, timeout=2000):
+        ctx.bus_reader.open(cfg)
+    win = ReplayWindow(instance_id="rp1")
+    qtbot.addWidget(win)
+    win.bind(ctx)
+    log = tmp_path / "in.asc"
+    writer = can.Logger(str(log))
+    try:
+        for i in range(10):
+            writer.on_message_received(
+                can.Message(timestamp=1000.0 + i, arbitration_id=0x300, channel="A")
+            )
+    finally:
+        writer.stop()
+    win._path_edit.setText(str(log))
+    win._speed_combo.setCurrentIndex(_speed_index_for(win, 1.0))
+    ring = ctx.bus_reader.ring
+    assert ring is not None
+    win._on_action_clicked()
+    qtbot.waitUntil(lambda: ring.total_seq >= 1, timeout=2000)
+    reports: list[tuple[str, str]] = []
+    ctx.events.report_requested.connect(lambda msg, kind: reports.append((msg, kind)))
+    return ctx, win, reports
+
+
+def test_replay_stops_when_target_bus_fails(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    ctx, win, reports = _replaying_slow_log(qtbot, tmp_path)
+
+    kill_capture(ctx.bus_reader, "CAN_1")
+    qtbot.waitUntil(lambda: win._controller is None, timeout=5000)
+    status = win._status_lbl.text()
+    assert status.startswith("Stopped · 1 frames sent — bus CAN_1 lost:")
+    assert [kind for _msg, kind in reports] == ["warn"]
+
+
+def test_replay_stops_when_target_bus_degrades(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    ctx, win, reports = _replaying_slow_log(qtbot, tmp_path)
+
+    ctx.bus_reader.bus_health_changed.emit("CAN_1", "errors", "no ACK")
+    qtbot.waitUntil(lambda: win._controller is None, timeout=5000)
+    assert win._status_lbl.text() == "Stopped · 1 frames sent — bus CAN_1: bus errors (no ACK)"
+    assert reports == [("Replay stopped after 1 frames: bus CAN_1: bus errors (no ACK)", "warn")]
+    ctx.bus_reader.close()
+
+
+def test_disconnecting_the_target_stops_without_a_report(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    ctx, win, reports = _replaying_slow_log(qtbot, tmp_path)
+
+    ctx.bus_reader.close()
+    qtbot.waitUntil(lambda: win._controller is None, timeout=5000)
+    assert win._status_lbl.text() == "Stopped · 1 frames sent — bus CAN_1 disconnected"
+    assert reports == []
+
+
+def test_error_not_overwritten_by_done(qapp, qtbot, tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    ctx = make_app_context(tmp_path)
+    cfg = BusConfig(
+        name="CAN_1", interface="virtual", channel=f"rp-{uuid.uuid4().hex[:8]}", bitrate=500000
+    )
+    with qtbot.waitSignal(ctx.bus_reader.bus_started, timeout=2000):
+        ctx.bus_reader.open(cfg)
+    win = ReplayWindow(instance_id="rp1")
+    qtbot.addWidget(win)
+    win.bind(ctx)
+    reports: list[tuple[str, str]] = []
+    ctx.events.report_requested.connect(lambda msg, kind: reports.append((msg, kind)))
+
+    def send_fails(_msg: can.Message, _bus: str | None = None) -> None:
+        raise can.CanOperationError("adapter jammed")
+
+    monkeypatch.setattr(ctx.bus_reader, "send_message", send_fails)
+    log = tmp_path / "in.asc"
+    _write_log(log, n=3)
+    win._path_edit.setText(str(log))
+    win._speed_combo.setCurrentIndex(_speed_index_for(win, 100.0))
+    win._on_action_clicked()
+    qtbot.waitUntil(lambda: win._controller is None, timeout=5000)
+
+    status = win._status_lbl.text()
+    assert status.startswith("Failed after 0 frames:")
+    assert "adapter jammed" in status
+    assert "Done" not in status
+    assert [kind for _msg, kind in reports] == ["error"]
+    ctx.bus_reader.close()

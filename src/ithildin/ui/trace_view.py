@@ -21,11 +21,17 @@ Per-bus decoders: messages on bus A use the DBC bound to A; same ID on
 bus B uses B's decoder. ``decoders`` is mutable via ``set_decoders`` so
 the window can swap in a new map when the project's DBC bindings
 change without rebuilding the model.
+
+Rows outlive their bus: ``set_rings`` only swaps where new frames come
+from, and a closed bus's rows stay, drawn dim, until ``clear`` drops
+everything for a new capture session. In ``overwrite`` mode a row also
+dims while its ID has gone quiet.
 """
 
 from __future__ import annotations
 
 import bisect
+import time
 from collections import deque
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
@@ -65,6 +71,12 @@ class _AdmitNone:
 
 
 _admit_none: AdmitPredicate = _AdmitNone()
+
+_STALE_MIN_S = 2.0
+_STALE_PERIODS = 3
+"""A Latest row goes stale after ``max(_STALE_MIN_S, _STALE_PERIODS * period)``
+without a new frame."""
+_STALE_SWEEP_MS = 1000
 
 
 class TraceTreeModel(QAbstractItemModel):
@@ -124,25 +136,35 @@ class TraceTreeModel(QAbstractItemModel):
         # call. Evict alongside the owning frame to keep id reuse safe.
         self._signal_keys: dict[int, tuple[str, ...]] = {}
         self._name_cache: dict[tuple[str, int], str] = {}
+        # Overwrite mode: when each key last drained, and the keys gone quiet.
+        self._arrival: dict[tuple[str, int], float] = {}
+        self._stale_keys: set[tuple[str, int]] = set()
         self._rx_count = 0
         self._err_count = 0
-        # Direction-column tints; refreshed on theme change.
+        # Direction-column tints, and the dim of a row whose bus is closed
+        # or whose Latest ID went quiet; refreshed on theme change.
         self._rx_color = QColor()
         self._tx_color = QColor()
+        self._dim_color = QColor()
         # Held weakly: a lambda on the app-lifetime ThemeManager would keep
         # every replaced model, and its rows and rings, alive.
-        themed_callback(self._refresh_direction_colors)
+        themed_callback(self._refresh_colors)
         self._timer = QTimer(self)
         self._timer.setInterval(max(1, 1000 // update_hz))
         self._timer.timeout.connect(self._drain)
+        self._stale_timer = QTimer(self)
+        self._stale_timer.setInterval(_STALE_SWEEP_MS)
+        self._stale_timer.timeout.connect(self._sweep_stale)
 
     # ---- Lifecycle ----
 
     def start(self) -> None:
         self._timer.start()
+        self._stale_timer.start()
 
     def stop(self) -> None:
         self._timer.stop()
+        self._stale_timer.stop()
 
     def drain_now(self) -> None:
         self._drain()
@@ -171,6 +193,21 @@ class TraceTreeModel(QAbstractItemModel):
             return
         self.beginResetModel()
         self._mode = mode
+        self._reset_rows()
+        self.endResetModel()
+        self.headerDataChanged.emit(Qt.Orientation.Horizontal, self.COL_TIME, self.COL_TIME)
+
+    def clear(self) -> None:
+        """Drop every row and zero the counters, for a new capture session.
+
+        Cursors stay where they are, so no ring is replayed.
+        """
+        self.beginResetModel()
+        self._reset_rows()
+        self.endResetModel()
+        self.reset_counters()
+
+    def _reset_rows(self) -> None:
         self._rows.clear()
         self._row_of_frame.clear()
         self._row_offset = 0
@@ -179,8 +216,8 @@ class TraceTreeModel(QAbstractItemModel):
         self._last_ts.clear()
         self._delta_for_key.clear()
         self._signal_keys.clear()
-        self.endResetModel()
-        self.headerDataChanged.emit(Qt.Orientation.Horizontal, self.COL_TIME, self.COL_TIME)
+        self._arrival.clear()
+        self._stale_keys.clear()
 
     def set_admit(self, admit: AdmitPredicate) -> None:
         """Swap the admission predicate.
@@ -220,6 +257,8 @@ class TraceTreeModel(QAbstractItemModel):
                     self._signal_keys.pop(id(old), None)
                 self._last_ts.pop((bus, aid), None)
                 self._delta_for_key.pop((bus, aid), None)
+                self._arrival.pop((bus, aid), None)
+                self._stale_keys.discard((bus, aid))
             self._sorted_keys = [k for k in self._sorted_keys if admit(k[1], k[0])]
             self.endResetModel()
 
@@ -230,10 +269,17 @@ class TraceTreeModel(QAbstractItemModel):
         self._name_cache.clear()
 
     def set_rings(self, rings: Mapping[str, RingBuffer]) -> None:
-        """Replace the per-bus ring map (e.g., when buses are added/removed)."""
+        """Replace the per-bus ring map when buses open or close.
+
+        Rows of a bus that left stay, drawn dim. A cursor is kept only for
+        the same ring object: a reopened bus has a new ring whose seq
+        restarts at 0.
+        """
+        self._cursors = {
+            name: self._cursors.get(name, -1) if self._rings.get(name) is ring else -1
+            for name, ring in rings.items()
+        }
         self._rings = dict(rings)
-        # Keep existing cursors where the bus is still around; default the rest.
-        self._cursors = {name: self._cursors.get(name, -1) for name in self._rings}
 
     def reset_counters(self) -> None:
         self._rx_count = 0
@@ -331,11 +377,14 @@ class TraceTreeModel(QAbstractItemModel):
         # invalidate expanded child rows so a pinned/expanded row tracks
         # the latest payload without needing the view to refetch via
         # rowCount.
+        now = time.monotonic()
         for f in new_frames:
             key = (f.bus_name, f.arbitration_id)
             prev_ts = self._last_ts.get(key)
             self._delta_for_key[key] = None if prev_ts is None else f.timestamp - prev_ts
             self._last_ts[key] = f.timestamp
+            self._arrival[key] = now
+            self._stale_keys.discard(key)
             sort_key = (f.arbitration_id, f.bus_name)
             pos = bisect.bisect_left(self._sorted_keys, sort_key)
             if pos < len(self._sorted_keys) and self._sorted_keys[pos] == sort_key:
@@ -360,6 +409,26 @@ class TraceTreeModel(QAbstractItemModel):
             self._sorted_keys.insert(pos, sort_key)
             self._rows_by_key[key] = f
             self.endInsertRows()
+
+    def _sweep_stale(self) -> None:
+        """Dim the Latest rows whose ID went quiet; repaints only on a change."""
+        if not self._sorted_keys:
+            return
+        now = time.monotonic()
+        stale = {
+            key
+            for key, arrived in self._arrival.items()
+            if now - arrived
+            > max(_STALE_MIN_S, _STALE_PERIODS * (self._delta_for_key.get(key) or 0.0))
+        }
+        if stale == self._stale_keys:
+            return
+        self._stale_keys = stale
+        self.dataChanged.emit(
+            self.index(0, 0),
+            self.index(len(self._sorted_keys) - 1, self.COL_NAME),
+            [Qt.ItemDataRole.ForegroundRole],
+        )
 
     # ---- QAbstractItemModel ----
 
@@ -490,11 +559,19 @@ class TraceTreeModel(QAbstractItemModel):
         col = index.column()
         parent = index.parent()
         if role == Qt.ItemDataRole.ForegroundRole:
-            # Only the direction cell on top-level frame rows is tinted.
-            if parent.isValid() or col != self.COL_DIR:
+            # Top-level frame rows only: dim when their bus is closed or their
+            # Latest ID went quiet; otherwise only the direction cell is tinted.
+            if parent.isValid():
                 return None
             frame = self._frame_at_visible_row(index.row())
             if frame is None:
+                return None
+            if (
+                frame.bus_name not in self._rings
+                or (frame.bus_name, frame.arbitration_id) in self._stale_keys
+            ):
+                return self._dim_color
+            if col != self.COL_DIR:
                 return None
             return self._rx_color if frame.is_rx else self._tx_color
         if role != Qt.ItemDataRole.DisplayRole:
@@ -525,10 +602,11 @@ class TraceTreeModel(QAbstractItemModel):
 
     # ---- Helpers ----
 
-    def _refresh_direction_colors(self) -> None:
+    def _refresh_colors(self) -> None:
         tokens = ThemeManager.instance().current_tokens()
         self._rx_color = QColor(tokens["rx"])
         self._tx_color = QColor(tokens["tx"])
+        self._dim_color = QColor(tokens["fg_3"])
 
     def _ensure_decoded(self, f: FrameRecord) -> dict[str, Any] | None:
         if f.decoded is not None:

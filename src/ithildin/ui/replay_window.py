@@ -6,6 +6,10 @@ Single-instance. Picks an input log file, picks a speed multiplier, and
 plays the log onto whatever bus the application currently owns by
 routing through ``BusReader.send_message``. Pause and scrub support are
 deferred to Stage 1.E (the underlying engine doesn't seek today).
+
+A replay stops when its target bus stops, fails or degrades; the reason
+replaces "Done" in the status, and a bus fault or a failed send also goes
+to the Report dock.
 """
 
 from __future__ import annotations
@@ -26,6 +30,7 @@ from PySide6.QtWidgets import (
 )
 
 from ithildin.core.replay import ReplayController
+from ithildin.core.types import BusHealth
 from ithildin.ui._child_base import ChildView
 from ithildin.ui.icons import icon, themed_callback
 from ithildin.ui.view_header import ViewHeaderBar
@@ -58,10 +63,19 @@ class ReplayWindow(ChildView):
         super().__init__(instance_id=instance_id, params=params)
         self._ctx: AppContext | None = None
         self._controller: ReplayController | None = None
+        # Per replay: the bus it plays onto, why it was stopped short (and
+        # whether that goes to the Report dock), and the worker's error.
+        self._target: str | None = None
+        self._stop_reason: str | None = None
+        self._report_stop = False
+        self._error: str | None = None
         self._build_body()
 
     def bind(self, ctx: AppContext) -> None:
         self._ctx = ctx
+        ctx.bus_reader.bus_failed.connect(self._on_bus_failed)
+        ctx.bus_reader.bus_stopped.connect(self._on_bus_stopped)
+        ctx.bus_reader.bus_health_changed.connect(self._on_bus_health_changed)
         # Child views get no closeEvent when the main window closes; stop
         # here so the replay thread is joined before exit.
         app = QCoreApplication.instance()
@@ -183,6 +197,10 @@ class ReplayWindow(ChildView):
         except Exception as exc:  # backend / file errors surface here
             self._status_lbl.setText(f"Error: {exc}")
             return
+        self._target = target
+        self._stop_reason = None
+        self._report_stop = False
+        self._error = None
         self._controller.started.connect(self._on_started)
         self._controller.progress.connect(self._on_progress)
         self._controller.error.connect(self._on_error)
@@ -202,11 +220,51 @@ class ReplayWindow(ChildView):
     def _on_progress(self, sent: int) -> None:
         self._status_lbl.setText(f"Playing · {sent} frames sent")
 
-    def _on_finished(self, sent: int) -> None:
+    def _on_finished(self, sent: int, outcome: str) -> None:
         self._controller = None
-        self._status_lbl.setText(f"Done · {sent} frames sent")
+        # A stop reason wins over "failed": a send racing the bus's close
+        # fails with "not open".
+        if self._stop_reason is not None:
+            self._status_lbl.setText(f"Stopped · {sent} frames sent — {self._stop_reason}")
+            if self._report_stop and self._ctx is not None:
+                self._ctx.events.report_requested.emit(
+                    f"Replay stopped after {sent} frames: {self._stop_reason}", "warn"
+                )
+        elif outcome == "failed":
+            self._status_lbl.setText(f"Failed after {sent} frames: {self._error}")
+            if self._ctx is not None:
+                self._ctx.events.report_requested.emit(
+                    f"Replay failed after {sent} frames: {self._error}", "error"
+                )
+        elif outcome == "stopped":
+            self._status_lbl.setText(f"Stopped · {sent} frames sent")
+        else:
+            self._status_lbl.setText(f"Done · {sent} frames sent")
         self._action_btn.setText("Play")
         self._refresh_action_icon()
+
+    def _on_bus_failed(self, bus_name: str, message: str) -> None:
+        # bus_stopped follows and stops the replay.
+        if self._controller is not None and bus_name == self._target:
+            self._stop_reason = f"bus {bus_name} lost: {message}"
+            self._report_stop = True
+
+    def _on_bus_stopped(self, bus_name: str) -> None:
+        if self._controller is None or bus_name != self._target:
+            return
+        if self._stop_reason is None:
+            self._stop_reason = f"bus {bus_name} disconnected"
+        self._stop()
+
+    def _on_bus_health_changed(self, bus_name: str, state: str, detail: str) -> None:
+        health = BusHealth(state)
+        if self._controller is None or bus_name != self._target or health is BusHealth.OK:
+            return
+        if self._stop_reason is not None:
+            return
+        self._stop_reason = f"bus {bus_name}: {health.describe(detail)}"
+        self._report_stop = True
+        self._stop()
 
     def _refresh_action_icon(self) -> None:
         # Play when idle, Stop while a replay is running (re-tinted on theme
@@ -215,7 +273,7 @@ class ReplayWindow(ChildView):
         self._action_btn.setIcon(icon("stop" if playing else "play"))
 
     def _on_error(self, message: str) -> None:
-        self._status_lbl.setText(f"Error: {message}")
+        self._error = message
 
     def closeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         if self._controller is not None:

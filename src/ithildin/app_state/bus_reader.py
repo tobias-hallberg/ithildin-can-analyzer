@@ -70,9 +70,10 @@ class BusReader(QObject):
     # The worker's view of an open bus changed; see health().
     bus_health_changed = Signal(str, str, str)  # bus_name, BusHealth value, detail
     error = Signal(str)
-    # Carries the new t0 (a float) when a session starts, or ``None``
-    # when the last bus closes. ``Signal(object)`` is how PySide6
-    # carries an optional value.
+    # ``None`` from open() when a new capture session starts: views drop
+    # the previous session's data then, and only then. The new t0 (a
+    # float) follows with the session's first batch. ``Signal(object)``
+    # is how PySide6 carries an optional value.
     session_t0_changed = Signal(object)
 
     def __init__(self, parent: QObject | None = None) -> None:
@@ -94,11 +95,12 @@ class BusReader(QObject):
         # adapter for. Kept until their thread exits; open() refuses their
         # name and channel meanwhile.
         self._retiring: dict[str, tuple[BusController, BusConfig]] = {}
-        # Anchor for "elapsed" time across the UI. Set on the first
-        # frame received while no buses had been open; reset to None
-        # once the last bus closes. Views read this lazily to convert
-        # python-can epoch seconds into relative seconds.
+        # Anchor for "elapsed" time across the UI, set on the session's
+        # first frame. A session ends only when close() leaves no bus open;
+        # a failure keeps it, so a Reconnect continues the same time base.
+        # Views read t0 lazily to convert epoch seconds into relative ones.
         self._session_t0: float | None = None
+        self._session_ended = True
         self._timer = QTimer(self)
         self._timer.setInterval(max(1, 1000 // _FANOUT_HZ))
         self._timer.timeout.connect(self._fan_out)
@@ -196,10 +198,10 @@ class BusReader(QObject):
     def session_t0(self) -> float | None:
         """Epoch second of the first frame in the current capture session.
 
-        ``None`` until the first batch of frames is fanned out after
-        opening a bus from a fully-closed state. Subtract from any
-        ``FrameRecord.timestamp`` to get elapsed seconds since bus
-        start.
+        ``None`` from the open() that starts a session until its first
+        batch is fanned out. Kept after the session ends, so the data
+        views still hold stays readable. Subtract from any
+        ``FrameRecord.timestamp`` to get elapsed seconds since bus start.
         """
         return self._session_t0
 
@@ -214,7 +216,8 @@ class BusReader(QObject):
         name, ``open`` is a no-op (it does not reconfigure on the fly).
         Caller must ``close(name)`` first if they want to reopen with a
         different ``BusConfig``. Refused, with ``error``, while a bus of
-        that name or on that channel is still closing.
+        that name or on that channel is still closing. Starts a new capture
+        session (``session_t0_changed(None)``) when the last one ended.
         """
         name = config.name
         if name in self._controllers:
@@ -237,6 +240,10 @@ class BusReader(QObject):
                 )
             self.error.emit(f"{reason} yet. Try again once it has, or unplug the adapter.")
             return
+        if self._session_ended:
+            self._session_ended = False
+            self._session_t0 = None
+            self.session_t0_changed.emit(None)
         ring = RingBuffer(_RING_CAPACITY)
         controller = BusController(config, ring, parent=self)
         # The slots tell controllers apart by sender(), not by bus name: a
@@ -282,7 +289,9 @@ class BusReader(QObject):
         ``bus_stopped`` fires for each before this returns. A bus that
         misses the deadline still counts as closed, but stays closing
         (``is_closing``) until its thread exits, then ``bus_released``.
-        Closing by name also clears a held LOST health.
+        Closing by name also clears a held LOST health. Leaving no bus open
+        ends the capture session, and the next open() starts a new one;
+        closing by name a bus that isn't open leaves the session alone.
         """
         targets = [(n, c) for n, c in self._controllers.items() if name in (None, n)]
         for _n, c in targets:
@@ -295,6 +304,8 @@ class BusReader(QObject):
         for n, _c in targets:
             self._health.pop(n, None)
             self._drop(n)
+        if (targets or name is None) and not self._controllers:
+            self._session_ended = True
         for n, c in stuck:
             self._retiring[n] = (c, self._last_configs[n])
             _log.warning("Bus %r did not stop within %.1f s", n, wait_ms / 1000)
@@ -308,6 +319,18 @@ class BusReader(QObject):
     def close_all(self, *, wait_ms: int = 2000) -> None:
         """Convenience alias for ``close(name=None)``."""
         self.close(None, wait_ms=wait_ms)
+
+    def reopen(self, config: BusConfig) -> None:
+        """Close the bus named in ``config`` and open it again, in the same session.
+
+        For a Reconnect after a failure or bus-off: views keep their data
+        and t0, where a plain close + open of the last bus would start a
+        new session. Callers pass the workspace's config for the bus.
+        """
+        ended = self._session_ended
+        self.close(config.name)
+        self._session_ended = ended
+        self.open(config)
 
     def shutdown(self, *, wait_ms: int = 2000) -> list[str]:
         """Close every bus for quit; return the names whose thread still runs.
@@ -339,9 +362,6 @@ class BusReader(QObject):
         last_error = self._last_errors.pop(name, None)
         if not self._controllers:
             self._timer.stop()
-            if self._session_t0 is not None:
-                self._session_t0 = None
-                self.session_t0_changed.emit(None)
         return last_error
 
     def _sender_if_current(self) -> BusController | None:

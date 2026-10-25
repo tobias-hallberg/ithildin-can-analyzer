@@ -24,10 +24,17 @@ Decode discipline (handoff §"Cross-window data"): on every
 ``frames_received`` batch, filter to the message IDs we care about
 *first*, then decode only those frames. Decoding all frames every
 tick is the obvious way to melt the GUI thread; we do not do that.
+
+Samples outlive their bus: a bus that stops or degrades breaks its
+curves' lines (a NaN marker) instead of clearing them, and only a new
+capture session clears the plot. The X axis keeps moving while a bus is
+open but silent.
 """
 
 from __future__ import annotations
 
+import math
+import time
 from collections import deque
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
@@ -81,6 +88,7 @@ from PySide6.QtWidgets import (
     QWidgetAction,
 )
 
+from ithildin.core.types import BusHealth
 from ithildin.ui._child_base import ChildView
 from ithildin.ui._drag_payload import MessagePayload, SignalPayload, pack_into_mime
 from ithildin.ui._gl_plot import GLPlotWidget
@@ -104,6 +112,10 @@ _MIN_LEFT_PANE_WIDTH = 200
 _POINTS_PER_SECOND = 1000
 """Worst-case sample density assumed when sizing per-curve ring
 buffers — 1 ms granularity is a generous upper bound for CAN signals."""
+
+_STALL_S = 0.5
+"""Without a new sample for this long while a bus is open, the X axis
+moves on with wall-clock time."""
 
 _MIN_POINTS_PER_CURVE = 1024
 _MAX_POINTS_PER_CURVE_CAP = 200_000
@@ -284,6 +296,8 @@ class _SignalCurve:
         # refreshes re-cycle only the automatic colours.
         self.user_color: bool = False
         self.last_value: float | None = None
+        # Bus of the newest sample; ``None`` once its line was broken.
+        self.last_bus: str | None = None
 
     def color(self) -> QColor:
         return QColor(self._color)
@@ -1322,10 +1336,26 @@ class _SubPlot(QObject):
             except (TypeError, ValueError):
                 continue
             curve.last_value = fvalue
+            curve.last_bus = frame.bus_name
             curve.times.append(frame.timestamp - t0)
             curve.values.append(fvalue)
             self._plot.append_point(curve.path, frame.timestamp - t0, fvalue)
             self._maybe_expand_curve_y(curve, fvalue)
+
+    def break_bus(self, bus_name: str) -> None:
+        """Break the line of every curve last fed by ``bus_name``.
+
+        The NaN marker stays in the deques, so the gap survives a move to
+        another sub-plot; it never touches ``last_value``.
+        """
+        for curve in self._curves.values():
+            if curve.last_bus != bus_name or not curve.times:
+                continue
+            curve.last_bus = None
+            t = curve.times[-1]
+            curve.times.append(t)
+            curve.values.append(math.nan)
+            self._plot.append_point(curve.path, t, math.nan)
 
     def latest_time(self) -> float | None:
         return max(
@@ -1401,6 +1431,7 @@ class _SubPlot(QObject):
             curve.times.clear()
             curve.values.clear()
             curve.last_value = None
+            curve.last_bus = None
             self._plot.clear_curve(curve.path)
             # Reset numeric range so the next sample re-seeds it.
             # Categorical curves keep their pinned [0, N-1] range.
@@ -1587,6 +1618,12 @@ class SignalPlotWindow(ChildView):
         self._committed_h_sizes: list[int] = [_DEFAULT_LEFT_PANE_WIDTH, 700]
         self._committed_v_sizes: list[int] = []
         self._paused = False
+        # The X axis follows the newest sample, and wall-clock time while
+        # none arrives: the newest sample time, when it was first seen, and
+        # the right edge shown, which never moves back.
+        self._sample_hi: float | None = None
+        self._sample_wall = 0.0
+        self._shown_hi: float | None = None
         # 10 Hz legend-refresh heartbeat. The plot widget paints at
         # its own (GPU-driven) cadence; the legend just needs to look
         # "live", not frame-accurate.
@@ -1603,6 +1640,8 @@ class SignalPlotWindow(ChildView):
         self._ctx = ctx
         ctx.bus_reader.frames_received.connect(self._on_frames_received)
         ctx.bus_reader.session_t0_changed.connect(self._on_t0_changed)
+        ctx.bus_reader.bus_stopped.connect(self._on_bus_stopped)
+        ctx.bus_reader.bus_health_changed.connect(self._on_bus_health_changed)
         ctx.database.database_changed.connect(self._invalidate_wanted_aids)
         ctx.database.database_changed.connect(self._refresh_enum_metadata)
         for sp in self._subplots:
@@ -1851,10 +1890,31 @@ class SignalPlotWindow(ChildView):
         latest_times = [t for t in (sp.latest_time() for sp in self._subplots) if t is not None]
         if not latest_times:
             return
-        hi = max(latest_times)
-        lo = hi - self._window_seconds
+        latest = max(latest_times)
+        if self._sample_hi is None or latest > self._sample_hi:
+            self._sample_hi = latest
+            self._sample_wall = time.monotonic()
+        self._show_x(latest)
+
+    def _advance_x_idle(self) -> None:
+        if (
+            self._ctx is None
+            or self._paused
+            or not self._ctx.bus_reader.is_open
+            or self._sample_hi is None
+        ):
+            return
+        stalled = time.monotonic() - self._sample_wall
+        if stalled > _STALL_S:
+            self._show_x(self._sample_hi + stalled)
+
+    def _show_x(self, hi: float) -> None:
+        # Never back: the adapter's clock and wall-clock time differ, so the
+        # first sample after a stall may land left of the idle edge.
+        self._shown_hi = hi if self._shown_hi is None else max(self._shown_hi, hi)
+        lo = self._shown_hi - self._window_seconds
         for sp in self._subplots:
-            sp.set_x_range(lo, hi)
+            sp.set_x_range(lo, self._shown_hi)
 
     # ---- Window-seconds plumbing ----
 
@@ -1868,12 +1928,11 @@ class SignalPlotWindow(ChildView):
         self._sync_window_button_text()
         # Snap the visible range immediately. If no samples yet, fall
         # back to [0, window] so the empty plot still spans the window.
-        latest_times = [t for t in (sp.latest_time() for sp in self._subplots) if t is not None]
-        if latest_times:
-            hi = max(latest_times)
-            lo = hi - seconds
-        else:
+        if self._shown_hi is None:
             lo, hi = 0.0, seconds
+        else:
+            hi = self._shown_hi
+            lo = hi - seconds
         for sp in self._subplots:
             sp.set_x_range(lo, hi)
 
@@ -1909,8 +1968,19 @@ class SignalPlotWindow(ChildView):
         self._apply_window_seconds(parsed, mark_user=True)
 
     def _on_t0_changed(self, _t0: object) -> None:
+        self._sample_hi = None
+        self._shown_hi = None
         for sp in self._subplots:
             sp.clear_session()
+
+    def _on_bus_stopped(self, bus_name: str) -> None:
+        for sp in self._subplots:
+            sp.break_bus(bus_name)
+
+    def _on_bus_health_changed(self, bus_name: str, state: str, _detail: str) -> None:
+        if BusHealth(state) is not BusHealth.OK:
+            for sp in self._subplots:
+                sp.break_bus(bus_name)
 
     def _invalidate_wanted_aids(self) -> None:
         for sp in self._subplots:
@@ -1923,6 +1993,7 @@ class SignalPlotWindow(ChildView):
     def _refresh_legend_live(self) -> None:
         for sp in self._subplots:
             sp.refresh_legend_live()
+        self._advance_x_idle()
 
     # ---- Left column toggle ----
 

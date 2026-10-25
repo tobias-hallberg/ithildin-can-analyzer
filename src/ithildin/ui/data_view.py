@@ -13,14 +13,19 @@ without a gauge.
 Drop target accepts ``application/x-ithildin-signal``. Decode runs per
 ``frames_received`` batch, filter-then-decode so the GUI thread stays
 responsive.
+
+A value dims while it is stale: its bus is closed, or no update came for
+``max(_STALE_MIN_S, _STALE_PERIODS × its period)``.
 """
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
@@ -35,6 +40,8 @@ from ithildin.ui._child_base import ChildView
 from ithildin.ui._drag_payload import MessagePayload, SignalPayload
 from ithildin.ui._signal_drop import SignalDropArea
 from ithildin.ui.fonts import tabular_font
+from ithildin.ui.icons import themed_callback
+from ithildin.ui.theme import ThemeManager
 from ithildin.ui.view_header import ViewHeaderBar
 
 if TYPE_CHECKING:
@@ -47,6 +54,10 @@ _COL_VALUE = 1
 _COL_UNIT = 2
 _COL_GAUGE = 3
 
+_STALE_MIN_S = 2.0
+_STALE_PERIODS = 3
+_STALE_CHECK_MS = 1000
+
 
 @dataclass
 class _Row:
@@ -57,6 +68,14 @@ class _Row:
     dbc_min: float | None = None
     dbc_max: float | None = None
     last: float | str | None = None
+    # Staleness bookkeeping, set on each value update: the frame's bus and
+    # timestamp, the interval since the previous one, and the monotonic
+    # time of the update.
+    bus: str | None = None
+    ts: float | None = None
+    period: float | None = None
+    updated: float | None = None
+    stale: bool = False
 
 
 class DataViewWindow(ChildView):
@@ -72,7 +91,9 @@ class DataViewWindow(ChildView):
         super().__init__(instance_id=instance_id, params=params)
         self._ctx: AppContext | None = None
         self._rows: dict[str, _Row] = {}
+        self._dim_color = QColor()
         self._build_body()
+        themed_callback(self._restyle_stale)
 
     def _format_title(self, params: dict[str, object]) -> str:
         name = params.get("name")
@@ -82,6 +103,10 @@ class DataViewWindow(ChildView):
         self._ctx = ctx
         ctx.bus_reader.frames_received.connect(self._on_frames_received)
         ctx.database.database_changed.connect(self._rebuild_table)
+        self._stale_timer = QTimer(self)
+        self._stale_timer.setInterval(_STALE_CHECK_MS)
+        self._stale_timer.timeout.connect(self._refresh_staleness)
+        self._stale_timer.start()
 
     # ---- Public API ----
 
@@ -245,11 +270,13 @@ class DataViewWindow(ChildView):
         if self._ctx is None or not self._rows:
             return
         wanted_messages = {row.message for row in self._rows.values()}
+        now = time.monotonic()
         for frame in batch:
-            self._ingest_frame(frame, wanted_messages)
+            self._ingest_frame(frame, wanted_messages, now)
         self._render()
+        self._refresh_staleness()
 
-    def _ingest_frame(self, frame: FrameRecord, wanted_messages: set[str]) -> None:
+    def _ingest_frame(self, frame: FrameRecord, wanted_messages: set[str], now: float) -> None:
         if self._ctx is None:
             return
         decoder = self._ctx.database.decoder_for_bus(frame.bus_name)
@@ -270,6 +297,11 @@ class DataViewWindow(ChildView):
             value = decoded.get(row.signal)
             if value is None:
                 continue
+            if row.ts is not None:
+                row.period = frame.timestamp - row.ts
+            row.ts = frame.timestamp
+            row.bus = frame.bus_name
+            row.updated = now
             if isinstance(value, bool):
                 row.last = str(value)
             elif isinstance(value, (int, float)):
@@ -281,6 +313,35 @@ class DataViewWindow(ChildView):
         for r, row in enumerate(self._rows.values()):
             self._set_value_cells(r, row)
         self._grow_columns()
+
+    def _refresh_staleness(self) -> None:
+        if self._ctx is None:
+            return
+        open_buses = set(self._ctx.bus_reader.bus_names())
+        now = time.monotonic()
+        for r, row in enumerate(self._rows.values()):
+            item = self._table.item(r, _COL_VALUE)
+            if row.updated is None or item is None:
+                continue
+            age = now - row.updated
+            stale = row.bus not in open_buses or age > max(
+                _STALE_MIN_S, _STALE_PERIODS * (row.period or 0.0)
+            )
+            item.setToolTip(f"Last update {age:.0f} s ago")
+            if stale == row.stale:
+                continue
+            row.stale = stale
+            if stale:
+                item.setForeground(self._dim_color)
+            else:
+                item.setData(Qt.ItemDataRole.ForegroundRole, None)
+
+    def _restyle_stale(self) -> None:
+        self._dim_color = QColor(ThemeManager.instance().current_tokens()["fg_3"])
+        for r, row in enumerate(self._rows.values()):
+            item = self._table.item(r, _COL_VALUE)
+            if row.stale and item is not None:
+                item.setForeground(self._dim_color)
 
     def _set_value_cells(self, r: int, row: _Row) -> None:
         if row.last is not None:
@@ -297,6 +358,8 @@ class DataViewWindow(ChildView):
     def _rebuild_table(self) -> None:
         self._table.setRowCount(len(self._rows))
         for r, row in enumerate(self._rows.values()):
+            # The fresh Value item isn't dimmed; the next refresh re-applies it.
+            row.stale = False
             display, tooltip = self._display_for(row)
             signal_item = QTableWidgetItem(display)
             if tooltip:

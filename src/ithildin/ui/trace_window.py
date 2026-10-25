@@ -11,6 +11,10 @@ pause + counters as before, now driven by ``TraceTreeModel``.
 Legacy ``message_trace`` and ``bus_trace`` state shapes round-trip
 through this window's ``restore_state`` so old ``.itp`` projects keep
 opening without a schema bump.
+
+The model is built once in ``bind``. Buses opening and closing only swap
+its rings, so rows survive a Disconnect, a failure and a Reconnect; a new
+capture session (``session_t0_changed(None)``) clears them.
 """
 
 from __future__ import annotations
@@ -41,7 +45,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ithildin.core.types import HEALTH_RANK, BusHealth
+from ithildin.core.types import HEALTH_RANK, BusHealth, FrameRecord
 from ithildin.ui._child_base import ChildView
 from ithildin.ui._tracked_tree import TrackedTreePane
 from ithildin.ui.banner import Banner
@@ -53,6 +57,7 @@ from ithildin.ui.view_header import ViewHeaderBar
 
 if TYPE_CHECKING:
     from ithildin.app_state.context import AppContext
+    from ithildin.core.decoder import Decoder
 
 _FILTER_DEBOUNCE_MS = 100
 _DEFAULT_LEFT_PANE_WIDTH = 220
@@ -130,10 +135,11 @@ class TraceWindow(ChildView):
         # Frame Inspector pin: the (bus, arbitration_id) pair set by the
         # user's last row click. While pinned, the inspector follows the
         # latest known frame for that key as new arrivals drain in.
-        # ``_last_pushed_seq`` short-circuits redundant re-renders on
-        # drains that didn't bring a new frame for the pinned key.
+        # ``_last_pushed`` short-circuits redundant re-renders on drains
+        # that didn't bring a new frame for the pinned key. Compared by
+        # identity, not seq: a reopened bus's new ring restarts seq at 0.
         self._pinned_key: tuple[str, int] | None = None
-        self._last_pushed_seq: int = -1
+        self._last_pushed: FrameRecord | None = None
 
         self._build_body()
 
@@ -161,8 +167,22 @@ class TraceWindow(ChildView):
         ctx.bus_reader.bus_failed.connect(self._on_bus_failed)
         ctx.bus_reader.bus_health_changed.connect(self._on_bus_health_changed)
         ctx.bus_reader.error.connect(self._on_bus_error)
+        ctx.bus_reader.session_t0_changed.connect(self._on_session_t0_changed)
         ctx.database.database_changed.connect(self._on_database_changed)
-        self._rebuild_model()
+        self._model = TraceTreeModel(
+            ctx.bus_reader.rings,
+            decoders=self._bound_decoders(),
+            admit=self._tracked_pane.effective().admits,
+            bus_reader=ctx.bus_reader,
+            parent=self,
+        )
+        self._model.counters_changed.connect(self._on_counters_changed)
+        self._model.counters_changed.connect(self._refresh_pinned_inspector)
+        if self._latest_btn.isChecked():
+            self._model.set_mode("overwrite")
+        self._proxy.setSourceModel(self._model)
+        if not self._paused_btn.isChecked():
+            self._model.start()
         sel = self._tree.selectionModel()
         if sel is not None:
             sel.currentRowChanged.connect(self._on_row_changed)
@@ -376,54 +396,34 @@ class TraceWindow(ChildView):
 
     # ---- Model lifecycle ----
 
-    def _rebuild_model(self) -> None:
+    def _bound_decoders(self) -> dict[str, Decoder | None]:
+        """Decoder per bus with a DBC bound, open or not: a closed bus's rows
+        keep their names and stay expandable."""
         if self._ctx is None:
-            return
-        # A rebuild means bus topology changed (or first build) — the
-        # previous pinned (bus, id) may reference a ring that no longer
-        # exists. Drop the pin so the inspector doesn't keep pushing
-        # stale data tied to a vanished bus.
-        self._pinned_key = None
-        self._last_pushed_seq = -1
-        if self._model is not None:
-            self._model.stop()
-            try:
-                self._model.counters_changed.disconnect(self._on_counters_changed)
-            except (TypeError, RuntimeError):
-                pass
-        rings = self._ctx.bus_reader.rings
-        decoders = {name: self._ctx.database.decoder_for_bus(name) for name in rings}
-        admit = (
-            self._tracked_pane.effective().admits
-            if self._tracked_pane is not None
-            else (lambda _b, _a: False)
-        )
-        self._model = TraceTreeModel(
-            rings,
-            decoders=decoders,
-            admit=admit,
-            bus_reader=self._ctx.bus_reader,
-            parent=self,
-        )
-        self._model.counters_changed.connect(self._on_counters_changed)
-        self._model.counters_changed.connect(self._refresh_pinned_inspector)
-        if self._latest_btn.isChecked():
-            self._model.set_mode("overwrite")
-        self._proxy.setSourceModel(self._model)
-        if not self._paused_btn.isChecked():
-            self._model.start()
-        self._counts_label.setText("RX 0   ERR 0")
+            return {}
+        db = self._ctx.database
+        return {b: db.decoder_for_bus(b) for p in db.loaded_paths() for b in db.buses_for_path(p)}
 
     def _on_bus_topology_changed(self, _bus_name: str) -> None:
-        self._rebuild_model()
-
-    def _on_database_changed(self) -> None:
         if self._model is None or self._ctx is None:
             return
-        decoders = {
-            name: self._ctx.database.decoder_for_bus(name) for name in self._ctx.bus_reader.rings
-        }
-        self._model.set_decoders(decoders)
+        # A stopped bus's ring is final by now; take its tail before letting go.
+        if not self._paused_btn.isChecked():
+            self._model.drain_now()
+        self._model.set_rings(self._ctx.bus_reader.rings)
+        self._tree.viewport().update()
+
+    def _on_session_t0_changed(self, t0: object) -> None:
+        if t0 is not None or self._model is None:
+            return
+        self._model.clear()
+        self._pinned_key = None
+        self._last_pushed = None
+
+    def _on_database_changed(self) -> None:
+        if self._model is None:
+            return
+        self._model.set_decoders(self._bound_decoders())
         # Effective set may shift if a tracked DBC's message-IDs changed.
         self._on_effective_changed()
 
@@ -514,14 +514,18 @@ class TraceWindow(ChildView):
         bus_name = self._failed_bus_name or self._health_bus
         if bus_name is None:
             return
-        if bus_name == self._health_bus:
-            # Bus-off: the bus is still open, and reopening resets the
-            # controller.
-            self._ctx.bus_reader.close(bus_name)
-        cfg = self._ctx.bus_reader.last_config_for(bus_name)
+        reader = self._ctx.bus_reader
+        if self._failed_bus_name is not None and bus_name in reader.bus_names():
+            # Already opening, from an earlier click or the toolbar's Connect.
+            return
+        cfg = next(
+            (c for c in self._ctx.project.workspace.bus if c.name == bus_name),
+            reader.last_config_for(bus_name),
+        )
         if cfg is None:
             return
-        self._ctx.bus_reader.open(cfg)
+        # Reopening also resets a bus-off controller, and keeps the session.
+        reader.reopen(cfg)
 
     def _on_effective_changed(self) -> None:
         if self._model is None or self._tracked_pane is None:
@@ -544,7 +548,7 @@ class TraceWindow(ChildView):
         # after the switch, so drop it. The user has to click again
         # under the new mode to engage the new behaviour.
         self._pinned_key = None
-        self._last_pushed_seq = -1
+        self._last_pushed = None
 
     def _on_pause_selected(self, paused: bool) -> None:
         if self._model is None:
@@ -649,11 +653,11 @@ class TraceWindow(ChildView):
         #   drain-driven refresh leaves the inspector alone.
         if self._model.mode() == "overwrite":
             self._pinned_key = (frame.bus_name, frame.arbitration_id)
-            self._last_pushed_seq = -1
+            self._last_pushed = None
             self._refresh_pinned_inspector()
         else:
             self._pinned_key = None
-            self._last_pushed_seq = -1
+            self._last_pushed = None
             if self._detail_view is not None:
                 period = self._model.period_for(frame.bus_name, frame.arbitration_id)
                 self._detail_view.set_frame(frame, observed_period_s=period)
@@ -669,7 +673,7 @@ class TraceWindow(ChildView):
 
         Connected to ``TraceTreeModel.counters_changed`` so it runs
         once per drain that admitted at least one frame. Cheap — a
-        single dict lookup plus a seq comparison; only actually
+        single dict lookup plus an identity check; only actually
         re-renders the inspector when a new frame for the pinned key
         has arrived.
         """
@@ -677,9 +681,9 @@ class TraceWindow(ChildView):
             return
         bus, aid = self._pinned_key
         latest = self._model.latest_frame_for(bus, aid)
-        if latest is None or latest.seq <= self._last_pushed_seq:
+        if latest is None or latest is self._last_pushed:
             return
-        self._last_pushed_seq = latest.seq
+        self._last_pushed = latest
         period = self._model.period_for(bus, aid)
         self._detail_view.set_frame(latest, observed_period_s=period)
 
@@ -836,5 +840,7 @@ class TraceWindow(ChildView):
         mode = state.get("mode")
         if mode == "overwrite":
             self._latest_btn.setChecked(True)
+            self._on_mode_selected("overwrite")
         elif mode == "append":
             self._stream_btn.setChecked(True)
+            self._on_mode_selected("append")
