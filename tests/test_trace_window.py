@@ -628,3 +628,125 @@ def test_filter_clear_button_hidden_until_text(qapp, qtbot, tmp_path: Path) -> N
     qapp.processEvents()
     assert win._filter_input.text() == ""
     assert button.isVisible() is False
+
+
+# ---- Health banner ----
+
+
+def _trace_on_open_bus(qtbot, tmp_path: Path):  # type: ignore[no-untyped-def]
+    ctx = make_app_context(tmp_path)
+    win = TraceWindow(instance_id="t1")
+    qtbot.addWidget(win)
+    win.bind(ctx)
+    cfg = BusConfig(
+        name="CAN_1", interface="virtual", channel=f"tr-{uuid.uuid4().hex[:8]}", bitrate=500000
+    )
+    with qtbot.waitSignal(ctx.bus_reader.bus_started, timeout=2000):
+        ctx.bus_reader.open(cfg)
+    return ctx, win
+
+
+def test_health_banner_shows_bus_errors_and_hides_on_recovery(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    ctx, win = _trace_on_open_bus(qtbot, tmp_path)
+
+    ctx.bus_reader.bus_health_changed.emit("CAN_1", "errors", "no ACK")
+    assert not win._banner.isHidden()
+    assert win._banner.kind == "warn"
+    assert win._banner._label.text().startswith("Bus CAN_1: bus errors (no ACK).")
+    assert win._banner._action_btn.isHidden()
+
+    ctx.bus_reader.bus_health_changed.emit("CAN_1", "ok", "")
+    assert win._banner.isHidden()
+
+
+def test_health_banner_never_replaces_a_failure_banner(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    ctx = make_app_context(tmp_path)
+    win = TraceWindow(instance_id="t1")
+    qtbot.addWidget(win)
+    win.bind(ctx)
+
+    ctx.bus_reader.bus_failed.emit("CAN_2", "adapter disconnected")
+    ctx.bus_reader.bus_health_changed.emit("CAN_1", "bus_off", "")
+    ctx.bus_reader.bus_health_changed.emit("CAN_1", "ok", "")
+    assert not win._banner.isHidden()
+    assert win._banner._label.text() == "Bus CAN_2 disconnected: adapter disconnected"
+
+
+def test_health_detail_alone_keeps_a_dismissed_banner_closed(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    ctx, win = _trace_on_open_bus(qtbot, tmp_path)
+    emit = ctx.bus_reader.bus_health_changed.emit
+
+    emit("CAN_1", "errors", "error warning")
+    emit("CAN_1", "errors", "error passive")
+    assert win._banner._label.text().startswith("Bus CAN_1: bus errors (error passive).")
+    win._banner._close_btn.click()
+
+    emit("CAN_1", "errors", "error warning")
+    assert win._banner.isHidden()
+    emit("CAN_1", "bus_off", "")
+    assert not win._banner.isHidden()
+
+
+def test_health_banner_keeps_the_worst_bus(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    ctx = make_app_context(tmp_path)
+    win = TraceWindow(instance_id="t1")
+    qtbot.addWidget(win)
+    win.bind(ctx)
+    emit = ctx.bus_reader.bus_health_changed.emit
+
+    emit("CAN_1", "errors", "no ACK")
+    emit("CAN_2", "bus_off", "")
+    emit("CAN_3", "errors", "no ACK")
+    assert win._banner._label.text().startswith("Bus CAN_2: bus-off.")
+    emit("CAN_3", "ok", "")
+    assert win._banner._label.text().startswith("Bus CAN_2: bus-off.")
+
+    # The bus shown recovers: the worst one left takes over.
+    emit("CAN_2", "ok", "")
+    assert win._banner._label.text().startswith("Bus CAN_1: bus errors (no ACK).")
+    ctx.bus_reader.bus_stopped.emit("CAN_1")
+    assert win._banner.isHidden()
+
+
+def test_banner_taken_by_another_message_frees_the_health_banner(  # type: ignore[no-untyped-def]
+    qapp, qtbot, tmp_path: Path
+) -> None:
+    ctx = make_app_context(tmp_path)
+    win = TraceWindow(instance_id="t1")
+    qtbot.addWidget(win)
+    win.bind(ctx)
+
+    ctx.bus_reader.bus_failed.emit("CAN_2", "adapter disconnected")
+    win._on_superseded("Superseded by the whole bus")
+    ctx.bus_reader.bus_health_changed.emit("CAN_1", "bus_off", "")
+    assert win._banner._label.text().startswith("Bus CAN_1: bus-off.")
+
+
+def test_reconnect_left_pending_is_dropped_when_the_bus_starts_or_fails(  # type: ignore[no-untyped-def]
+    qapp, qtbot, tmp_path: Path
+) -> None:
+    ctx = make_app_context(tmp_path)
+    win = TraceWindow(instance_id="t1")
+    qtbot.addWidget(win)
+    win.bind(ctx)
+
+    win._reopen_bus = "CAN_1"
+    ctx.bus_reader.bus_started.emit("CAN_1")
+    assert win._reopen_bus is None
+    win._reopen_bus = "CAN_1"
+    ctx.bus_reader.bus_failed.emit("CAN_1", "adapter disconnected")
+    assert win._reopen_bus is None
+
+
+def test_bus_off_banner_reconnects_the_bus(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    ctx, win = _trace_on_open_bus(qtbot, tmp_path)
+
+    ctx.bus_reader.bus_health_changed.emit("CAN_1", "bus_off", "")
+    assert win._banner.kind == "error"
+    assert win._banner._action_btn.text() == "Reconnect"
+    assert not win._banner._action_btn.isHidden()
+
+    with qtbot.waitSignal(ctx.bus_reader.bus_started, timeout=2000):
+        win._banner._action_btn.click()
+    assert ctx.bus_reader.bus_names() == ["CAN_1"]
+    assert win._banner.isHidden()

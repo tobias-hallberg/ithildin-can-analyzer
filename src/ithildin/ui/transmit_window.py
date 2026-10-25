@@ -13,8 +13,8 @@ Two-tier control:
 The window owns a :class:`TxScheduler` (``core.transmit``) and shares
 its :class:`TxSetup` with it. Closing the window calls
 :meth:`TxScheduler.shutdown` — equivalent to master OFF plus stopping
-every cyclic task. When the scheduler disarms (a bus closed or lost, a
-periodic task failed) the window shows why in an amber banner and in the
+every cyclic task. When the scheduler disarms (a bus closed, lost or
+newly in error, a periodic task failed) the window shows why in an amber banner and in the
 Report dock; the user re-arms by hand.
 
 Visuals follow ``design_handoff_tx_window/TX window.html``: large pill
@@ -52,6 +52,7 @@ from ithildin.core.transmit import (
     inactive_signals,
     resolve_kind,
 )
+from ithildin.core.types import BusHealth
 from ithildin.ui._child_base import ChildView
 from ithildin.ui._drag_payload import MessagePayload, SignalPayload
 from ithildin.ui._signal_drop import SignalDropArea
@@ -125,6 +126,7 @@ class TransmitWindow(ChildView):
         # lambda would keep calling into it after it is deleted.
         bus_reader.bus_started.connect(self._on_bus_topology_changed)
         bus_reader.bus_stopped.connect(self._on_bus_topology_changed)
+        bus_reader.bus_health_changed.connect(self._on_bus_health_changed)
         self._refresh_listen_only_gate()
         self._refresh_status_bar()
 
@@ -807,6 +809,9 @@ class TransmitWindow(ChildView):
         self._refresh_status_bar()
         self._rebuild_list_glyphs()
 
+    def _on_bus_health_changed(self, _name: str, _state: str, _detail: str) -> None:
+        self._refresh_status_bar()
+
     # ---- Refresh helpers ----
 
     def _sync_master_button(self) -> None:
@@ -906,14 +911,17 @@ class TransmitWindow(ChildView):
         if not bus_name or self._ctx is None:
             return ""
         reader = self._ctx.bus_reader
-        closed = "" if bus_name in reader.bus_names() else " (closed)"
+        suffix = "" if bus_name in reader.bus_names() else " (closed)"
+        health = reader.health(bus_name)
+        if health is not None and health[0] is not BusHealth.OK:
+            suffix += f" · {health[0].describe(health[1])}"
         cfg = reader.last_config_for(bus_name)
         if cfg is None:
             # Never opened this session: the project's declaration.
             cfg = next((c for c in self._ctx.project.workspace.bus if c.name == bus_name), None)
         if cfg is None:
-            return f"{bus_name}{closed}"
-        return f"{cfg.name} · {cfg.bitrate // 1000} kbps{closed}"
+            return f"{bus_name}{suffix}"
+        return f"{cfg.name} · {cfg.bitrate // 1000} kbps{suffix}"
 
     def _toast(self, message: str) -> None:
         """Brief status-bar toast — restored to the live status after _ERROR_TOAST_MS."""

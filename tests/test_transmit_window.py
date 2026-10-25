@@ -474,6 +474,7 @@ def test_closed_window_ignores_bus_signals(qapp, qtbot, tmp_path: Path) -> None:
     ctx.bus_reader.bus_failed.emit("CAN_1", "gone")
     ctx.bus_reader.cyclic_failed.emit("CAN_1", 0x100, "boom")
     ctx.bus_reader.send_failed.emit("CAN_1", 0x100, "boom")
+    ctx.bus_reader.bus_health_changed.emit("CAN_1", "errors", "no ACK")
 
 
 def test_bus_loss_turns_master_off_and_shows_banner(  # type: ignore[no-untyped-def]
@@ -482,8 +483,10 @@ def test_bus_loss_turns_master_off_and_shows_banner(  # type: ignore[no-untyped-
     fake = use_fake_bus(monkeypatch)
     ctx = make_app_context(tmp_path)
     ctx.database.add_dbc(example_dbc_path, ["CAN_1"])
+    # Kvaser: a receive error without a hardware code is fatal there.
+    cfg = BusConfig(name="CAN_1", interface="kvaser", channel="X", bitrate=500000)
     with qtbot.waitSignal(ctx.bus_reader.bus_started, timeout=2000):
-        ctx.bus_reader.open(BusConfig(name="CAN_1", interface="pcan", channel="X", bitrate=500000))
+        ctx.bus_reader.open(cfg)
     win = _armed_window(ctx, qtbot)
     reports: list[tuple[str, str]] = []
     ctx.events.report_requested.connect(lambda msg, kind: reports.append((msg, kind)))
@@ -597,3 +600,36 @@ def test_theme_change_after_editor_rebuild_is_safe(  # type: ignore[no-untyped-d
     gc.collect()
     assert old_control() is None
     ThemeManager.instance().theme_changed.emit(ThemeManager.instance().current_tokens())
+
+
+def test_bus_errors_disarm_and_show_in_status_bar(  # type: ignore[no-untyped-def]
+    qapp, qtbot, monkeypatch, tmp_path: Path, example_dbc_path: Path
+) -> None:
+    from can.interfaces.pcan import basic
+
+    from ithildin.core import bus as bus_module
+
+    monkeypatch.setattr(bus_module, "_HEALTH_TICK_S", 0.1)
+    fake = use_fake_bus(monkeypatch)
+    ctx = make_app_context(tmp_path)
+    ctx.database.add_dbc(example_dbc_path, ["CAN_1"])
+    with qtbot.waitSignal(ctx.bus_reader.bus_started, timeout=2000):
+        ctx.bus_reader.open(BusConfig(name="CAN_1", interface="pcan", channel="X", bitrate=500000))
+    win = _armed_window(ctx, qtbot)
+    win._select(0)
+
+    with qtbot.waitSignal(win._scheduler.disarmed, timeout=2000) as blocker:  # type: ignore[union-attr]
+        fake.status_code = basic.PCAN_ERROR_BUSPASSIVE
+    assert blocker.args == ["Bus CAN_1: bus errors (error passive)"]
+    assert win._master_btn.is_on is False
+    assert win._status_label.text().endswith("CAN_1 · 500 kbps · bus errors (error passive)")
+
+    # Re-arming on a bus that is still degraded is the user's call, and holds.
+    win._on_master_toggled(True)
+    with qtbot.assertNotEmitted(win._scheduler.disarmed, wait=300):  # type: ignore[union-attr]
+        pass
+    assert win._setup.master_enabled is True
+
+    with qtbot.waitSignal(ctx.bus_reader.bus_health_changed, timeout=2000):
+        fake.status_code = 0
+    assert win._status_label.text().endswith("CAN_1 · 500 kbps")

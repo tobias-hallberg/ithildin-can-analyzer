@@ -27,7 +27,7 @@ from PySide6.QtCore import QObject, QTimer, Signal
 
 from ithildin.core.bus import BusController, BusWorker
 from ithildin.core.ringbuf import RingBuffer
-from ithildin.core.types import FrameRecord
+from ithildin.core.types import BusHealth, FrameRecord
 from ithildin.workspace.schema import BusConfig
 
 _log = logging.getLogger(__name__)
@@ -48,7 +48,9 @@ class BusReader(QObject):
     """Multi-bus capture singleton with a 60 Hz fan-out timer."""
 
     frames_received = Signal(list)
-    bus_started = Signal(str)  # bus name
+    # open() registered the bus; bus_started follows once the adapter is up.
+    bus_opening = Signal(str)  # bus name
+    bus_started = Signal(str)
     bus_stopped = Signal(str)
     # Fires only when the worker died on its own (hardware unplug,
     # backend error). Carries the last error message. Explicit close()
@@ -58,6 +60,8 @@ class BusReader(QObject):
     cyclic_failed = Signal(str, int, str)  # bus_name, arbitration_id, error
     # A send_message_async one-shot failed. Emitted from the send thread.
     send_failed = Signal(str, int, str)  # bus_name, arbitration_id, error
+    # The worker's view of an open bus changed; see health().
+    bus_health_changed = Signal(str, str, str)  # bus_name, BusHealth value, detail
     error = Signal(str)
     # Carries the new t0 (a float) when a session starts, or ``None``
     # when the last bus closes. ``Signal(object)`` is how PySide6
@@ -75,6 +79,10 @@ class BusReader(QObject):
         # Most recent error per bus, captured between open() and the
         # worker's stopped signal. Drives the bus_failed dispatch.
         self._last_errors: dict[str, str] = {}
+        # Health per bus: set to OK on bus_started, absent while opening.
+        # LOST outlives the failure that follows it, so the UI can say why
+        # the bus went away; open() and close(name) clear it.
+        self._health: dict[str, tuple[BusHealth, str]] = {}
         # Anchor for "elapsed" time across the UI. Set on the first
         # frame received while no buses had been open; reset to None
         # once the last bus closes. Views read this lazily to convert
@@ -155,6 +163,16 @@ class BusReader(QObject):
         cfg = self._last_configs.get(name)
         return bool(cfg and cfg.listen_only)
 
+    def health(self, name: str) -> tuple[BusHealth, str] | None:
+        """``(state, detail)`` of the named bus; ``None`` while it is opening or closed.
+
+        A bus lost with its adapter keeps ``LOST`` after closing, until it is
+        opened again or closed by name. Any state but ``OK`` counts as
+        degraded.
+        Callable from any thread.
+        """
+        return self._health.get(name)
+
     @property
     def session_t0(self) -> float | None:
         """Epoch second of the first frame in the current capture session.
@@ -184,19 +202,24 @@ class BusReader(QObject):
         controller = BusController(config, ring, parent=self)
         name = config.name
         controller.error.connect(lambda msg, n=name: self._on_controller_error(n, msg))
-        controller.started.connect(lambda n=name: self.bus_started.emit(n))
+        controller.started.connect(lambda n=name: self._on_controller_started(n))
         controller.stopped.connect(lambda n=name: self._on_controller_stopped(n))
         controller.cyclic_failed.connect(
             lambda mid, err, n=name: self.cyclic_failed.emit(n, mid, err)
+        )
+        controller.health.connect(
+            lambda state, detail, n=name: self._on_controller_health(n, state, detail)
         )
         self._controllers[name] = controller
         self._rings[name] = ring
         self._cursors[name] = -1
         self._last_configs[name] = config
         self._last_errors.pop(name, None)
+        self._health.pop(name, None)
         controller.start()
         if not self._timer.isActive():
             self._timer.start()
+        self.bus_opening.emit(name)
 
     def open_all(self, configs: list[BusConfig]) -> None:
         """Open every config sequentially. Failures emit ``error`` and continue.
@@ -231,6 +254,7 @@ class BusReader(QObject):
         # Drop any pending error so the soon-to-arrive worker stopped
         # signal can't fire bus_failed for a bus the user is closing.
         self._last_errors.pop(name, None)
+        self._health.pop(name, None)
         controller = self._controllers.pop(name, None)
         self._rings.pop(name, None)
         self._cursors.pop(name, None)
@@ -239,6 +263,17 @@ class BusReader(QObject):
         if not self._controllers and self._session_t0 is not None:
             self._session_t0 = None
             self.session_t0_changed.emit(None)
+
+    def _on_controller_started(self, name: str) -> None:
+        if name in self._controllers:
+            self._health[name] = (BusHealth.OK, "")
+        self.bus_started.emit(name)
+
+    def _on_controller_health(self, name: str, state: str, detail: str) -> None:
+        if name not in self._controllers:
+            return
+        self._health[name] = (BusHealth(state), detail)
+        self.bus_health_changed.emit(name, state, detail)
 
     def _on_controller_error(self, name: str, msg: str) -> None:
         self._last_errors[name] = msg
@@ -256,6 +291,9 @@ class BusReader(QObject):
             self._controllers.pop(name, None)
             self._rings.pop(name, None)
             self._cursors.pop(name, None)
+            health = self._health.get(name)
+            if health is not None and health[0] is not BusHealth.LOST:
+                del self._health[name]
             if not self._controllers:
                 self._timer.stop()
                 if self._session_t0 is not None:

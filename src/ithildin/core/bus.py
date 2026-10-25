@@ -12,6 +12,13 @@ MCP). Every touch of the python-can bus other than ``recv()`` takes the
 worker's send lock, so senders, task creation, the TX flush and shutdown
 never overlap.
 
+The worker also judges the bus's health. A receive error the backend can
+recover from (error passive, bus-off) is classified instead of ending the
+capture, a 0.5 s tick probes the adapter and measures the error-frame rate,
+and ``health(state, detail)`` fires when the result changes. Error frames
+are sampled into the ring, at most ``1 / _ERR_SAMPLE_S`` per second, each
+carrying how many it stands for.
+
 A ``BusController`` wraps the QThread + worker pair to give the rest of the
 app one thing to start/stop.
 """
@@ -20,6 +27,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from functools import partial
 from typing import Any, cast
 
@@ -28,7 +36,7 @@ from can.broadcastmanager import ThreadBasedCyclicSendTask
 from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot
 
 from ithildin.core.ringbuf import RingBuffer
-from ithildin.core.types import FrameRecord
+from ithildin.core.types import HEALTH_RANK, BusHealth, FrameRecord
 from ithildin.workspace.schema import BusConfig
 
 _log = logging.getLogger(__name__)
@@ -36,6 +44,45 @@ _log = logging.getLogger(__name__)
 _RECV_TIMEOUT_S = 0.1
 """Worst-case shutdown latency. Bus polls recv() at this cadence and checks
 the stop flag between iterations."""
+
+_HEALTH_TICK_S = 0.5
+_ERR_SAMPLE_S = 0.1
+_ERR_FLOOD_PER_S = 50
+_CLEAN_TICKS = 2
+"""Consecutive clean ticks before a degraded bus reads healthy again."""
+_STICKY_CLEAR_S = 1.0
+"""A data frame this long after the last error frame clears a SocketCAN
+controller state."""
+
+# SocketCAN error frames: class bits in the ID, controller state in data[1].
+_CAN_ERR_CRTL = 0x04
+_CAN_ERR_ACK = 0x20
+_CAN_ERR_BUSOFF = 0x40
+_CAN_ERR_RESTARTED = 0x100
+_CRTL_WARNING = 0x0C
+_CRTL_PASSIVE = 0x30
+_CRTL_ACTIVE = 0x40
+
+_Level = tuple[BusHealth, str]
+_OK: _Level = (BusHealth.OK, "")
+_LOST: _Level = (BusHealth.LOST, "")
+_PCAN_WARNING: _Level = (BusHealth.ERRORS, "error warning")
+
+# python-can's IXXAT recv raises these after a poll without data, while the
+# controller status shows them (canlib_vcinpl.py, _recv_internal).
+_IXXAT_LEVELS: dict[str, _Level] = {
+    "Error warning limit exceeded": (BusHealth.ERRORS, "error warning"),
+    "Bus coupling error": (BusHealth.ERRORS, "bus coupling error"),
+    "Bus off status": (BusHealth.BUS_OFF, ""),
+    "Data overrun occurred": _OK,
+}
+
+# Kvaser canERR_HARDWARE / canERR_NOCARD.
+_KVASER_LOST_CODES = (-15, -26)
+
+
+class _AdapterLostError(Exception):
+    """The health probe found the adapter gone; ends the capture as a failure."""
 
 
 class BusWorker(QObject):
@@ -46,6 +93,7 @@ class BusWorker(QObject):
     error = Signal(str)
     frame_count = Signal(int)
     cyclic_failed = Signal(int, str)  # arbitration_id, error
+    health = Signal(str, str)  # BusHealth value, detail
 
     def __init__(
         self,
@@ -63,6 +111,16 @@ class BusWorker(QObject):
         self._bus: can.BusABC | None = None
         self._send_lock = threading.Lock()
         self._tasks: set[ThreadBasedCyclicSendTask] = set()
+        # Health state, touched on the worker thread only.
+        self._level: _Level = _OK
+        self._raised: _Level | None = None
+        self._sticky: _Level = _OK
+        self._sticky_t = 0.0
+        self._err_tick = 0
+        self._err_unsampled = 0
+        self._err_sample_t = float("-inf")
+        self._clean_ticks = 0
+        self._next_tick = 0.0
 
     @property
     def name(self) -> str:
@@ -79,6 +137,7 @@ class BusWorker(QObject):
             return
         with self._send_lock:
             self._bus = bus
+        self._next_tick = time.monotonic() + _HEALTH_TICK_S
 
         self.started.emit()
         count = 0
@@ -88,9 +147,25 @@ class BusWorker(QObject):
                     self._flush_requested = False
                     with self._send_lock:
                         self._flush_tx(bus)
-                msg = bus.recv(timeout=_RECV_TIMEOUT_S)
+                try:
+                    msg = bus.recv(timeout=_RECV_TIMEOUT_S)
+                except can.CanOperationError as exc:
+                    self._note_recv_error(bus, exc)
+                    msg = None
+                now = time.monotonic()
+                # Before the None check, so an idle or silently dead bus
+                # still ticks.
+                if now >= self._next_tick:
+                    self._health_tick(bus, now)
                 if msg is None:
                     continue
+                coalesced = 1
+                if msg.is_error_frame:
+                    coalesced = self._count_error_frame(msg, now)
+                    if coalesced == 0:
+                        continue
+                elif self._sticky != _OK and now - self._sticky_t >= _STICKY_CLEAR_S:
+                    self._sticky = _OK
                 rec = FrameRecord(
                     bus_name=self._name,
                     timestamp=msg.timestamp,
@@ -101,6 +176,7 @@ class BusWorker(QObject):
                     is_error_frame=msg.is_error_frame,
                     is_remote_frame=msg.is_remote_frame,
                     is_rx=bool(getattr(msg, "is_rx", True)),
+                    coalesced=coalesced,
                 )
                 self._ring.append(rec)
                 count += 1
@@ -184,6 +260,101 @@ class BusWorker(QObject):
             self.cyclic_failed.emit(task.arbitration_id, str(exc))
         return False
 
+    # ---- Health (worker thread) ----
+
+    def _note_recv_error(self, bus: can.BusABC, exc: can.CanOperationError) -> None:
+        """Keep a recoverable receive error for the next tick; re-raise the rest."""
+        level = self._recv_error_level(bus, exc)
+        if level is None:
+            raise exc
+        if level[0] is BusHealth.LOST:
+            self._set_health(level)
+            raise exc
+        if self._raised is None:
+            _log.info("Receive error on %r: %s", self._name, exc)
+            self._raised = level
+        else:
+            self._raised = _worst(self._raised, level)
+
+    def _recv_error_level(self, bus: can.BusABC, exc: can.CanOperationError) -> _Level | None:
+        """What a receive error says about the bus; ``None`` when it is fatal."""
+        interface = self._config.interface
+        if interface == "pcan":
+            # PcanCanOperationError carries no code; the live status does.
+            level = _pcan_level(cast(Any, bus).status())
+            if level in (_OK, _PCAN_WARNING):
+                # python-can never raises for error warning, so the status
+                # doesn't explain this one; only an overrun is safe to read on.
+                return _OK if _pcan_overrun(bus, exc) else None
+            return level
+        if interface == "ixxat":
+            return _IXXAT_LEVELS.get(str(exc))
+        if interface == "kvaser" and exc.error_code in _KVASER_LOST_CODES:
+            return _LOST
+        return None
+
+    def _probe(self, bus: can.BusABC) -> _Level:
+        """Ask the adapter how it is. Catches a PCAN USB pull, after which
+        ``recv`` only ever times out."""
+        if self._config.interface == "pcan":
+            return _pcan_level(cast(Any, bus).status())
+        return _OK
+
+    def _health_tick(self, bus: can.BusABC, now: float) -> None:
+        self._next_tick = now + _HEALTH_TICK_S
+        probe = self._probe(bus)
+        if probe[0] is BusHealth.LOST:
+            self._set_health(probe)
+            raise _AdapterLostError("adapter disconnected")
+        if probe == _PCAN_WARNING and not self._err_tick:
+            # The controller holds error warning until it next transmits,
+            # long after the bus is fixed (TX is disarmed by then). Only
+            # errors still arriving make it count.
+            probe = _OK
+        flood = self._err_tick >= _ERR_FLOOD_PER_S * _HEALTH_TICK_S
+        rate = (BusHealth.ERRORS, "error-frame flood") if flood else _OK
+        # Ties keep the first: the probe, then a raised error, then the
+        # SocketCAN state, then the rate. Keeps the detail from flapping.
+        level = _worst(probe, self._raised or _OK, self._sticky, rate)
+        self._err_tick = 0
+        self._raised = None
+        if level[0] is BusHealth.OK and self._level[0] is not BusHealth.OK:
+            self._clean_ticks += 1
+            if self._clean_ticks < _CLEAN_TICKS:
+                return
+        self._clean_ticks = 0
+        if level == self._level:
+            return
+        worsened = HEALTH_RANK[level[0]] > HEALTH_RANK[self._level[0]]
+        self._set_health(level)
+        if worsened:
+            # Unacknowledged frames pile up in the adapter and would burst
+            # out once the bus recovers. Flushing here covers MCP and Replay
+            # frames too, not only the TX window's.
+            with self._send_lock:
+                self._flush_tx(bus)
+
+    def _count_error_frame(self, msg: can.Message, now: float) -> int:
+        """Count an error frame; how many the ring record stands for, 0 to drop it."""
+        self._err_tick += 1
+        self._err_unsampled += 1
+        if self._config.interface == "socketcan":
+            level = _socketcan_level(msg)
+            if level is not None:
+                self._sticky = level
+                self._sticky_t = now
+        if now - self._err_sample_t < _ERR_SAMPLE_S:
+            return 0
+        coalesced, self._err_unsampled = self._err_unsampled, 0
+        self._err_sample_t = now
+        return coalesced
+
+    def _set_health(self, level: _Level) -> None:
+        self._level = level
+        # INFO: the UI reports health changes itself.
+        _log.info("Bus %r health: %s", self._name, level[0].describe(level[1]))
+        self.health.emit(level[0].value, level[1])
+
     def _flush_tx(self, bus: can.BusABC) -> None:
         """Discard queued transmits. Worker thread only, send lock held.
 
@@ -245,6 +416,69 @@ class BusWorker(QObject):
         return can.Bus(**kwargs)
 
 
+def _worst(*levels: _Level) -> _Level:
+    return max(levels, key=lambda level: HEALTH_RANK[level[0]])
+
+
+def _pcan_level(code: int) -> _Level:
+    """Map a PCAN-Basic status code to a health level."""
+    from can.interfaces.pcan import basic
+
+    # The handle errors are values of one field, not bits: 0x0400 and
+    # 0x0800 in that field are HWINUSE and NETINUSE.
+    if (code & basic.PCAN_ERROR_ILLHANDLE) in (
+        basic.PCAN_ERROR_ILLHW,
+        basic.PCAN_ERROR_ILLNET,
+        basic.PCAN_ERROR_ILLCLIENT,
+    ):
+        return _LOST
+    if code & (
+        basic.PCAN_ERROR_NODRIVER
+        | basic.PCAN_ERROR_REGTEST
+        | basic.PCAN_ERROR_INITIALIZE
+        | basic.PCAN_ERROR_ILLOPERATION
+    ):
+        return _LOST
+    if code & basic.PCAN_ERROR_BUSOFF:
+        return (BusHealth.BUS_OFF, "")
+    if code & basic.PCAN_ERROR_BUSPASSIVE:
+        return (BusHealth.ERRORS, "error passive")
+    if code & (basic.PCAN_ERROR_BUSLIGHT | basic.PCAN_ERROR_BUSHEAVY):
+        return _PCAN_WARNING
+    return _OK
+
+
+def _pcan_overrun(bus: can.BusABC, exc: can.CanOperationError) -> bool:
+    """Whether a PCAN receive error reports an overrun: frames were lost, but
+    the next read works."""
+    from can.interfaces.pcan import basic
+
+    # The error holds only the driver's text for the code, made by this same
+    # formatter (one line per bit when the code combines several).
+    pcan = cast(Any, bus)
+    return any(
+        pcan._get_formatted_error(code) in str(exc)
+        for code in (basic.PCAN_ERROR_OVERRUN, basic.PCAN_ERROR_QOVERRUN)
+    )
+
+
+def _socketcan_level(msg: can.Message) -> _Level | None:
+    """The controller state a SocketCAN error frame reports, if any."""
+    err_class = msg.arbitration_id
+    crtl = msg.data[1] if len(msg.data) > 1 else 0
+    if err_class & _CAN_ERR_BUSOFF:
+        return (BusHealth.BUS_OFF, "")
+    if err_class & _CAN_ERR_RESTARTED or (err_class & _CAN_ERR_CRTL and crtl & _CRTL_ACTIVE):
+        return _OK
+    if err_class & _CAN_ERR_CRTL and crtl & _CRTL_PASSIVE:
+        return (BusHealth.ERRORS, "error passive")
+    if err_class & _CAN_ERR_ACK:
+        return (BusHealth.ERRORS, "no ACK")
+    if err_class & _CAN_ERR_CRTL and crtl & _CRTL_WARNING:
+        return (BusHealth.ERRORS, "error warning")
+    return None
+
+
 def _apply_listen_only_kwargs(kwargs: dict[str, Any], interface: str) -> None:
     """Translate ``listen_only=True`` to the backend's native kwarg.
 
@@ -273,6 +507,7 @@ class BusController(QObject):
     stopped = Signal()
     frame_count = Signal(int)
     cyclic_failed = Signal(int, str)
+    health = Signal(str, str)
 
     def __init__(
         self,
@@ -296,6 +531,7 @@ class BusController(QObject):
         self._worker.stopped.connect(self.stopped)
         self._worker.frame_count.connect(self.frame_count)
         self._worker.cyclic_failed.connect(self.cyclic_failed)
+        self._worker.health.connect(self.health)
 
     @property
     def name(self) -> str:

@@ -24,10 +24,11 @@ the bottom of every Trace window. Hardware / Settings / MCP / About are
 Process-level singletons live in `app_state/`:
 
 - `BusReader` (`bus_reader.py`) — wraps `core/bus.py`'s `BusController`,
-  exposes `bus_started / bus_stopped / bus_failed / frames_received(list)
-  / error`, plus `cyclic_failed / send_failed` for TX. `send_message` is
-  synchronous and callable from any thread (Replay, MCP);
-  `send_message_async` is the TX window's one-shot path.
+  exposes `bus_opening / bus_started / bus_stopped / bus_failed /
+  frames_received(list) / error`, plus `cyclic_failed / send_failed` for
+  TX and `bus_health_changed(name, state, detail)` with `health(name)` for
+  bus health. `send_message` is synchronous and callable from any thread
+  (Replay, MCP); `send_message_async` is the TX window's one-shot path.
 - `Database` (`database.py`) — wraps `core/decoder.py`'s `Decoder`,
   emits `database_changed / error`.
 - `Project` (`project.py`) — `.itp` file loader + legacy migration.
@@ -79,17 +80,43 @@ MCP layer (`src/ithildin/mcp/`):
   the send lock: pcan `reset()` (also empties the RX queue), kvaser
   `flush_tx_buffer()`; never IXXAT (its flush waits INFINITE), never a
   listen-only bus. Flush on master OFF, on every disarm and on scheduler
-  shutdown only — not when a row stops.
+  shutdown only — not when a row stops. The worker also flushes by itself
+  when health worsens into bus errors / bus-off, which covers MCP and
+  Replay frames.
 - **TX disarms and never resumes implicitly.** `TxScheduler._disarm(reason)`
   is the single path: master OFF, stop every task, flush, emit
   `disarmed` (the TX window shows an amber banner and a Report entry). It
-  runs when a bus an *active* row targets closes or fails, when a cyclic
-  task fails, and when a wanted task can't start while armed. Arming is
-  refused while an active row's bus is closed or listen-only. Nothing
-  starts while master is OFF, so a reopened bus or a later edit never
-  restarts TX — the user re-arms. The TX window and its scheduler share
-  one `TxSetup`; what the UI shows as transmitting comes from
-  `TxScheduler.is_transmitting`.
+  runs when a bus an *active* row targets closes or fails or its health
+  worsens into bus errors / bus-off, when a cyclic task fails, and when a
+  wanted task can't start while armed. Re-arming while the bus is still
+  degraded is allowed and holds until the next worsening. Arming is
+  refused while an active row's bus is closed, still opening or
+  listen-only. Nothing starts while master is OFF, so a reopened bus or a
+  later edit never restarts TX — the user re-arms. The TX window and its
+  scheduler share one `TxSetup`; what the UI shows as transmitting comes
+  from `TxScheduler.is_transmitting`.
+- **Bus health comes from the capture worker.** `BusWorker` classifies a
+  `recv` `CanOperationError` instead of dying on it: pcan by `status()`
+  (a raise the status doesn't explain, clean or error warning, is fatal
+  unless its text is an overrun's), IXXAT by its exact message strings,
+  Kvaser −15/−26 → lost; anything else stays fatal. A 0.5 s tick (it runs on an idle bus too)
+  probes pcan `status()`, which is how a pulled PCAN-USB is noticed (`recv`
+  only times out), and counts error frames (≥50/s → bus errors); pcan's
+  error warning counts only while error frames arrive, since the
+  controller holds it until it next transmits. Recovery needs two clean
+  ticks, ties break probe > raised > SocketCAN state > rate, and
+  `health(state, detail)` fires only on a change. A lost adapter raises
+  into the normal failure path. Never add a sleep when `recv` returns
+  `None`. `BusReader.health(name)` is `None` while opening, OK from
+  `bus_started`; LOST outlives the failure until the bus is opened again
+  or closed by name. **Degraded means `health is not BusHealth.OK`**, one rule
+  everywhere. Known gaps: Kvaser bus-off shows only through the error-frame
+  rate (python-can doesn't wrap `canReadStatus`); an IXXAT bus in error
+  keeps up to 16 stale queued frames (its flush waits INFINITE).
+- **Error frames are coalesced in `BusWorker`.** The ring gets at most ~10
+  per second per bus, each with `FrameRecord.coalesced` = how many it
+  stands for; data frames are never dropped. Bus state comes from
+  `BusReader.health()`, not from counting error frames in a view.
 - **Connect app-lifetime emitters to bound methods.** `BusReader`,
   `ThemeManager` and `UiEvents` outlive every view. A lambda capturing
   `self` keeps firing into a deleted widget; a bound QObject method

@@ -42,6 +42,7 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import (
     QAction,
+    QColor,
     QDragEnterEvent,
     QDragMoveEvent,
     QDropEvent,
@@ -64,6 +65,7 @@ from PySide6.QtWidgets import (
 )
 
 from ithildin.core.decoder import Decoder
+from ithildin.core.types import BusHealth
 from ithildin.ui._drag_payload import (
     BUS_MIME,
     DBC_MIME,
@@ -78,6 +80,7 @@ from ithildin.ui.adapter_prober import AdapterChoice, AdapterProber, register_pr
 from ithildin.ui.collapsible_section import HEADER_BAND_HEIGHT, CollapsibleSection
 from ithildin.ui.dbc_loader import DbcLoader
 from ithildin.ui.icons import icon, themed_callback, themed_icon
+from ithildin.ui.theme import ThemeManager
 from ithildin.workspace.schema import DbcRef
 
 if TYPE_CHECKING:
@@ -235,10 +238,16 @@ class MessagesModel(QAbstractListModel):
         return pack_into_mime(payloads)
 
 
-LiveState = Literal["live", "stopped", "available", "unavailable"]
+LiveState = Literal[
+    "live", "opening", "errors", "bus_off", "lost", "stopped", "available", "unavailable"
+]
 """Per-row liveness:
 
-- ``live`` — this is the bus the ``BusReader`` is currently capturing.
+- ``live`` — the ``BusReader`` is capturing this bus and it is healthy.
+- ``opening`` — opened, but the adapter isn't up yet (or the open hangs).
+- ``errors`` / ``bus_off`` — capturing, but the bus is degraded.
+- ``lost`` — the adapter went away; holds until the bus is opened or
+  closed again.
 - ``stopped`` — this bus was opened earlier in this session but its
   worker has exited (user disconnect, or hardware unplug / error).
 - ``available`` — a detected adapter matches this row's
@@ -248,9 +257,36 @@ LiveState = Literal["live", "stopped", "available", "unavailable"]
 
 _DOT_FOR_STATE: dict[LiveState, str] = {
     "live": "●",
+    "opening": "◔",
+    "errors": "▲",
+    "bus_off": "■",
+    "lost": "✕",
     "stopped": "◌",
     "available": "○",
     "unavailable": "⊘",
+}
+
+_STATE_FOR_HEALTH: dict[BusHealth, LiveState] = {
+    BusHealth.OK: "live",
+    BusHealth.ERRORS: "errors",
+    BusHealth.BUS_OFF: "bus_off",
+    BusHealth.LOST: "lost",
+}
+
+# Tooltip and theme tint for the states that need explaining. No health
+# detail: the row only rebuilds when the state changes; the status bar
+# carries the detail.
+_STATE_HINTS: dict[LiveState, tuple[str, str | None]] = {
+    "opening": ("Opening — waiting for the adapter.", None),
+    "errors": (
+        "Bus errors. Check the cable, termination and that another node is powered.",
+        "warn",
+    ),
+    "bus_off": (
+        "Bus-off — the controller stopped transmitting. Reconnect the bus to recover.",
+        "err",
+    ),
+    "lost": ("Adapter lost — plug it back in, then connect the bus again.", "err"),
 }
 
 
@@ -406,12 +442,22 @@ class BusTreeView(QTreeView):
     def set_rows(self, rows: list[tuple[_BusRow, list[Path]]]) -> None:
         """Repopulate the tree from a flat list of (bus, dbcs) pairs."""
         self._tree_model.removeRows(0, self._tree_model.rowCount())
+        tokens = ThemeManager.instance().current_tokens()
         for bus, dbc_paths in rows:
             parent_item = QStandardItem(_format_bus_label(bus))
             parent_item.setData(bus, _BUS_ROW_ROLE)
             parent_item.setEditable(False)
+            tips: list[str] = []
+            hint = _STATE_HINTS.get(bus.state)
+            if hint is not None:
+                tip, tint = hint
+                tips.append(tip)
+                if tint is not None:
+                    parent_item.setForeground(QColor(tokens[tint]))
             if bus.listen_only:
-                parent_item.setToolTip("Listen only — this bus cannot transmit.")
+                tips.append("Listen only — this bus cannot transmit.")
+            if tips:
+                parent_item.setToolTip("\n".join(tips))
             for path in dbc_paths:
                 child = QStandardItem(path.name)
                 child.setData(path, _DBC_PATH_ROLE)
@@ -616,12 +662,15 @@ class LeftDockWidget(QWidget):
     def bind(self, ctx: AppContext) -> None:
         self._ctx = ctx
         ctx.database.database_changed.connect(self._refresh_dbc_lists)
+        ctx.bus_reader.bus_opening.connect(self._on_bus_state_changed)
         ctx.bus_reader.bus_started.connect(self._on_bus_state_changed)
         ctx.bus_reader.bus_stopped.connect(self._on_bus_state_changed)
+        ctx.bus_reader.bus_health_changed.connect(self._on_bus_health_changed)
         if self._bus_tree is not None:
             self._bus_tree.set_signal_centric_getter(ctx.database.is_signal_centric)
         self._refresh_dbc_lists()
-        self._refresh_buses()
+        # Rebuilt on a theme switch too: degraded rows carry a theme tint.
+        themed_callback(self._refresh_buses)
 
     def start_adapter_probe(self) -> None:
         """Kick off background adapter detection.
@@ -1003,8 +1052,11 @@ class LeftDockWidget(QWidget):
         rows: list[tuple[_BusRow, list[Path]]] = []
         for cfg in project.workspace.bus:
             state: LiveState
+            health = bus_reader.health(cfg.name)
             if cfg.name in live_names:
-                state = "live"
+                state = "opening" if health is None else _STATE_FOR_HEALTH[health[0]]
+            elif health is not None and health[0] is BusHealth.LOST:
+                state = "lost"
             elif cfg.name in ever_opened:
                 state = "stopped"
             elif (cfg.interface, cfg.channel) in detected:
@@ -1237,6 +1289,15 @@ class LeftDockWidget(QWidget):
     def _on_bus_state_changed(self, _name: str) -> None:
         self._refresh_dbc_lists()
         self._refresh_buses()
+
+    def _on_bus_health_changed(self, name: str, state: str, _detail: str) -> None:
+        # A detail-only change keeps the row: rebuilding the tree on every
+        # one would churn it on a noisy bus.
+        if self._bus_tree is None:
+            return
+        row = self._bus_tree.bus_row(name)
+        if row is not None and row.state != _STATE_FOR_HEALTH[BusHealth(state)]:
+            self._refresh_buses()
 
     def _start_prober(self) -> None:
         if self._prober is not None:

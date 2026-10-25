@@ -27,6 +27,7 @@ closes every declared bus in one click.
 
 from __future__ import annotations
 
+import html
 import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -51,6 +52,7 @@ from PySide6.QtWidgets import (
 
 from ithildin.app_state.project import MigrationError, Project, new_unsaved, open_or_migrate
 from ithildin.app_state.recent_projects import RecentProjectsStore
+from ithildin.core.types import BusHealth
 from ithildin.ui.about_window import AboutDialog
 from ithildin.ui.icons import icon, themed_callback, themed_icon
 from ithildin.ui.left_dock import LeftDockWidget
@@ -111,6 +113,8 @@ class MainWindow(QMainWindow):
         # canonical comparison key (model_dump on the same Pydantic
         # model is order-stable).
         self._workspace_baseline: dict[str, object] | None = None
+        # Last health state reported per running bus; absent means OK.
+        self._health_seen: dict[str, BusHealth] = {}
 
         # Give the bottom-left corner to the left dock so the project pane
         # keeps full height and the report pane only spans the central
@@ -130,6 +134,7 @@ class MainWindow(QMainWindow):
         themed_callback(self._refresh_pane_toggle_icons)
         themed_callback(self._refresh_mdi_background)
         themed_callback(self._refresh_connect_action)
+        themed_callback(self._refresh_status_left)
 
     @property
     def mdi_area(self) -> QMdiArea:
@@ -486,6 +491,8 @@ class MainWindow(QMainWindow):
     def _build_status_bar(self) -> None:
         bar = self.statusBar()
         self._status_left = QLabel("Disconnected")
+        # Rich text so each bus's segment carries its own tint.
+        self._status_left.setTextFormat(Qt.TextFormat.RichText)
         self._status_right = QLabel("MCP off")
         self._status_right.setToolTip("MCP server state — open the MCP dialog to start it")
         bar.addWidget(self._status_left, 1)
@@ -493,12 +500,10 @@ class MainWindow(QMainWindow):
 
     def _wire_app_state(self) -> None:
         if self._bus is not None:
-            self._bus.bus_started.connect(lambda name: self._status_left.setText(f"{name} · LIVE"))
-            self._bus.bus_stopped.connect(
-                lambda name: self._status_left.setText(f"{name} · stopped")
-            )
-            self._bus.bus_started.connect(lambda _name: self._refresh_connect_action())
-            self._bus.bus_stopped.connect(lambda _name: self._refresh_connect_action())
+            self._bus.bus_opening.connect(self._on_bus_state_changed)
+            self._bus.bus_started.connect(self._on_bus_state_changed)
+            self._bus.bus_stopped.connect(self._on_bus_state_changed)
+            self._bus.bus_health_changed.connect(self._on_bus_health_changed)
             self._bus.error.connect(lambda msg: self.report(msg, kind="error"))
             # Bound slots, so the off-GUI-thread send_failed is queued here.
             self._bus.send_failed.connect(self._on_send_failed)
@@ -506,6 +511,63 @@ class MainWindow(QMainWindow):
         if self._db is not None:
             self._db.error.connect(lambda msg: self.report(msg, kind="error"))
         self._refresh_connect_action()
+
+    @Slot(str)
+    def _on_bus_state_changed(self, name: str) -> None:
+        self._health_seen.pop(name, None)
+        self._refresh_status_left()
+        self._refresh_connect_action()
+
+    @Slot(str, str, str)
+    def _on_bus_health_changed(self, name: str, state: str, detail: str) -> None:
+        self._refresh_status_left()
+        health = BusHealth(state)
+        previous = self._health_seen.get(name, BusHealth.OK)
+        self._health_seen[name] = health
+        # A new detail alone shows in the status bar only.
+        if health is previous:
+            return
+        # A lost adapter is reported by the failure that follows.
+        if health is BusHealth.BUS_OFF:
+            self.report(f"Bus {name}: bus-off — reconnect the bus to recover", kind="warn")
+        elif health is BusHealth.ERRORS:
+            # Info, so a bus that flaps doesn't keep popping the dock open.
+            self.report(f"Bus {name}: {health.describe(detail)}", kind="info")
+        elif health is BusHealth.OK:
+            self.report(f"Bus {name}: live again", kind="info")
+
+    def _refresh_status_left(self) -> None:
+        """One segment per open bus, plus buses whose adapter was lost."""
+        if self._bus is None:
+            return
+        tokens = ThemeManager.instance().current_tokens()
+        open_names = set(self._bus.bus_names())
+        segments: list[str] = []
+        lines: list[str] = []
+        for cfg in self._bus.last_configs():
+            health = self._bus.health(cfg.name)
+            tint: str | None = None
+            if cfg.name in open_names:
+                if health is None:
+                    text = "opening"
+                elif health[0] is BusHealth.OK:
+                    text = "LIVE"
+                else:
+                    text = health[0].describe(health[1])
+                    tint = "warn" if health[0] is BusHealth.ERRORS else "err"
+            elif health is not None and health[0] is BusHealth.LOST:
+                text = health[0].label
+                tint = "err"
+            else:
+                continue
+            line = f"{cfg.name} · {text}"
+            lines.append(line)
+            segment = html.escape(line)
+            if tint is not None:
+                segment = f'<span style="color: {tokens[tint]}">{segment}</span>'
+            segments.append(segment)
+        self._status_left.setText(" &nbsp;|&nbsp; ".join(segments) if segments else "Disconnected")
+        self._status_left.setToolTip("\n".join(lines))
 
     @Slot(str, int, str)
     def _on_send_failed(self, bus_name: str, message_id: int, error: str) -> None:

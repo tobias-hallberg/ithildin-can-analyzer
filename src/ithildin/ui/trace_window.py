@@ -41,6 +41,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ithildin.core.types import HEALTH_RANK, BusHealth
 from ithildin.ui._child_base import ChildView
 from ithildin.ui._tracked_tree import TrackedTreePane
 from ithildin.ui.banner import Banner
@@ -56,6 +57,7 @@ if TYPE_CHECKING:
 _FILTER_DEBOUNCE_MS = 100
 _DEFAULT_LEFT_PANE_WIDTH = 220
 _DEFAULT_DETAIL_HEIGHT = 240
+_BANNER_HEALTH = (BusHealth.ERRORS, BusHealth.BUS_OFF)
 
 
 class TraceFilterProxy(QSortFilterProxyModel):
@@ -155,7 +157,9 @@ class TraceWindow(ChildView):
         ctx.bus_reader.bus_started.connect(self._on_bus_topology_changed)
         ctx.bus_reader.bus_stopped.connect(self._on_bus_topology_changed)
         ctx.bus_reader.bus_started.connect(self._on_bus_started_clear_banner)
+        ctx.bus_reader.bus_stopped.connect(self._on_bus_stopped_clear_health_banner)
         ctx.bus_reader.bus_failed.connect(self._on_bus_failed)
+        ctx.bus_reader.bus_health_changed.connect(self._on_bus_health_changed)
         ctx.bus_reader.error.connect(self._on_bus_error)
         ctx.database.database_changed.connect(self._on_database_changed)
         self._rebuild_model()
@@ -180,9 +184,18 @@ class TraceWindow(ChildView):
 
         self._banner = Banner(kind="error", parent=self)
         self._banner.action_clicked.connect(self._on_banner_action)
+        self._banner.dismissed.connect(self._on_banner_dismissed)
         # Bus name shown by the most recent bus_failed banner. ``None``
         # when the banner is dismissed or showing a non-failure message.
         self._failed_bus_name: str | None = None
+        # Bus whose bus-errors or bus-off state the banner shows, if any.
+        self._health_bus: str | None = None
+        # Last health per running bus; absent means OK.
+        self._health_seen: dict[str, tuple[BusHealth, str]] = {}
+        # Bus the bus-off Reconnect closed, to open again once it stopped.
+        # Dropped if the bus starts or fails meanwhile, so a stop that never
+        # came can't reopen it later.
+        self._reopen_bus: str | None = None
         layout.addWidget(self._banner)
 
         self._splitter = QSplitter(Qt.Orientation.Horizontal, self)
@@ -419,10 +432,16 @@ class TraceWindow(ChildView):
         self._on_effective_changed()
 
     def _on_bus_error(self, message: str) -> None:
+        # Comes before a bus_failed, which takes the banner back.
+        self._failed_bus_name = None
+        self._health_bus = None
         self._banner.show_message(message, kind="error")
 
     def _on_bus_failed(self, bus_name: str, message: str) -> None:
         self._failed_bus_name = bus_name
+        self._health_bus = None
+        if self._reopen_bus == bus_name:
+            self._reopen_bus = None
         self._banner.show_message(
             f"Bus {bus_name} disconnected: {message}",
             kind="error",
@@ -430,14 +449,92 @@ class TraceWindow(ChildView):
         )
 
     def _on_bus_started_clear_banner(self, bus_name: str) -> None:
+        if self._reopen_bus == bus_name:
+            self._reopen_bus = None
         if self._failed_bus_name == bus_name:
             self._failed_bus_name = None
             self._banner.hide()
 
-    def _on_banner_action(self) -> None:
-        if self._ctx is None or self._failed_bus_name is None:
+    def _on_bus_stopped_clear_health_banner(self, bus_name: str) -> None:
+        self._health_seen.pop(bus_name, None)
+        if self._health_bus == bus_name:
+            self._show_worst_health()
+        if self._reopen_bus == bus_name and self._ctx is not None:
+            self._reopen_bus = None
+            cfg = self._ctx.bus_reader.last_config_for(bus_name)
+            if cfg is not None:
+                self._ctx.bus_reader.open(cfg)
+
+    def _on_bus_health_changed(self, bus_name: str, state: str, detail: str) -> None:
+        health = BusHealth(state)
+        previous = self._health_seen.get(bus_name, (BusHealth.OK, ""))[0]
+        self._health_seen[bus_name] = (health, detail)
+        # A failure banner carries a Reconnect for a dead bus; keep it.
+        if self._failed_bus_name is not None:
             return
-        cfg = self._ctx.bus_reader.last_config_for(self._failed_bus_name)
+        # LOST: bus_failed follows with its own banner.
+        if bus_name == self._health_bus and health is not BusHealth.LOST:
+            self._show_worst_health()
+            return
+        # A new detail alone never brings a dismissed banner back, and a
+        # bus-off banner, with its Reconnect, never gives way to bus errors.
+        if health is previous or health not in _BANNER_HEALTH:
+            return
+        if self._health_bus is not None:
+            shown = self._health_seen[self._health_bus][0]
+            if HEALTH_RANK[shown] > HEALTH_RANK[health]:
+                return
+        self._show_health(bus_name)
+
+    def _show_worst_health(self) -> None:
+        """Show the worst bus-errors / bus-off state left, the shown bus winning a tie."""
+        degraded = [name for name, (h, _d) in self._health_seen.items() if h in _BANNER_HEALTH]
+        if not degraded:
+            self._health_bus = None
+            self._banner.hide()
+            return
+        self._show_health(
+            max(
+                degraded,
+                key=lambda n: (HEALTH_RANK[self._health_seen[n][0]], n == self._health_bus),
+            )
+        )
+
+    def _show_health(self, bus_name: str) -> None:
+        health, detail = self._health_seen[bus_name]
+        self._health_bus = bus_name
+        if health is BusHealth.BUS_OFF:
+            self._banner.show_message(
+                f"Bus {bus_name}: bus-off. The controller stopped transmitting; "
+                "reconnect to recover.",
+                kind="error",
+                action_label="Reconnect",
+            )
+        else:
+            self._banner.show_message(
+                f"Bus {bus_name}: {health.describe(detail)}. Error frames are sampled. "
+                "Check the cable, termination and that another node is powered.",
+                kind="warn",
+            )
+
+    def _on_banner_dismissed(self) -> None:
+        self._failed_bus_name = None
+        self._health_bus = None
+
+    def _on_banner_action(self) -> None:
+        if self._ctx is None:
+            return
+        bus_name = self._failed_bus_name or self._health_bus
+        if bus_name is None:
+            return
+        if bus_name == self._health_bus:
+            # Bus-off: the bus is still open, and reopening resets the
+            # controller. Open once its stop has arrived: a stop that lands
+            # after the new open would take the new bus down with it.
+            self._reopen_bus = bus_name
+            self._ctx.bus_reader.close(bus_name)
+            return
+        cfg = self._ctx.bus_reader.last_config_for(bus_name)
         if cfg is None:
             return
         self._ctx.bus_reader.open(cfg)
@@ -448,6 +545,8 @@ class TraceWindow(ChildView):
         self._model.set_admit(self._tracked_pane.effective().admits)
 
     def _on_superseded(self, message: str) -> None:
+        self._failed_bus_name = None
+        self._health_bus = None
         self._banner.show_message(message, kind="info")
 
     # ---- Slots ----

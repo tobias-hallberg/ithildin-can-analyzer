@@ -657,3 +657,51 @@ def test_no_prompt_skips_capture_dialog_and_closes_bus(  # type: ignore[no-untyp
         win.closeEvent(event)
     assert event.isAccepted()
     assert not ctx.bus_reader.is_open
+
+
+def test_status_bar_and_report_follow_bus_health(  # type: ignore[no-untyped-def]
+    qapp, qtbot, monkeypatch, tmp_path: Path
+) -> None:
+    from can.interfaces.pcan import basic
+
+    from ithildin.core import bus as bus_module
+    from tests.fake_bus import use_fake_bus
+
+    monkeypatch.setattr(bus_module, "_HEALTH_TICK_S", 0.1)
+    fake = use_fake_bus(monkeypatch)
+    ctx = make_app_context(tmp_path)
+    win = MainWindow(bus_reader=ctx.bus_reader, database=ctx.database, prompt_on_close=False)
+    qtbot.addWidget(win)
+    win.bind_events(ctx)
+    tokens = ThemeManager.instance().current_tokens()
+
+    def tinted(text: str, token: str) -> str:
+        return f'<span style="color: {tokens[token]}">{text}</span>'
+
+    ctx.bus_reader.open(BusConfig(name="CAN_1", interface="pcan", channel="X", bitrate=500000))
+    assert win._status_left.text() == "CAN_1 · opening"
+    qtbot.waitUntil(lambda: win._status_left.text() == "CAN_1 · LIVE", timeout=2000)
+
+    with qtbot.waitSignal(ctx.bus_reader.bus_health_changed, timeout=2000):
+        fake.status_code = basic.PCAN_ERROR_BUSPASSIVE
+    assert win._status_left.text() == tinted("CAN_1 · bus errors (error passive)", "warn")
+    assert "Bus CAN_1: bus errors (error passive)" in win._report_widget.item(0).text()
+    # Info only: a flapping bus must not keep popping the dock open.
+    assert win._report_dock.isHidden()
+    # A new detail alone adds no entry.
+    reported = win._report_widget.count()
+    ctx.bus_reader.bus_health_changed.emit("CAN_1", "errors", "error warning")
+    assert win._report_widget.count() == reported
+
+    with qtbot.waitSignal(ctx.bus_reader.bus_health_changed, timeout=2000):
+        fake.status_code = basic.PCAN_ERROR_BUSOFF
+    assert win._status_left.text() == tinted("CAN_1 · bus-off", "err")
+    assert "Bus CAN_1: bus-off" in win._report_widget.item(0).text()
+    assert not win._report_dock.isHidden()
+
+    with qtbot.waitSignal(ctx.bus_reader.bus_failed, timeout=2000):
+        fake.status_code = basic.PCAN_ERROR_ILLHW
+    assert win._status_left.text() == tinted("CAN_1 · adapter lost", "err")
+    texts = [win._report_widget.item(i).text() for i in range(win._report_widget.count())]
+    assert "adapter disconnected" in texts[0]
+    assert not any("adapter lost" in text for text in texts)

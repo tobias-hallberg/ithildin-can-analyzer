@@ -13,8 +13,8 @@ This module owns two responsibilities:
    live ``python-can`` cyclic tasks via :meth:`BusReader.start_periodic`
    and ``CyclicSendTask.modify_data`` — see handoff §2 for the two-tier
    master / per-row semantics. Anything that stops TX behind the user's
-   back (bus closed or lost, a task failing) turns the master OFF; nothing
-   ever restarts on its own.
+   back (bus closed, lost or newly in error, a task failing) turns the
+   master OFF; nothing ever restarts on its own.
 
 The shared :func:`encode_tx_message` helper is also called by the MCP
 ``send_signal`` tool so the two transmit paths can never drift.
@@ -33,6 +33,7 @@ from PySide6.QtCore import QObject, Signal
 
 from ithildin.app_state.bus_reader import BusReader
 from ithildin.app_state.database import Database
+from ithildin.core.types import HEALTH_RANK, BusHealth
 
 TxSignalKind = Literal[
     "bool",
@@ -342,11 +343,13 @@ class TxScheduler(QObject):
     task. When that can't hold (a task fails or won't start, or a bus an
     active row targets closes or fails) the scheduler disarms: master
     OFF, every task stopped, queued frames flushed, ``disarmed`` emitted.
-    Nothing starts while master is OFF, so a reopened bus or a later edit
-    never resumes TX by itself.
+    It also disarms when such a bus gets worse into bus errors or bus-off.
+    Arming again while the bus is still degraded is the user's call and
+    sticks until the next worsening. Nothing starts while master is OFF,
+    so a reopened bus or a later edit never resumes TX by itself.
 
     Arming is refused up front, with ``error`` and master left OFF, while
-    an active transmit targets a listen-only or closed bus.
+    an active transmit targets a listen-only, closed or still opening bus.
     """
 
     error = Signal(int, str)  # (message_id, message); 0 for non-row errors
@@ -363,8 +366,16 @@ class TxScheduler(QObject):
         self._database = database
         self._setup = TxSetup()
         self._tasks: dict[tuple[str, int], ThreadBasedCyclicSendTask] = {}
+        # Last health seen per bus since it started; absent means OK.
+        self._health_seen: dict[str, BusHealth] = {}
+        for name in bus_reader.bus_names():
+            health = bus_reader.health(name)
+            if health is not None:
+                self._health_seen[name] = health[0]
+        bus_reader.bus_started.connect(self._on_bus_started)
         bus_reader.bus_failed.connect(self._on_bus_failed)
         bus_reader.bus_stopped.connect(self._on_bus_stopped)
+        bus_reader.bus_health_changed.connect(self._on_bus_health_changed)
         bus_reader.cyclic_failed.connect(self._on_cyclic_failed)
         bus_reader.send_failed.connect(self._on_send_failed)
 
@@ -523,16 +534,24 @@ class TxScheduler(QObject):
         return True
 
     def _check_buses_open(self) -> bool:
-        """Verify every active transmit's bus is connected."""
+        """Verify every active transmit's bus is connected and done opening."""
         open_buses = set(self._bus_reader.bus_names())
         for tx in self._setup.transmits:
-            if tx.active and tx.bus_name not in open_buses:
+            if not tx.active:
+                continue
+            if tx.bus_name not in open_buses:
                 self.error.emit(
                     tx.message_id,
                     f"bus {tx.bus_name!r} is not connected — connect it first",
                 )
                 return False
+            if self._bus_reader.health(tx.bus_name) is None:
+                self.error.emit(tx.message_id, f"bus {tx.bus_name!r} is still connecting")
+                return False
         return True
+
+    def _on_bus_started(self, bus_name: str) -> None:
+        self._health_seen.pop(bus_name, None)
 
     def _on_bus_failed(self, bus_name: str, error: str) -> None:
         # Fires just before bus_stopped, so this more specific reason wins.
@@ -544,6 +563,20 @@ class TxScheduler(QObject):
             self._bus_reader.stop_periodic(bus_name, self._tasks.pop(key))
         if self._targets_actively(bus_name):
             self._disarm(f"Bus {bus_name} closed")
+
+    def _on_bus_health_changed(self, bus_name: str, state: str, detail: str) -> None:
+        health = BusHealth(state)
+        previous = self._health_seen.get(bus_name, BusHealth.OK)
+        self._health_seen[bus_name] = health
+        # Only a worsening: re-arming on a bus that is still degraded holds.
+        # LOST is left to bus_failed, which follows it.
+        worsened = HEALTH_RANK[health] > HEALTH_RANK[previous]
+        if (
+            worsened
+            and health in (BusHealth.ERRORS, BusHealth.BUS_OFF)
+            and self._targets_actively(bus_name)
+        ):
+            self._disarm(f"Bus {bus_name}: {health.describe(detail)}")
 
     def _on_cyclic_failed(self, bus_name: str, message_id: int, error: str) -> None:
         if (bus_name, message_id) in self._tasks:

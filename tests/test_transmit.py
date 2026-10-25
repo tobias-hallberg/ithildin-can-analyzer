@@ -687,7 +687,8 @@ def test_bus_failure_disarms_with_reason(  # type: ignore[no-untyped-def]
     qapp, qtbot, monkeypatch, example_dbc_path: Path, tx_reader
 ) -> None:
     fake = use_fake_bus(monkeypatch)
-    _open_fake(tx_reader, qtbot)
+    # Kvaser: a receive error without a hardware code is fatal there.
+    _open_fake(tx_reader, qtbot, "kvaser")
     sched = TxScheduler(tx_reader, _db(example_dbc_path))
     sched.apply(TxSetup(master_enabled=True, transmits=[_periodic()]))
     qtbot.waitUntil(lambda: len(fake.sent) >= 1, timeout=2000)
@@ -847,3 +848,124 @@ def test_same_id_on_two_buses_gets_two_tasks(  # type: ignore[no-untyped-def]
     assert set(sched._tasks) == {("CAN_1", 0x100), ("CAN_2", 0x100)}
     assert not any(task.stopped for task in sched._tasks.values())
     sched.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Disarm on bus health: only a worsening into bus errors or bus-off.
+# ---------------------------------------------------------------------------
+
+
+def test_health_worsening_disarms(  # type: ignore[no-untyped-def]
+    qapp, qtbot, example_dbc_path: Path, tx_reader
+) -> None:
+    _open_virtual_bus(tx_reader, qtbot)
+    sched = TxScheduler(tx_reader, _db(example_dbc_path))
+    sched.apply(TxSetup(master_enabled=True, transmits=[_periodic()]))
+
+    with qtbot.waitSignal(sched.disarmed, timeout=1000) as blocker:
+        tx_reader.bus_health_changed.emit("CAN_1", "errors", "error passive")
+    assert blocker.args == ["Bus CAN_1: bus errors (error passive)"]
+    assert sched.setup.master_enabled is False
+    assert sched._tasks == {}
+
+
+def test_rearming_while_degraded_holds_until_it_gets_worse(  # type: ignore[no-untyped-def]
+    qapp, qtbot, example_dbc_path: Path, tx_reader
+) -> None:
+    _open_virtual_bus(tx_reader, qtbot)
+    sched = TxScheduler(tx_reader, _db(example_dbc_path))
+    sched.apply(TxSetup(master_enabled=True, transmits=[_periodic()]))
+    disarms: list[str] = []
+    sched.disarmed.connect(disarms.append)
+    tx_reader.bus_health_changed.emit("CAN_1", "errors", "error passive")
+    assert len(disarms) == 1
+
+    sched.set_master(True)
+    # Same state, other detail: not a worsening.
+    tx_reader.bus_health_changed.emit("CAN_1", "errors", "error-frame flood")
+    assert sched.setup.master_enabled is True
+    tx_reader.bus_health_changed.emit("CAN_1", "bus_off", "")
+    assert disarms[1:] == ["Bus CAN_1: bus-off"]
+
+    # Recovered, then worse again.
+    sched.set_master(True)
+    tx_reader.bus_health_changed.emit("CAN_1", "ok", "")
+    assert sched.setup.master_enabled is True
+    tx_reader.bus_health_changed.emit("CAN_1", "errors", "no ACK")
+    assert disarms[2:] == ["Bus CAN_1: bus errors (no ACK)"]
+
+
+def test_health_of_an_untargeted_bus_keeps_master_on(  # type: ignore[no-untyped-def]
+    qapp, qtbot, example_dbc_path: Path, tx_reader
+) -> None:
+    _open_virtual_bus(tx_reader, qtbot, name="CAN_1")
+    _open_virtual_bus(tx_reader, qtbot, name="CAN_2")
+    sched = TxScheduler(tx_reader, _db(example_dbc_path, ["CAN_1", "CAN_2"]))
+    sched.apply(
+        TxSetup(
+            master_enabled=True, transmits=[_periodic("CAN_1"), _periodic("CAN_2", active=False)]
+        )
+    )
+    disarms: list[str] = []
+    sched.disarmed.connect(disarms.append)
+
+    tx_reader.bus_health_changed.emit("CAN_2", "bus_off", "")
+    # LOST is left to the bus failure that follows it.
+    tx_reader.bus_health_changed.emit("CAN_1", "lost", "")
+    assert disarms == []
+    assert sched.setup.master_enabled is True
+    sched.shutdown()
+
+
+def test_scheduler_created_on_a_degraded_bus_sees_no_worsening(  # type: ignore[no-untyped-def]
+    qapp, qtbot, monkeypatch, example_dbc_path: Path, tx_reader
+) -> None:
+    from ithildin.core.types import BusHealth
+
+    _open_virtual_bus(tx_reader, qtbot)
+    monkeypatch.setitem(tx_reader._health, "CAN_1", (BusHealth.ERRORS, "error passive"))
+    sched = TxScheduler(tx_reader, _db(example_dbc_path))
+    sched.apply(TxSetup(master_enabled=True, transmits=[_periodic()]))
+
+    tx_reader.bus_health_changed.emit("CAN_1", "errors", "no ACK")
+    assert sched.setup.master_enabled is True
+    sched.shutdown()
+
+
+def test_arming_refused_while_bus_is_opening(  # type: ignore[no-untyped-def]
+    qapp, qtbot, example_dbc_path: Path, tx_reader
+) -> None:
+    sched = TxScheduler(tx_reader, _db(example_dbc_path))
+    sched.apply(TxSetup(transmits=[_periodic()]))
+    errors: list[str] = []
+    sched.error.connect(lambda _mid, msg: errors.append(msg))
+    cfg = BusConfig(
+        name="CAN_1", interface="virtual", channel=f"tx-{uuid.uuid4().hex[:8]}", bitrate=500000
+    )
+
+    with qtbot.waitSignal(tx_reader.bus_started, timeout=2000):
+        tx_reader.open(cfg)
+        sched.set_master(True)
+    assert sched.setup.master_enabled is False
+    assert errors == ["bus 'CAN_1' is still connecting"]
+
+
+def test_bus_errors_disarm_end_to_end(  # type: ignore[no-untyped-def]
+    qapp, qtbot, monkeypatch, example_dbc_path: Path, tx_reader
+) -> None:
+    from can.interfaces.pcan import basic
+
+    from ithildin.core import bus as bus_module
+
+    monkeypatch.setattr(bus_module, "_HEALTH_TICK_S", 0.1)
+    fake = use_fake_bus(monkeypatch)
+    _open_fake(tx_reader, qtbot, "pcan")
+    sched = TxScheduler(tx_reader, _db(example_dbc_path))
+    sched.apply(TxSetup(master_enabled=True, transmits=[_periodic()]))
+    qtbot.waitUntil(lambda: len(fake.sent) >= 1, timeout=2000)
+
+    with qtbot.waitSignal(sched.disarmed, timeout=2000) as blocker:
+        fake.status_code = basic.PCAN_ERROR_BUSPASSIVE
+    assert blocker.args == ["Bus CAN_1: bus errors (error passive)"]
+    assert sched._tasks == {}
+    qtbot.waitUntil(lambda: fake.resets >= 1, timeout=2000)

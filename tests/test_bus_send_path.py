@@ -218,7 +218,8 @@ def test_closing_bus_refuses_sends_without_waiting_for_shutdown(  # type: ignore
 ) -> None:
     """A worker that failed on its own holds the send lock through shutdown."""
     fake = use_fake_bus(monkeypatch)
-    _open(reader, qtbot)
+    # Kvaser: a receive error without a hardware code is fatal there.
+    _open(reader, qtbot, "kvaser")
     in_shutdown = threading.Event()
     release = threading.Event()
     real_shutdown = fake.shutdown

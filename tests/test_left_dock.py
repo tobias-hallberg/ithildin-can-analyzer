@@ -9,6 +9,7 @@ from pathlib import Path
 from PySide6.QtCore import QItemSelectionModel, Qt
 
 from ithildin.app_state.project import open_or_migrate
+from ithildin.core.types import BusHealth
 from ithildin.ui._drag_payload import (
     DBC_MIME,
     SIGNAL_MIME,
@@ -334,6 +335,7 @@ def test_bus_row_live_indicator_when_bus_reader_open(qapp, qtbot, tmp_path: Path
     from types import SimpleNamespace
 
     ctx.bus_reader._controllers = {"Engine": SimpleNamespace(name="Engine")}  # type: ignore[attr-defined]
+    ctx.bus_reader._health = {"Engine": (BusHealth.OK, "")}
     dock._refresh_buses()
 
     row_engine = dock._bus_tree.bus_row("Engine")
@@ -773,3 +775,49 @@ def test_filter_clear_button_hidden_until_text(qapp, qtbot, tmp_path: Path) -> N
     qapp.processEvents()
     assert dock._filter_input.text() == ""
     assert button.isVisible() is False
+
+
+def test_bus_row_follows_health(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    from types import SimpleNamespace
+
+    from ithildin.ui.theme import ThemeManager
+
+    project = _make_project(tmp_path, ["Engine"])
+    ctx = make_app_context(tmp_path, project=project)
+    dock = LeftDockWidget()
+    qtbot.addWidget(dock)
+    dock.bind(ctx)
+    reader = ctx.bus_reader
+    tokens = ThemeManager.instance().current_tokens()
+
+    def item():  # type: ignore[no-untyped-def]
+        return dock._bus_tree._tree_model.item(0)
+
+    reader._controllers = {"Engine": SimpleNamespace(name="Engine")}  # type: ignore[assignment]
+    reader.bus_opening.emit("Engine")
+    assert item().text().startswith("◔  Engine")
+
+    reader._health = {"Engine": (BusHealth.ERRORS, "no ACK")}
+    reader.bus_health_changed.emit("Engine", "errors", "no ACK")
+    row = dock._bus_tree.bus_row("Engine")
+    assert row is not None and row.state == "errors"
+    assert item().text().startswith("▲  Engine")
+    assert item().toolTip().startswith("Bus errors. Check the cable")
+    assert item().foreground().color().name() == tokens["warn"]
+
+    # A detail-only change keeps the row as it is.
+    reader._health = {"Engine": (BusHealth.ERRORS, "error passive")}
+    reader.bus_health_changed.emit("Engine", "errors", "error passive")
+    assert dock._bus_tree.bus_row("Engine") is row
+
+    reader._health = {"Engine": (BusHealth.BUS_OFF, "")}
+    reader.bus_health_changed.emit("Engine", "bus_off", "")
+    assert item().text().startswith("■  Engine")
+    assert item().foreground().color().name() == tokens["err"]
+
+    # The adapter went away: the bus closed, LOST stays.
+    reader._controllers = {}
+    reader._health = {"Engine": (BusHealth.LOST, "")}
+    reader.bus_stopped.emit("Engine")
+    assert item().text().startswith("✕  Engine")
+    assert "Adapter lost" in item().toolTip()

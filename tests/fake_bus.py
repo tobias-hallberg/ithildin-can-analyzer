@@ -9,8 +9,8 @@ exercises that backend's branches without importing a vendor module.
 
 from __future__ import annotations
 
+import queue
 import threading
-import time
 from typing import Any
 
 import can
@@ -24,6 +24,10 @@ class FakeBus(can.BusABC):
 
     * ``send_exc`` / ``recv_exc``: raised by every ``send`` / ``recv``
       while set.
+    * ``rx``: scripted receive. Each queued message is returned once, each
+      queued exception raised once, in order; an empty queue times out.
+    * ``status_code``: what PCAN's ``status()`` reports (0 is OK);
+      ``pcan_error(code)`` is the text PCAN's receive error carries.
     * ``sent``: ``(msg, sending thread, send lock held)`` per send.
     * ``resets`` (PCAN flush) and ``flushes`` (Kvaser flush) count calls;
       ``flush_exc`` makes either raise.
@@ -40,6 +44,8 @@ class FakeBus(can.BusABC):
         self.lock: threading.Lock | None = None
         self.send_exc: Exception | None = None
         self.recv_exc: Exception | None = None
+        self.rx: queue.SimpleQueue[can.Message | Exception] = queue.SimpleQueue()
+        self.status_code = 0
         self.flush_exc: Exception | None = None
         self.sent: list[tuple[can.Message, threading.Thread, bool]] = []
         self.resets = 0
@@ -57,8 +63,19 @@ class FakeBus(can.BusABC):
         self.recv_calls += 1
         if self.recv_exc is not None:
             raise self.recv_exc
-        time.sleep(timeout or 0.0)
-        return None, False
+        try:
+            item = self.rx.get(timeout=timeout or 0.0)
+        except queue.Empty:
+            return None, False
+        if isinstance(item, Exception):
+            raise item
+        return item, False
+
+    def status(self) -> int:
+        return self.status_code
+
+    def _get_formatted_error(self, error: int) -> str:
+        return pcan_error(error)
 
     def reset(self) -> bool:
         if self.flush_exc is not None:
@@ -77,6 +94,10 @@ class FakeBus(can.BusABC):
     def shutdown(self) -> None:
         self.shutdown_calls += 1
         super().shutdown()
+
+
+def pcan_error(code: int) -> str:
+    return f"PCAN error 0x{code:X}."
 
 
 def use_fake_bus(monkeypatch: pytest.MonkeyPatch, fake: FakeBus | None = None) -> FakeBus:
