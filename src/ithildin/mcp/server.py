@@ -82,8 +82,9 @@ def register_read_tools(mcp: FastMCP, ctx: McpReadContext) -> None:
     ) -> list[dict[str, Any]]:
         """Return the last ``count`` captured frames, decoded when a DBC is loaded.
 
-        Filter by raw CAN ID (``message_id``), bus name (``bus``), or epoch
-        seconds (``since_timestamp``, exclusive) to poll for new traffic.
+        Error frames (``is_error``) are never decoded. Filter by raw CAN ID
+        (``message_id``), bus name (``bus``), or epoch seconds
+        (``since_timestamp``, exclusive) to poll for new traffic.
         """
         return tools.get_recent_messages(
             ctx,

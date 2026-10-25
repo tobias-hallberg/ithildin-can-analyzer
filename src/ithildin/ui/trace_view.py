@@ -3,9 +3,13 @@
 """Merged trace tree model — frames as top-level, signals as children.
 
 Replaces ``MessageTraceTreeModel`` and ``BusTraceTreeModel``. The model
-is parameterised by an admission predicate (``admits(bus, aid)``) supplied
-by the owning window from its ``TrackedTreeModel.effective()`` snapshot;
-the model itself stays agnostic to the shape of the subscription.
+is parameterised by an admission predicate (``admits(bus, aid, is_error=)``)
+supplied by the owning window from its ``TrackedTreeModel.effective()``
+snapshot; the model itself stays agnostic to the shape of the subscription.
+
+Error frames are never decoded or expandable. Their Name cell reads "Error
+frame", with "×N" when the capture worker sampled one to stand for N, and
+the ERR counter sums those N.
 
 Two display modes:
 
@@ -61,12 +65,12 @@ Mode = Literal["append", "overwrite"]
 
 
 class AdmitPredicate(Protocol):
-    def __call__(self, bus_name: str, arbitration_id: int) -> bool: ...
+    def __call__(self, bus_name: str, arbitration_id: int, *, is_error: bool = False) -> bool: ...
 
 
 class _AdmitNone:
-    def __call__(self, bus_name: str, arbitration_id: int) -> bool:
-        del bus_name, arbitration_id
+    def __call__(self, bus_name: str, arbitration_id: int, *, is_error: bool = False) -> bool:
+        del bus_name, arbitration_id, is_error
         return False
 
 
@@ -141,10 +145,12 @@ class TraceTreeModel(QAbstractItemModel):
         self._stale_keys: set[tuple[str, int]] = set()
         self._rx_count = 0
         self._err_count = 0
-        # Direction-column tints, and the dim of a row whose bus is closed
-        # or whose Latest ID went quiet; refreshed on theme change.
+        # Direction-column tints, the error-frame Name tint, and the dim of a
+        # row whose bus is closed or whose Latest ID went quiet; refreshed on
+        # theme change.
         self._rx_color = QColor()
         self._tx_color = QColor()
+        self._err_color = QColor()
         self._dim_color = QColor()
         # Held weakly: a lambda on the app-lifetime ThemeManager would keep
         # every replaced model, and its rows and rings, alive.
@@ -228,10 +234,17 @@ class TraceTreeModel(QAbstractItemModel):
         """
         self._admit = admit
         if self._mode == "append":
-            if any(not admit(f.bus_name, f.arbitration_id) for f in self._rows):
+            if any(
+                not admit(f.bus_name, f.arbitration_id, is_error=f.is_error_frame)
+                for f in self._rows
+            ):
                 self.beginResetModel()
                 self._rows = deque(
-                    (f for f in self._rows if admit(f.bus_name, f.arbitration_id)),
+                    (
+                        f
+                        for f in self._rows
+                        if admit(f.bus_name, f.arbitration_id, is_error=f.is_error_frame)
+                    ),
                     maxlen=self._max_rows,
                 )
                 self._row_of_frame.clear()
@@ -244,11 +257,15 @@ class TraceTreeModel(QAbstractItemModel):
                         self._signal_keys.pop(old_id, None)
                 self.endResetModel()
                 self._rx_count = len(self._rows)
-                self._err_count = sum(1 for f in self._rows if f.is_error_frame)
+                self._err_count = sum(f.coalesced for f in self._rows if f.is_error_frame)
                 self.counters_changed.emit(self._rx_count, self._err_count)
             return
         # Overwrite mode: drop stale (bus, aid) entries.
-        stale = [(aid, bus) for (aid, bus) in self._sorted_keys if not admit(bus, aid)]
+        stale = [
+            (aid, bus)
+            for (aid, bus) in self._sorted_keys
+            if not admit(bus, aid, is_error=self._rows_by_key[(bus, aid)].is_error_frame)
+        ]
         if stale:
             self.beginResetModel()
             for aid, bus in stale:
@@ -259,7 +276,8 @@ class TraceTreeModel(QAbstractItemModel):
                 self._delta_for_key.pop((bus, aid), None)
                 self._arrival.pop((bus, aid), None)
                 self._stale_keys.discard((bus, aid))
-            self._sorted_keys = [k for k in self._sorted_keys if admit(k[1], k[0])]
+            gone = set(stale)
+            self._sorted_keys = [k for k in self._sorted_keys if k not in gone]
             self.endResetModel()
 
     def set_decoders(self, decoders: Mapping[str, Decoder | None]) -> None:
@@ -323,7 +341,7 @@ class TraceTreeModel(QAbstractItemModel):
                 continue
             self._cursors[name] = frames[-1].seq
             for f in frames:
-                if not admit(f.bus_name, f.arbitration_id):
+                if not admit(f.bus_name, f.arbitration_id, is_error=f.is_error_frame):
                     continue
                 new_frames.append(f)
         if not new_frames:
@@ -336,7 +354,7 @@ class TraceTreeModel(QAbstractItemModel):
             self._drain_overwrite(new_frames)
 
         self._rx_count += len(new_frames)
-        self._err_count += sum(1 for f in new_frames if f.is_error_frame)
+        self._err_count += sum(f.coalesced for f in new_frames if f.is_error_frame)
         self.counters_changed.emit(self._rx_count, self._err_count)
 
     def _drain_append(self, new_frames: list[FrameRecord]) -> None:
@@ -388,19 +406,28 @@ class TraceTreeModel(QAbstractItemModel):
             sort_key = (f.arbitration_id, f.bus_name)
             pos = bisect.bisect_left(self._sorted_keys, sort_key)
             if pos < len(self._sorted_keys) and self._sorted_keys[pos] == sort_key:
-                old = self._rows_by_key.get(key)
-                if old is not None and old is not f:
+                old = self._rows_by_key[key]
+                if old is not f:
                     self._signal_keys.pop(id(old), None)
-                self._ensure_decoded(f)
-                self._rows_by_key[key] = f
+                decoded = self._ensure_decoded(f)
                 top = self.createIndex(pos, 0, None)
+                # The new frame can carry a different number of signal rows: an
+                # error frame has none, a multiplexed message varies.
+                old_n, new_n = len(old.decoded or ()), len(decoded or ())
+                if new_n < old_n:
+                    self.beginRemoveRows(top, new_n, old_n - 1)
+                elif new_n > old_n:
+                    self.beginInsertRows(top, old_n, new_n - 1)
+                self._rows_by_key[key] = f
+                if new_n < old_n:
+                    self.endRemoveRows()
+                elif new_n > old_n:
+                    self.endInsertRows()
                 bot = self.createIndex(pos, self.columnCount() - 1, None)
                 self.dataChanged.emit(top, bot)
-                decoded = f.decoded
                 if decoded:
-                    parent_idx = self.createIndex(pos, 0, None)
-                    c_top = self.index(0, self.COL_TIME, parent_idx)
-                    c_bot = self.index(len(decoded) - 1, self.COL_TIME, parent_idx)
+                    c_top = self.index(0, self.COL_TIME, top)
+                    c_bot = self.index(len(decoded) - 1, self.COL_TIME, top)
                     if c_top.isValid() and c_bot.isValid():
                         self.dataChanged.emit(c_top, c_bot)
                 continue
@@ -523,7 +550,7 @@ class TraceTreeModel(QAbstractItemModel):
         if parent.parent().isValid():
             return False
         frame = self._frame_at_visible_row(parent.row())
-        if frame is None:
+        if frame is None or frame.is_error_frame:
             return False
         if frame.decoded:
             return True
@@ -560,7 +587,8 @@ class TraceTreeModel(QAbstractItemModel):
         parent = index.parent()
         if role == Qt.ItemDataRole.ForegroundRole:
             # Top-level frame rows only: dim when their bus is closed or their
-            # Latest ID went quiet; otherwise only the direction cell is tinted.
+            # Latest ID went quiet; otherwise only the direction cell and an
+            # error frame's name are tinted.
             if parent.isValid():
                 return None
             frame = self._frame_at_visible_row(index.row())
@@ -571,6 +599,8 @@ class TraceTreeModel(QAbstractItemModel):
                 or (frame.bus_name, frame.arbitration_id) in self._stale_keys
             ):
                 return self._dim_color
+            if col == self.COL_NAME and frame.is_error_frame:
+                return self._err_color
             if col != self.COL_DIR:
                 return None
             return self._rx_color if frame.is_rx else self._tx_color
@@ -606,9 +636,12 @@ class TraceTreeModel(QAbstractItemModel):
         tokens = ThemeManager.instance().current_tokens()
         self._rx_color = QColor(tokens["rx"])
         self._tx_color = QColor(tokens["tx"])
+        self._err_color = QColor(tokens["err"])
         self._dim_color = QColor(tokens["fg_3"])
 
     def _ensure_decoded(self, f: FrameRecord) -> dict[str, Any] | None:
+        if f.is_error_frame:
+            return None
         if f.decoded is not None:
             return f.decoded
         decoder = self._decoders.get(f.bus_name)
@@ -639,6 +672,8 @@ class TraceTreeModel(QAbstractItemModel):
         if col == self.COL_DATA:
             return f.data.hex(" ").upper()
         if col == self.COL_NAME:
+            if f.is_error_frame:
+                return "Error frame" if f.coalesced == 1 else f"Error frame ×{f.coalesced}"
             key = (f.bus_name, f.arbitration_id)
             cached = self._name_cache.get(key)
             if cached is None:

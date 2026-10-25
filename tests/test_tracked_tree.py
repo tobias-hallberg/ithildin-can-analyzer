@@ -58,6 +58,24 @@ def test_msg_subscription_admits_only_that_id_on_that_bus(qapp) -> None:  # type
     assert not eff.admits("CAN_2", 0x100)
 
 
+def test_error_frames_only_admitted_by_bus_subscription(qapp) -> None:  # type: ignore[no-untyped-def]
+    """An error frame's ID is an error class: DBC and message sets never match it."""
+    model = TrackedTreeModel()
+    path = Path("/tmp/example.dbc")
+    model.recompute({path: frozenset({0x100, 0x200})})
+    model.add_dbc("CAN_1", path)
+    model.add_message(
+        bus_name="CAN_2", dbc_path=path, message_id=0x100, message_name="EngineCommand"
+    )
+    model.add_bus("CAN_3")
+    eff = model.effective()
+    assert eff.admits("CAN_1", 0x100)
+    assert not eff.admits("CAN_1", 0x100, is_error=True)
+    assert eff.admits("CAN_2", 0x100)
+    assert not eff.admits("CAN_2", 0x100, is_error=True)
+    assert eff.admits("CAN_3", 0x100, is_error=True)
+
+
 def test_redundant_drops_are_silent_no_ops(qapp) -> None:  # type: ignore[no-untyped-def]
     model = TrackedTreeModel()
     path = Path("/tmp/a.dbc")

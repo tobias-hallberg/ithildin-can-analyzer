@@ -170,9 +170,15 @@ def test_value_cell_shows_enum_name(  # type: ignore[no-untyped-def]
 # ---- Staleness ----
 
 
-def _speed_frame(ts: float = 0.0) -> FrameRecord:
+def _speed_frame(ts: float = 0.0, *, is_error_frame: bool = False) -> FrameRecord:
     payload = (6400).to_bytes(2, "little") + (700).to_bytes(2, "little") + bytes(4)
-    return FrameRecord(bus_name="CAN_1", timestamp=ts, arbitration_id=0x100, data=payload)
+    return FrameRecord(
+        bus_name="CAN_1",
+        timestamp=ts,
+        arbitration_id=0x100,
+        data=payload,
+        is_error_frame=is_error_frame,
+    )
 
 
 def _data_view_on_silent_bus(qtbot, tmp_path: Path, dbc: Path):  # type: ignore[no-untyped-def]
@@ -240,3 +246,21 @@ def test_rebuilt_table_reapplies_the_dim(  # type: ignore[no-untyped-def]
     win.add_signal("BodyStatus.VehicleSpeed")
     win._refresh_staleness()
     assert _is_dim(win)
+
+
+def test_error_frame_with_a_dbc_id_is_not_decoded(  # type: ignore[no-untyped-def]
+    qapp, qtbot, tmp_path: Path, example_dbc_path: Path
+) -> None:
+    ctx = make_app_context(tmp_path)
+    ctx.database.add_dbc(example_dbc_path, ["CAN_1"])
+    win = DataViewWindow(instance_id="d1")
+    qtbot.addWidget(win)
+    win.bind(ctx)
+    win.add_signal("EngineCommand.EngineSpeed")
+
+    err = _speed_frame(is_error_frame=True)
+    win._on_frames_received([err])
+    assert err.decoded is None
+    assert win._rows["EngineCommand.EngineSpeed"].last is None
+    win._on_frames_received([_speed_frame()])
+    assert win._rows["EngineCommand.EngineSpeed"].last == 800.0

@@ -108,3 +108,30 @@ def test_decoded_table_populates_when_dbc_loaded(
     assert raw_idle == "700"
     assert phys_idle == "700"
     assert unit_idle == "rpm"
+
+
+def test_error_frame_shows_no_decode(  # type: ignore[no-untyped-def]
+    qapp, qtbot, tmp_path: Path, example_dbc_path: Path
+) -> None:
+    ctx = make_app_context(tmp_path)
+    ctx.database.add_dbc(example_dbc_path, ["CAN_1"])
+    view = FrameInspectorView()
+    qtbot.addWidget(view)
+    view.bind(ctx)
+    raw = (6400).to_bytes(2, "little") + (700).to_bytes(2, "little") + bytes(4)
+    view.set_frame(FrameRecord(bus_name="CAN_1", timestamp=0.0, arbitration_id=0x100, data=raw))
+    assert view._table.rowCount() == 2
+
+    err = FrameRecord(
+        bus_name="CAN_1",
+        timestamp=0.0,
+        arbitration_id=0x100,
+        data=raw,
+        is_error_frame=True,
+        coalesced=12,
+    )
+    view.set_frame(err)
+    assert view._name_val.text() == "Error frame ×12"
+    assert view._sender_val.text() == "—"
+    assert view._table.rowCount() == 0
+    assert err.decoded is None

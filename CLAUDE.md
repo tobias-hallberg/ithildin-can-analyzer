@@ -57,7 +57,15 @@ MCP layer (`src/ithildin/mcp/`):
 - **Decode lazily, in every consumer.** Plot, Monitor, Trace each receive
   full `frames_received` batches at 60 Hz from `BusReader`. Filter to
   IDs of interest *first*, then decode. Decoding everything every tick
-  melts the GUI thread.
+  melts the GUI thread. A batch carries at most 8192 frames per bus
+  (`_MAX_FANOUT_PER_BUS`); after a stall the older backlog is skipped and
+  reported through `frames_dropped`, never caught up on.
+- **Consumers skip error frames before decoding.** An error frame's
+  `arbitration_id` is an error class, not a DBC message ID, and a sampled
+  one stands for `FrameRecord.coalesced` error frames. Every view and MCP
+  read tool checks `is_error_frame` before any decode. Only a whole-bus
+  subscription admits error frames: every caller of
+  `_Effective.admits(bus, aid, *, is_error=)` passes `is_error`.
 - **MCP allowlist is the only send path.** Never bypass
   `AllowlistStore.check_*()`. The audit log must record both allow and
   deny outcomes.

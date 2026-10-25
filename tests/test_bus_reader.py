@@ -14,6 +14,8 @@ from PySide6.QtCore import QDeadlineTimer
 
 from ithildin.app_state.bus_reader import BusReader, BusReadOnlyError
 from ithildin.core.bus import BusController
+from ithildin.core.ringbuf import RingBuffer
+from ithildin.core.types import FrameRecord
 from ithildin.workspace.schema import BusConfig
 from tests.conftest import kill_capture
 from tests.fake_bus import FakeBus, use_fake_bus
@@ -500,3 +502,75 @@ def test_refused_open_keeps_the_session(qapp, qtbot, monkeypatch, reader) -> Non
     finally:
         with qtbot.waitSignal(reader.bus_released, timeout=2000):
             fake.block.set()
+
+
+def _flood(ring: RingBuffer, count: int) -> None:
+    for i in range(count):
+        ring.append(
+            FrameRecord(bus_name="CAN_1", timestamp=float(i), arbitration_id=0x100, data=b"")
+        )
+
+
+def _fan_out_spy(reader: BusReader) -> tuple[list[list[FrameRecord]], list[tuple[str, int]]]:
+    batches: list[list[FrameRecord]] = []
+    dropped: list[tuple[str, int]] = []
+    reader.frames_received.connect(batches.append)
+    reader.frames_dropped.connect(lambda name, count: dropped.append((name, count)))
+    return batches, dropped
+
+
+def test_fan_out_caps_a_backlog_and_reports_the_skip(qapp, qtbot, reader) -> None:  # type: ignore[no-untyped-def]
+    _open(reader, qtbot, _virtual())
+    reader._timer.stop()
+    batches, dropped = _fan_out_spy(reader)
+
+    _flood(reader.rings["CAN_1"], 10_000)
+    reader._fan_out()
+    assert [len(b) for b in batches] == [8192]
+    assert batches[0][-1].seq == 9999
+    assert dropped == [("CAN_1", 1808)]
+
+
+def test_fan_out_reports_ring_overrun(qapp, qtbot, reader) -> None:  # type: ignore[no-untyped-def]
+    _open(reader, qtbot, _virtual())
+    reader._timer.stop()
+    batches, dropped = _fan_out_spy(reader)
+
+    _flood(reader.rings["CAN_1"], 70_000)
+    reader._fan_out()
+    assert [len(b) for b in batches] == [8192]
+    assert dropped == [("CAN_1", 70_000 - 8192)]
+
+
+def test_fan_out_silent_when_keeping_up(qapp, qtbot, reader) -> None:  # type: ignore[no-untyped-def]
+    _open(reader, qtbot, _virtual())
+    reader._timer.stop()
+    batches, dropped = _fan_out_spy(reader)
+    ring = reader.rings["CAN_1"]
+
+    for _ in range(2):
+        _flood(ring, 8192)
+        reader._fan_out()
+    assert [len(b) for b in batches] == [8192, 8192]
+    assert dropped == []
+
+
+def test_session_t0_is_the_first_frame_of_a_capped_backlog(qapp, qtbot, reader) -> None:  # type: ignore[no-untyped-def]
+    _open(reader, qtbot, _virtual())
+    reader._timer.stop()
+    _fan_out_spy(reader)
+
+    _flood(reader.rings["CAN_1"], 10_000)
+    reader._fan_out()
+    assert reader.session_t0 == 0.0
+
+
+def test_fan_out_skip_silent_without_frame_listeners(qapp, qtbot, reader) -> None:  # type: ignore[no-untyped-def]
+    _open(reader, qtbot, _virtual())
+    reader._timer.stop()
+    dropped: list[tuple[str, int]] = []
+    reader.frames_dropped.connect(lambda name, count: dropped.append((name, count)))
+
+    _flood(reader.rings["CAN_1"], 10_000)
+    reader._fan_out()
+    assert dropped == []

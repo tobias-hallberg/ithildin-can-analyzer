@@ -245,7 +245,7 @@ class RecordWindow(ChildView):
         eff = self._tracked_pane.effective()
         if not eff.bus_all and not eff.bus_dbc_ids and not eff.bus_msg_ids:
             return True
-        return eff.admits(frame.bus_name, frame.arbitration_id)
+        return eff.admits(frame.bus_name, frame.arbitration_id, is_error=frame.is_error_frame)
 
     # ---- Persistence ----
 

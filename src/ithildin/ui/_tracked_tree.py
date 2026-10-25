@@ -6,9 +6,12 @@ Three node kinds: ``bus``, ``dbc``, ``msg``. The tree mirrors the natural
 data model — buses contain DBCs, DBCs contain messages. Each tracked
 root admits frames at its level:
 
-- ``bus`` admits every frame on that bus (decoded or not).
+- ``bus`` admits every frame on that bus (decoded or not), error frames too.
 - ``dbc`` admits frames whose arbitration ID is defined by the DBC.
 - ``msg`` admits frames whose arbitration ID equals that message's.
+
+An error frame's arbitration ID is an error class, not a message ID, so
+only a ``bus`` subscription admits it.
 
 After every tree mutation an ``_Effective`` snapshot is recomputed so
 the model's hot-path ``_admit`` is a couple of set lookups.
@@ -105,9 +108,11 @@ class _Effective:
     bus_dbc_ids: dict[str, frozenset[int]] = field(default_factory=dict)
     bus_msg_ids: dict[str, frozenset[int]] = field(default_factory=dict)
 
-    def admits(self, bus_name: str, arbitration_id: int) -> bool:
+    def admits(self, bus_name: str, arbitration_id: int, *, is_error: bool = False) -> bool:
         if bus_name in self.bus_all:
             return True
+        if is_error:
+            return False
         ids = self.bus_dbc_ids.get(bus_name)
         if ids is not None and arbitration_id in ids:
             return True

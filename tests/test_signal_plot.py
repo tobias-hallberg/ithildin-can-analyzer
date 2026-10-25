@@ -598,3 +598,35 @@ def test_new_session_clears_plot(  # type: ignore[no-untyped-def]
     with qtbot.waitSignal(ctx.bus_reader.bus_started, timeout=2000):
         ctx.bus_reader.open(cfg)
         assert len(curve.values) == 0
+
+
+def _engine_frame(raw: int, *, is_error_frame: bool = False) -> FrameRecord:
+    payload = raw.to_bytes(2, "little") + (700).to_bytes(2, "little") + bytes(4)
+    return FrameRecord(
+        bus_name="CAN_1",
+        timestamp=1.0,
+        arbitration_id=0x100,
+        data=payload,
+        is_error_frame=is_error_frame,
+    )
+
+
+def test_error_frame_with_a_dbc_id_is_not_plotted(  # type: ignore[no-untyped-def]
+    qapp, qtbot, tmp_path: Path, example_dbc_path: Path
+) -> None:
+    ctx = make_app_context(tmp_path)
+    ctx.database.add_dbc(example_dbc_path, ["CAN_1"])
+    ctx.bus_reader._session_t0 = 0.0
+    win = SignalPlotWindow(instance_id="p1")
+    qtbot.addWidget(win)
+    win.bind(ctx)
+    win.add_signal(_SPEED)
+    curve = win._curves[_SPEED]
+
+    err = _engine_frame(6400, is_error_frame=True)
+    win._on_frames_received([err])
+    assert len(curve.values) == 0
+    assert err.decoded is None
+
+    win._on_frames_received([_engine_frame(6400)])
+    assert list(curve.values) == [800.0]

@@ -136,8 +136,8 @@ def get_recent_messages(
 
     Filters: ``message_id`` (raw CAN ID), ``bus`` (name), and
     ``since_timestamp`` (epoch seconds, exclusive). Frames are decoded if
-    a DBC is loaded for the originating bus. Multi-bus aware: reads every
-    open ring and merges by timestamp.
+    a DBC is loaded for the originating bus; error frames never are.
+    Multi-bus aware: reads every open ring and merges by timestamp.
     """
     rings = ctx.bus_reader.rings
     if bus is not None:
@@ -162,7 +162,8 @@ def get_recent_messages(
 
     out: list[dict[str, Any]] = []
     for frame in frames:
-        decoder = ctx.database.decoder_for_bus(frame.bus_name)
+        # An error frame's ID is an error class, not a DBC message ID.
+        decoder = None if frame.is_error_frame else ctx.database.decoder_for_bus(frame.bus_name)
         decoded = decoder.decode(frame.arbitration_id, frame.data) if decoder else None
         message_name = decoder.message_name(frame.arbitration_id) if decoder else None
         out.append(
@@ -318,7 +319,7 @@ def get_signal_value(ctx: McpReadContext, signal_path: str) -> dict[str, Any] | 
     # Newest first: the first frame carrying this signal wins, so a busy
     # ring costs one decode rather than one per frame.
     for frame in reversed(frames):
-        if frame.arbitration_id != message_id:
+        if frame.is_error_frame or frame.arbitration_id != message_id:
             continue
         decoded = decoder.decode(frame.arbitration_id, frame.data)
         if not decoded or signal_name not in decoded:

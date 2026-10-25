@@ -11,6 +11,7 @@ import can
 
 from ithildin.app_state.bus_reader import BusReader
 from ithildin.app_state.database import Database
+from ithildin.core.types import FrameRecord
 from ithildin.mcp.audit import AuditWriter
 from ithildin.mcp.permissions import AllowlistStore, AllowRule
 from ithildin.mcp.tools import (
@@ -406,3 +407,63 @@ def test_signal_metadata_reports_bit_range_and_multiplexing(
         240: "Set_max_voltage",
     }
     assert by_name["Set_max_voltage"]["multiplexer_ids"] == [240]
+
+
+def _engine_frame(raw: int, ts: float, *, is_error_frame: bool = False) -> FrameRecord:
+    payload = raw.to_bytes(2, "little") + (700).to_bytes(2, "little") + bytes(4)
+    return FrameRecord(
+        bus_name="CAN_1",
+        timestamp=ts,
+        arbitration_id=0x100,
+        data=payload,
+        is_error_frame=is_error_frame,
+    )
+
+
+def _open_virtual(ctx: McpReadContext, qtbot) -> None:  # type: ignore[no-untyped-def]
+    cfg = BusConfig(
+        name="CAN_1", interface="virtual", channel=f"t-{uuid.uuid4().hex[:6]}", bitrate=500000
+    )
+    with qtbot.waitSignal(ctx.bus_reader.bus_started, timeout=2000):
+        ctx.bus_reader.open(cfg)
+
+
+def test_get_recent_messages_does_not_decode_error_frames(  # type: ignore[no-untyped-def]
+    qapp, qtbot, tmp_path: Path, example_dbc_path: Path
+) -> None:
+    ctx = _make_ctx(tmp_path)
+    ctx.database.add_dbc(example_dbc_path, ["CAN_1"])
+    _open_virtual(ctx, qtbot)
+    try:
+        ring = ctx.bus_reader.rings["CAN_1"]
+        ring.append(_engine_frame(6400, 1.0))
+        ring.append(_engine_frame(6400, 2.0, is_error_frame=True))
+
+        data, err = get_recent_messages(ctx, count=10)
+        assert data["message"] == "EngineCommand"
+        assert data["decoded"]["EngineSpeed"] == 800
+        assert err["is_error"] is True
+        assert err["message"] is None
+        assert err["decoded"] is None
+    finally:
+        ctx.bus_reader.close()
+
+
+def test_get_signal_value_skips_error_frames(  # type: ignore[no-untyped-def]
+    qapp, qtbot, tmp_path: Path, example_dbc_path: Path
+) -> None:
+    """A newer error frame with the message's ID doesn't hide the last real value."""
+    ctx = _make_ctx(tmp_path)
+    ctx.database.add_dbc(example_dbc_path, ["CAN_1"])
+    _open_virtual(ctx, qtbot)
+    try:
+        ring = ctx.bus_reader.rings["CAN_1"]
+        ring.append(_engine_frame(6400, 1.0))
+        ring.append(_engine_frame(8000, 2.0, is_error_frame=True))
+
+        out = get_signal_value(ctx, "EngineCommand.EngineSpeed")
+        assert out is not None
+        assert out["value"] == 800
+        assert out["timestamp"] == 1.0
+    finally:
+        ctx.bus_reader.close()

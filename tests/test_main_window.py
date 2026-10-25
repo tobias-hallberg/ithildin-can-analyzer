@@ -803,3 +803,20 @@ def test_new_project_closes_and_forgets_buses(  # type: ignore[no-untyped-def]
     assert ctx.bus_reader.last_configs() == []
     assert win._status_left.text() == "Disconnected"
     assert win._connect_action.text() == "Connect"
+
+
+def test_fan_out_skip_reported_as_warning(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    ctx = make_app_context(tmp_path)
+    win = MainWindow(bus_reader=ctx.bus_reader, database=ctx.database, prompt_on_close=False)
+    qtbot.addWidget(win)
+    win.bind_events(ctx)
+
+    ctx.bus_reader.frames_dropped.emit("CAN_1", 1808)
+    assert (
+        win._report_widget.item(0)
+        .text()
+        .endswith(
+            "Plots, monitors and data views skipped 1808 frames on CAN_1 to catch up after a stall"
+        )
+    )
+    assert not win._report_dock.isHidden()

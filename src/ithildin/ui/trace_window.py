@@ -341,6 +341,10 @@ class TraceWindow(ChildView):
         self._counts_label = QLabel("RX 0   ERR 0", right)
         self._counts_label.setFont(tabular_font())
         self._counts_label.setStyleSheet("color: palette(mid);")
+        self._counts_label.setToolTip(
+            "RX: frames this trace admitted. ERR: error frames among them, counting "
+            "each sampled one as every error frame it stands for."
+        )
         strip.add_widget(self._counts_label)
 
         self._toggle_left_btn = strip.add_pane_toggle(

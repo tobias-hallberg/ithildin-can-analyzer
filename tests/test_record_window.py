@@ -9,6 +9,7 @@ from pathlib import Path
 
 import can
 
+from ithildin.core.types import FrameRecord
 from ithildin.ui.record_window import RecordWindow
 from ithildin.workspace.schema import BusConfig
 from tests.conftest import kill_capture, make_app_context
@@ -211,3 +212,29 @@ def test_lost_frames_shown_and_reported_on_stop(qapp, qtbot, tmp_path: Path) -> 
     assert win._counts_label.text().endswith("LOST 3")
     assert reports == [(f"Recording to {out_path} finished with 3 frames lost", "warn")]
     ctx.bus_reader.close()
+
+
+def test_error_frames_recorded_only_by_bus_subscription(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    win = RecordWindow(instance_id="r1")
+    qtbot.addWidget(win)
+    win.bind(make_app_context(tmp_path))
+    data = FrameRecord(bus_name="CAN_1", timestamp=0.0, arbitration_id=0x100, data=b"")
+    err = FrameRecord(
+        bus_name="CAN_1", timestamp=0.0, arbitration_id=0x100, data=b"", is_error_frame=True
+    )
+    # No subscription records everything.
+    assert win._admit(err)
+
+    pane = win._tracked_pane
+    assert pane is not None
+    pane.model.add_message(
+        bus_name="CAN_1",
+        dbc_path=tmp_path / "example.dbc",
+        message_id=0x100,
+        message_name="EngineCommand",
+    )
+    assert win._admit(data)
+    assert not win._admit(err)
+
+    pane.model.add_bus("CAN_1")
+    assert win._admit(err)

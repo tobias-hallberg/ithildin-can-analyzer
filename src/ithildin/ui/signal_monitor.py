@@ -512,7 +512,7 @@ class SignalMonitorWindow(ChildView):
         self._refresh_staleness()
 
     def _ingest_frame(self, frame: FrameRecord, wanted_messages: set[str], now: float) -> None:
-        if self._ctx is None:
+        if self._ctx is None or frame.is_error_frame:
             return
         decoder = self._ctx.database.decoder_for_bus(frame.bus_name)
         if decoder is None:

@@ -509,6 +509,7 @@ class MainWindow(QMainWindow):
             # Bound slots, so the off-GUI-thread send_failed is queued here.
             self._bus.send_failed.connect(self._on_send_failed)
             self._bus.cyclic_failed.connect(self._on_cyclic_failed)
+            self._bus.frames_dropped.connect(self._on_frames_dropped)
         if self._db is not None:
             self._db.error.connect(lambda msg: self.report(msg, kind="error"))
         self._refresh_connect_action()
@@ -584,6 +585,14 @@ class MainWindow(QMainWindow):
     @Slot(str, int, str)
     def _on_cyclic_failed(self, bus_name: str, message_id: int, error: str) -> None:
         self.report(f"Periodic TX 0x{message_id:X} on {bus_name} stopped: {error}", kind="error")
+
+    @Slot(str, int)
+    def _on_frames_dropped(self, bus_name: str, count: int) -> None:
+        self.report(
+            f"Plots, monitors and data views skipped {count} frames on {bus_name} "
+            "to catch up after a stall",
+            kind="warn",
+        )
 
     @Slot(str, str)
     def _on_report_requested(self, message: str, kind: str) -> None:

@@ -1302,7 +1302,7 @@ class _SubPlot(QObject):
     # ---- Ingest ----
 
     def ingest_frame(self, frame: FrameRecord) -> None:
-        if self._ctx is None or not self._curves:
+        if self._ctx is None or not self._curves or frame.is_error_frame:
             return
         aids = self._wanted_aids_for_bus(frame.bus_name)
         if frame.arbitration_id not in aids:

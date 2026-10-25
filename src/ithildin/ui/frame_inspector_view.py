@@ -213,8 +213,12 @@ class FrameInspectorView(QWidget):
         else:
             self._id_val.setText(f"0x{frame.arbitration_id:03X} ({frame.arbitration_id})")
 
-        message = self._lookup_message(frame)
-        name = message.name if message is not None else ""
+        if frame.is_error_frame:
+            message = None
+            name = "Error frame" if frame.coalesced == 1 else f"Error frame ×{frame.coalesced}"
+        else:
+            message = self._lookup_message(frame)
+            name = message.name if message is not None else ""
         self._name_val.setText(name or "—")
         self._dlc_val.setText(str(len(frame.data)))
         # Direction is RX in v0.1 (TX paths land with MCP in Stage 1.D).

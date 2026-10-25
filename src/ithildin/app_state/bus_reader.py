@@ -6,7 +6,10 @@ Holds a dict of ``BusController`` keyed by bus name; one ``QTimer``
 fans out frames from every ring at ~60 Hz batched into a single
 ``frames_received(list[FrameRecord])`` emission. ``FrameRecord`` already
 carries ``bus_name`` per frame, so consumers that decode per-frame
-work unchanged across multiple live buses.
+work unchanged across multiple live buses. A tick carries at most
+``_MAX_FANOUT_PER_BUS`` frames per bus: after a stall the consumers skip
+the older backlog, reported through ``frames_dropped``, instead of
+catching up on it.
 
 Single-bus convenience properties (``bus_name``, ``ring``,
 ``last_config``) return the value when exactly one bus is open and
@@ -24,7 +27,7 @@ from typing import cast
 
 import can
 from can.broadcastmanager import ThreadBasedCyclicSendTask
-from PySide6.QtCore import QDeadlineTimer, QObject, QTimer, Signal, Slot
+from PySide6.QtCore import QDeadlineTimer, QMetaMethod, QObject, QTimer, Signal, Slot
 
 from ithildin.core.bus import BusController, BusWorker
 from ithildin.core.ringbuf import RingBuffer
@@ -35,6 +38,9 @@ _log = logging.getLogger(__name__)
 
 _RING_CAPACITY = 1 << 16
 _FANOUT_HZ = 60
+# Caps one slot's work after a GUI stall: catching up on the whole backlog
+# in one batch would stall the GUI thread again, for longer.
+_MAX_FANOUT_PER_BUS = 8_192
 
 
 class BusReadOnlyError(RuntimeError):
@@ -49,6 +55,10 @@ class BusReader(QObject):
     """Multi-bus capture singleton with a 60 Hz fan-out timer."""
 
     frames_received = Signal(list)
+    # Frames frames_received never carried: a backlog past _MAX_FANOUT_PER_BUS,
+    # or frames the ring overwrote before the fan-out read them. Silent while
+    # nothing listens to frames_received, as then no view missed them.
+    frames_dropped = Signal(str, int)  # bus_name, frame count
     # open() registered the bus; bus_started follows once the adapter is up.
     bus_opening = Signal(str)  # bus name
     bus_started = Signal(str)
@@ -524,13 +534,18 @@ class BusReader(QObject):
         batch: list[FrameRecord] = []
         for bus_name, ring in self._rings.items():
             cursor = self._cursors.get(bus_name, -1)
-            frames, _dropped = ring.read_since(cursor)
+            frames, dropped = ring.read_since(cursor)
             if not frames:
                 continue
             self._cursors[bus_name] = frames[-1].seq
+            if self._session_t0 is None:
+                self._session_t0 = frames[0].timestamp
+                self.session_t0_changed.emit(self._session_t0)
+            if len(frames) > _MAX_FANOUT_PER_BUS:
+                dropped += len(frames) - _MAX_FANOUT_PER_BUS
+                frames = frames[-_MAX_FANOUT_PER_BUS:]
+            if dropped and self.isSignalConnected(QMetaMethod.fromSignal(self.frames_received)):
+                self.frames_dropped.emit(bus_name, dropped)
             batch.extend(frames)
         if batch:
-            if self._session_t0 is None:
-                self._session_t0 = batch[0].timestamp
-                self.session_t0_changed.emit(self._session_t0)
             self.frames_received.emit(batch)
