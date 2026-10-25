@@ -167,6 +167,25 @@ def test_bus_name_filter_matches(tmp_path: Path) -> None:
     assert off_bus.allowed is False
 
 
+def test_bus_scoped_rule_requires_explicit_bus(tmp_path: Path) -> None:
+    """With no bus named, the frame goes wherever send_message sends it, so a
+    rule for one bus can't vouch for it."""
+    store = _store(tmp_path)
+    store.add_rule(AllowRule(id=0, message_id=0x100, signal="*", bus_name="CAN_1"))
+    unnamed = store.check_frame(SendFrameRequest(message_id=0x100))
+    assert unnamed.allowed is False
+    assert unnamed.reason == "NO_RULE"
+    unnamed_signal = store.check_signal(
+        SendSignalRequest(message_id=0x100, signal="EngineSpeed", value=800.0)
+    )
+    assert unnamed_signal.reason == "NO_RULE"
+
+    any_bus = store.add_rule(AllowRule(id=0, message_id=0x100, signal="*"))
+    decision = store.check_frame(SendFrameRequest(message_id=0x100))
+    assert decision.allowed is True
+    assert decision.rule_id == any_bus.id
+
+
 def test_save_load_roundtrip(tmp_path: Path) -> None:
     store = _store(tmp_path)
     rule = store.add_rule(

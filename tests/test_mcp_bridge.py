@@ -19,15 +19,18 @@ from __future__ import annotations
 import logging
 import socket
 import sys
+import threading
 from pathlib import Path
 
+import can
 import pytest
 
 from ithildin.app_state.bus_reader import BusReader
 from ithildin.app_state.database import Database
+from ithildin.mcp.audit import AuditWriter
 from ithildin.mcp.bridge import McpServerBridge
-from ithildin.mcp.permissions import AllowlistStore
-from ithildin.mcp.tools import McpReadContext
+from ithildin.mcp.permissions import AllowlistStore, AllowRule
+from ithildin.mcp.tools import McpReadContext, McpWriteContext
 
 
 def _free_port() -> int:
@@ -248,3 +251,84 @@ def test_real_client_lists_and_calls_tools(qtbot, bridge: McpServerBridge) -> No
     assert "list_messages" in names
     # No bus open in this fixture, so the tool reports closed.
     assert "false" in called.lower() or "False" in called
+
+
+def test_stop_during_stalled_send_returns(qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    """A send stuck in the driver must not keep the server from stopping; it
+    still writes its audit line once the driver returns."""
+    import asyncio
+    import contextlib
+    import json
+
+    import httpx
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamable_http_client
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    def stalled(_msg: can.Message, _bus: str | None = None) -> None:
+        entered.set()
+        release.wait(10)
+
+    read = _make_read_ctx(tmp_path)
+    read.allowlist.add_rule(AllowRule(id=0, message_id=0x100, signal="*"))
+    audit_path = tmp_path / "audit.jsonl"
+    write = McpWriteContext(read=read, audit=AuditWriter(audit_path), send=stalled)
+    bridge = McpServerBridge(read, write_ctx=write)
+    with qtbot.waitSignal(bridge.started, timeout=5000) as started:
+        bridge.start(host="127.0.0.1", port=_free_port())
+    url = started.args[0]
+    headers = {"Authorization": f"Bearer {bridge.token}"}
+
+    server_gone = threading.Event()
+
+    async def drive() -> None:
+        async with (
+            httpx.AsyncClient(headers=headers) as http_client,
+            streamable_http_client(url, http_client=http_client, terminate_on_close=False) as (
+                r,
+                w,
+                _,
+            ),
+            ClientSession(r, w) as session,
+        ):
+            await session.initialize()
+            call = asyncio.create_task(
+                session.call_tool(
+                    "send_frame", {"message_id": 0x100, "data_hex": "01", "bus": "CAN_1"}
+                )
+            )
+            await asyncio.to_thread(server_gone.wait, 10)
+            call.cancel()
+            # The server went away under this call on purpose; how the
+            # client reports that doesn't matter here.
+            with contextlib.suppress(BaseException):
+                await call
+
+    def run_client() -> None:
+        with contextlib.suppress(BaseException):
+            asyncio.run(asyncio.wait_for(drive(), 15))
+
+    client = threading.Thread(target=run_client, name="mcp-test-client", daemon=True)
+    client.start()
+    try:
+        assert entered.wait(10)
+        with qtbot.waitSignal(bridge.stopped, timeout=5000):
+            assert bridge.stop(wait_s=6.0) is True
+    finally:
+        server_gone.set()
+        release.set()
+        client.join(15)
+        if bridge.is_running:
+            bridge.stop(wait_s=5.0)
+    assert not client.is_alive()
+
+    def lines() -> list[dict[str, object]]:
+        if not audit_path.exists():
+            return []
+        return [json.loads(x) for x in audit_path.read_text(encoding="utf-8").splitlines()]
+
+    qtbot.waitUntil(lambda: len(lines()) == 1, timeout=5000)
+    (line,) = lines()
+    assert (line["decision"], line["outcome"]) == ("ALLOW", "SENT")

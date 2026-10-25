@@ -17,8 +17,10 @@ itself.
 
 from __future__ import annotations
 
+from functools import partial
 from typing import Any
 
+from anyio import CapacityLimiter, to_thread
 from mcp.server.fastmcp import FastMCP
 
 from ithildin.mcp import tools
@@ -65,7 +67,12 @@ def register_read_tools(mcp: FastMCP, ctx: McpReadContext) -> None:
 
     @mcp.tool()
     def list_buses() -> list[dict[str, Any]]:
-        """List currently-known CAN buses with their live status."""
+        """List the open CAN buses with their status.
+
+        ``status`` is ``opening`` until the adapter is up, then ``live``, or
+        ``errors`` / ``bus_off`` / ``lost`` while the bus is degraded (see
+        ``status_detail``). Sends to a degraded bus are refused.
+        """
         return tools.list_buses(ctx)
 
     @mcp.tool()
@@ -126,15 +133,27 @@ def register_read_tools(mcp: FastMCP, ctx: McpReadContext) -> None:
 
     @mcp.tool()
     def get_audit_log(count: int = 50, agent: str | None = None) -> list[dict[str, Any]]:
-        """Tail of the send-decision audit log — why a send was allowed or denied."""
+        """Tail of the send audit log, one line per send attempt.
+
+        ``decision`` (ALLOW / DENY) and ``reason`` say why the allowlist let a
+        send through or not; ``outcome`` says what happened to the frame:
+        SENT (the driver accepted it), SEND_FAILED, NOT_SENT, DRY_RUN or
+        UNKNOWN.
+        """
         return tools.get_audit_log(ctx, count=count, agent=agent)
 
 
 def register_write_tools(mcp: FastMCP, ctx: McpWriteContext) -> None:
     """Register the write tools. Every send routes through the allowlist."""
+    # Sends run on a worker thread, so a stalled driver can't block read tools
+    # or the bridge's shutdown, and one at a time, so the audit order is the
+    # send order. A cancelled call abandons its thread, which still writes its
+    # audit line; the next send, or one on a restarted server, can then start
+    # beside it, and on the same bus waits for it at the send lock.
+    sends = CapacityLimiter(1)
 
     @mcp.tool()
-    def send_signal(
+    async def send_signal(
         message: str,
         signal: str,
         value: int | float,
@@ -143,21 +162,44 @@ def register_write_tools(mcp: FastMCP, ctx: McpWriteContext) -> None:
     ) -> dict[str, Any]:
         """Encode + send one signal value (DBC-validated, allowlist-gated).
 
-        ``bus`` is required only when more than one bus is open. Pass
-        integers as JSON integers so 64-bit signals keep every bit. Sending
-        a multiplexed signal sets its selector to that signal's branch.
+        ``bus`` may be omitted only while exactly one bus is open; otherwise
+        the send is refused with reason NO_BUS. Pass integers as JSON
+        integers so 64-bit signals keep every bit. Sending a multiplexed
+        signal sets its selector to that signal's branch. ``ok`` is false
+        with reason BUS_UNHEALTHY while the bus is degraded; retry once
+        list_buses shows it live.
         """
-        return tools.send_signal(ctx, message, signal, value, agent=agent, bus=bus)
+        return await to_thread.run_sync(
+            partial(tools.send_signal, ctx, message, signal, value, agent=agent, bus=bus),
+            abandon_on_cancel=True,
+            limiter=sends,
+        )
 
     @mcp.tool()
-    def send_frame(
+    async def send_frame(
         message_id: int,
         data_hex: str,
         is_extended: bool = False,
         agent: str = "",
         bus: str | None = None,
     ) -> dict[str, Any]:
-        """Send a raw frame by CAN ID + hex payload. Needs a wildcard rule."""
-        return tools.send_frame(
-            ctx, message_id, data_hex, is_extended=is_extended, agent=agent, bus=bus
+        """Send a raw frame by CAN ID + hex payload. Needs a wildcard rule.
+
+        ``bus`` may be omitted only while exactly one bus is open; otherwise
+        the send is refused with reason NO_BUS. ``ok`` is false with reason
+        BUS_UNHEALTHY while the bus is degraded; retry once list_buses shows
+        it live.
+        """
+        return await to_thread.run_sync(
+            partial(
+                tools.send_frame,
+                ctx,
+                message_id,
+                data_hex,
+                is_extended=is_extended,
+                agent=agent,
+                bus=bus,
+            ),
+            abandon_on_cancel=True,
+            limiter=sends,
         )

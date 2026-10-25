@@ -62,6 +62,9 @@ if TYPE_CHECKING:
 
 _AUDIT_TAIL_LIMIT = 5000
 _AUDIT_POLL_MS = 1000
+# The first read of a log (rotation lets it reach 50 MB) starts this far
+# from its end: it runs on the GUI thread.
+_AUDIT_TAIL_BYTES = 2 * 1024 * 1024
 
 
 class McpDialog(QDialog):
@@ -338,15 +341,22 @@ class McpDialog(QDialog):
             self._audit_list.clear()
         if stat.st_size == self._audit_tail_offset:
             return
+        start = self._audit_tail_offset
+        mid_line = start == 0 and stat.st_size > _AUDIT_TAIL_BYTES
+        if mid_line:
+            start = stat.st_size - _AUDIT_TAIL_BYTES
         try:
             with open(self._audit_path, "rb") as f:
-                f.seek(self._audit_tail_offset)
+                f.seek(start)
                 new_bytes = f.read()
             self._audit_tail_offset = stat.st_size
         except OSError:
             return
+        if mid_line:
+            new_bytes = new_bytes.partition(b"\n")[2]
 
-        for line in new_bytes.decode("utf-8", errors="replace").splitlines():
+        lines = new_bytes.decode("utf-8", errors="replace").splitlines()
+        for line in lines[-_AUDIT_TAIL_LIMIT:]:
             if not line.strip():
                 continue
             self._append_audit_line(line)
@@ -366,14 +376,17 @@ class McpDialog(QDialog):
             return
         ts = event.get("ts", "")
         decision = event.get("decision", "")
+        outcome = event.get("outcome", "")
         call = event.get("call", "")
         reason = event.get("reason", "")
         rule_id = event.get("rule_id")
         suffix = f" rule={rule_id}" if rule_id is not None else ""
-        text = f"{_short_ts(ts)}  {decision:5s}  {call:14s}  {reason}{suffix}"
+        text = f"{_short_ts(ts)}  {decision:5s}  {outcome:11s}  {call:14s}  {reason}{suffix}"
         item = QListWidgetItem(text)
         tokens = ThemeManager.instance().current_tokens()
-        if decision == "ALLOW":
+        if outcome in ("SEND_FAILED", "UNKNOWN"):
+            item.setForeground(QColor(tokens["warn"]))
+        elif decision == "ALLOW":
             item.setForeground(QColor(tokens["ok"]))
         elif decision == "DENY":
             item.setForeground(QColor(tokens["err"]))

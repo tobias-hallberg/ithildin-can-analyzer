@@ -7,8 +7,11 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from PySide6.QtGui import QColor
+
 from ithildin.mcp.permissions import AllowRule
 from ithildin.ui.mcp_panel import AddRuleDialog, McpDialog
+from ithildin.ui.theme import ThemeManager
 from tests.conftest import make_app_context
 
 
@@ -275,3 +278,69 @@ def test_audit_tail_resets_on_file_shrink(qapp, qtbot, tmp_path: Path) -> None: 
     ctx.audit_path.write_text(line, encoding="utf-8")
     dlg._tail_audit()
     assert dlg._audit_list.count() == 1
+
+
+def test_audit_feed_shows_outcome(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    """An allowed send the driver refused reads as a warning, not as a deny."""
+    ctx = make_app_context(tmp_path)
+    events = [
+        {"decision": "ALLOW", "outcome": "SEND_FAILED", "reason": "BUS_ERROR", "rule_id": 1},
+        {"decision": "ALLOW", "outcome": "SENT", "reason": "OK", "rule_id": 1},
+        {"decision": "DENY", "outcome": "NOT_SENT", "reason": "BUS_UNHEALTHY"},
+    ]
+    ctx.audit_path.write_text(
+        "".join(
+            json.dumps({"ts": "2026-04-25T12:00:00+00:00", "call": "send_frame", **e}) + "\n"
+            for e in events
+        ),
+        encoding="utf-8",
+    )
+
+    dlg = McpDialog()
+    qtbot.addWidget(dlg)
+    dlg.bind_app(ctx)
+
+    tokens = ThemeManager.instance().current_tokens()
+    items = [dlg._audit_list.item(i) for i in range(dlg._audit_list.count())]
+    assert [item.foreground().color() for item in items] == [
+        QColor(tokens["warn"]),
+        QColor(tokens["ok"]),
+        QColor(tokens["err"]),
+    ]
+    assert "SEND_FAILED" in items[0].text()
+    assert "BUS_ERROR" in items[0].text()
+    assert "SENT" in items[1].text()
+    assert "BUS_UNHEALTHY" in items[2].text()
+
+
+def test_audit_feed_initial_tail_is_bounded(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    """The first read of a big log takes only its tail, starting at a whole line."""
+    ctx = make_app_context(tmp_path)
+    total = 3000
+    padding = "x" * 1000
+    with open(ctx.audit_path, "w", encoding="utf-8") as f:
+        for i in range(total):
+            event = {
+                "ts": "2026-04-25T12:00:00+00:00",
+                "call": "send_frame",
+                "decision": "DENY",
+                "outcome": "NOT_SENT",
+                "reason": "NO_RULE",
+                "rule_id": i,
+                "detail": padding,
+            }
+            f.write(json.dumps(event) + "\n")
+    assert ctx.audit_path.stat().st_size > 3 * 1024 * 1024
+
+    dlg = McpDialog()
+    qtbot.addWidget(dlg)
+    dlg.bind_app(ctx)
+
+    count = dlg._audit_list.count()
+    assert 0 < count < total
+    texts = [dlg._audit_list.item(i).text() for i in range(count)]
+    # Every item parsed (a partial first line would render raw), and the
+    # lines run unbroken up to the file's last.
+    assert all(text.startswith("12:00:00") for text in texts)
+    assert texts[0].endswith(f"rule={total - count}")
+    assert texts[-1].endswith(f"rule={total - 1}")

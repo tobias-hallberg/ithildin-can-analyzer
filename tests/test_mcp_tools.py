@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import threading
 import uuid
 from pathlib import Path
 
@@ -11,7 +12,7 @@ import can
 
 from ithildin.app_state.bus_reader import BusReader
 from ithildin.app_state.database import Database
-from ithildin.core.types import FrameRecord
+from ithildin.core.types import BusHealth, FrameRecord
 from ithildin.mcp.audit import AuditWriter
 from ithildin.mcp.permissions import AllowlistStore, AllowRule
 from ithildin.mcp.tools import (
@@ -28,6 +29,7 @@ from ithildin.mcp.tools import (
     list_signals,
 )
 from ithildin.workspace.schema import BusConfig
+from tests.fake_bus import FakeBus, use_fake_bus
 
 
 def _make_ctx(tmp_path: Path) -> McpReadContext:
@@ -58,11 +60,52 @@ def test_list_buses_reports_open_bus(qapp, qtbot, tmp_path: Path) -> None:  # ty
         assert len(out) == 1
         assert out[0]["name"] == "CAN_1"
         assert out[0]["status"] == "live"
+        assert out[0]["status_detail"] is None
         assert out[0]["interface"] == "virtual"
         assert out[0]["bitrate"] == 500000
         assert out[0]["listen_only"] is False
         assert out[0]["dbcs"] == []
     finally:
+        ctx.bus_reader.close()
+
+
+def test_list_buses_reports_degraded_health(qapp, qtbot, tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    ctx = _make_ctx(tmp_path)
+    cfg = BusConfig(
+        name="CAN_1",
+        interface="virtual",
+        channel=f"t-{uuid.uuid4().hex[:6]}",
+        bitrate=500000,
+    )
+    with qtbot.waitSignal(ctx.bus_reader.bus_started, timeout=2000):
+        ctx.bus_reader.open(cfg)
+    try:
+        health = {"CAN_1": (BusHealth.ERRORS, "error passive")}
+        monkeypatch.setattr(ctx.bus_reader, "health", health.get)
+        (bus,) = list_buses(ctx)
+        assert (bus["status"], bus["status_detail"]) == ("errors", "error passive")
+
+        health["CAN_1"] = (BusHealth.BUS_OFF, "")
+        (bus,) = list_buses(ctx)
+        assert (bus["status"], bus["status_detail"]) == ("bus_off", None)
+    finally:
+        ctx.bus_reader.close()
+
+
+def test_list_buses_reports_opening(qapp, qtbot, tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    fake = FakeBus()
+    fake.open_gate = threading.Event()
+    use_fake_bus(monkeypatch, fake)
+    ctx = _make_ctx(tmp_path)
+    ctx.bus_reader.open(BusConfig(name="CAN_1", interface="virtual", channel="t", bitrate=500000))
+    try:
+        (bus,) = list_buses(ctx)
+        assert (bus["status"], bus["status_detail"]) == ("opening", None)
+        with qtbot.waitSignal(ctx.bus_reader.bus_started, timeout=2000):
+            fake.open_gate.set()
+        assert list_buses(ctx)[0]["status"] == "live"
+    finally:
+        fake.open_gate.set()
         ctx.bus_reader.close()
 
 

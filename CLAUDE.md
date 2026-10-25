@@ -42,12 +42,35 @@ MCP layer (`src/ithildin/mcp/`):
 
 - `AllowlistStore` is the **single chokepoint** every send goes through.
   Default-deny: a send without a matching `AllowRule` is rejected.
-  Per-rule token-bucket rate limit; DBC range clamp; agent filter.
-- `AuditWriter` writes JSONL with 50 MB rotation; every send decision
-  (allow or deny) is logged.
+  Per-rule token-bucket rate limit; DBC range clamp; agent filter. A
+  bus-scoped rule matches only a request for its bus; one with no bus
+  matches only any-bus rules.
+- `AuditWriter` writes JSONL with 50 MB rotation. Every write-tool attempt
+  writes exactly one line, through `tools._audited` (try/finally, so an
+  attempt that raises — even a non-`Exception` — is recorded as
+  `INTERNAL_ERROR`). The line carries the allowlist's `decision` (ALLOW /
+  DENY) and, separately, the frame's `outcome` (SENT / SEND_FAILED /
+  NOT_SENT / DRY_RUN / UNKNOWN): a driver error is ALLOW + SEND_FAILED,
+  never a DENY. SENT means the driver accepted the frame, not that the bus
+  ACKed it.
+- Before the allowlist, the write tools resolve the target (the `bus`
+  named, else the single open bus) and refuse an unresolved one (`NO_BUS`),
+  a listen-only one (`BUS_READ_ONLY`) and a degraded one (`BUS_UNHEALTHY`,
+  any `BusReader.health()` but OK), so a refusal spends no rate-limit
+  token. The send always gets a concrete name: given `None`,
+  `send_message` would pick whichever single bus is open by then, unchecked.
+  `list_buses` reports `opening` (no health yet), `live`, or the degraded
+  `BusHealth` value with `status_detail`.
 - `bridge.py` runs FastMCP on a worker-thread asyncio loop. Qt and
   asyncio loops stay independent — **do not** introduce `qasync`. A
-  misbehaving tool handler must not stall paint events.
+  misbehaving tool handler must not stall paint events. Write tools are
+  `async` wrappers that run the synchronous send on an anyio worker thread
+  (`to_thread.run_sync(..., abandon_on_cancel=True, limiter=…)` with one
+  `CapacityLimiter(1)` per server), so a stalled driver blocks neither the
+  read tools nor the bridge's stop, and the audit order is the send order —
+  except after a cancelled call or a bridge restart, whose abandoned send
+  may still be inside the driver beside the next one.
+  The limiter is built on the GUI thread, hence the `anyio>=4.2` floor.
 
 ## Invariants to respect
 
@@ -84,8 +107,9 @@ MCP layer (`src/ithildin/mcp/`):
   leaving the live window is deselected before the view moves the
   selection to the next row on every drain.
 - **MCP allowlist is the only send path.** Never bypass
-  `AllowlistStore.check_*()`. The audit log must record both allow and
-  deny outcomes.
+  `AllowlistStore.check_*()`. The audit log must record every attempt,
+  allowed or denied, sent or not: write tools go through `tools._audited`,
+  the only writer of their audit lines.
 - **Bus worker shutdown** uses `Qt.ConnectionType.DirectConnection` for
   `worker.stopped → thread.quit`. The main thread blocks on
   `thread.wait()`; a queued slot can't fire there. `start_capture` catches
@@ -427,7 +451,7 @@ widget (drops on the inner GraphicsView don't propagate reliably).
 | Tune theme colours | `ui/theme.py::TOKENS` |
 | Tune QSS for a widget | `ui/theme.py::_QSS_TEMPLATE` |
 | Add an MCP read tool | implement in `mcp/tools.py`, register in `mcp/server.py::register_read_tools` |
-| Add an MCP write tool | same split; register in `mcp/server.py::register_write_tools` (must go through `AllowlistStore.check_*`) |
+| Add an MCP write tool | same split; the body runs inside `tools._audited` and goes through `AllowlistStore.check_*`; register an `async` wrapper in `mcp/server.py::register_write_tools` that calls it via `to_thread.run_sync` with the server's `sends` limiter |
 | Wire a `BusReader` error display | `MainWindow.report()` and per-view banners |
 | Add or re-enable a CAN backend | `ui/adapter_prober.py::_SUPPORTED_BACKENDS` + `workspace/schema.py::SupportedInterface` (must update both); for listen-only also `LISTEN_ONLY_INTERFACES` + `core/bus.py::_apply_listen_only_kwargs` |
 | Add a vendor dep that limits the Python range | `[project.optional-dependencies]` in `pyproject.toml` + the `--extra` in `.github/workflows/release.yml` |

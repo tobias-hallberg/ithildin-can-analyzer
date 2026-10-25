@@ -183,7 +183,7 @@ bottom of the dialog as the agent works.
 
 | Tool | Purpose |
 |---|---|
-| `list_buses` | Open buses with interface, channel, bitrate, listen-only, bound DBCs |
+| `list_buses` | Open buses with status (live or degraded), interface, channel, bitrate, listen-only, bound DBCs |
 | `get_bus_stats` | Open state and per-bus frame totals |
 | `list_dbcs` | Loaded DBC files, their bus bindings, and counts |
 | `list_messages` | Every message in the loaded DBCs — **start here** |
@@ -192,7 +192,7 @@ bottom of the dialog as the agent works.
 | `get_recent_messages` | Recent decoded frames; filter by ID, bus, or timestamp |
 | `get_signal_value` | Latest observed value of one signal |
 | `list_allowlist` | The rules currently authorising sends |
-| `get_audit_log` | Recent send decisions — why a send was allowed or denied |
+| `get_audit_log` | Recent send attempts — why each was allowed or denied, and whether it went out |
 | `send_signal` | Encode + send one signal value (allowlist-gated); a multiplexed signal sets its selector |
 | `send_frame` | Send a raw frame by ID + hex payload (needs a wildcard rule) |
 

@@ -19,6 +19,17 @@ once it reaches 1.0.
 - Kvaser Virtual CAN Driver channels are no longer supported: they aren't
   listed, and a project bus bound to one fails to open. Create the bus
   again on a physical Kvaser channel.
+- MCP audit lines record what happened to the frame (`outcome`: SENT,
+  SEND_FAILED, NOT_SENT, DRY_RUN or UNKNOWN) next to the allowlist's
+  `decision`. A send the driver refused is now ALLOW + SEND_FAILED (shown
+  in the warning colour) rather than a DENY; look for failures by
+  `outcome`.
+- An MCP send that names no `bus` while none or several buses are open is
+  refused with `NO_BUS` before the allowlist is asked, instead of matching
+  a rule scoped to any one bus or failing as `BUS_ERROR`.
+- MCP sends to a bus with bus errors, bus-off or a lost adapter are refused
+  with `BUS_UNHEALTHY`. `list_buses` reports `opening`, `live`, `errors`,
+  `bus_off` or `lost`, with a `status_detail`, instead of always `live`.
 
 ### Fixed
 
@@ -46,6 +57,11 @@ once it reaches 1.0.
   recordings and decoded signals.
 - A listen-only PCAN bus refuses to open when the adapter doesn't enter
   listen-only mode, instead of ACKing on the wire.
+- An MCP send stuck in the driver no longer stalls the other MCP tools or
+  stopping the MCP server, and every send attempt is audited, including
+  one that fails with an unexpected error.
+- The MCP dialog opens quickly on a large audit log: it reads only the last
+  2 MB.
 
 ## [0.1.1] - 2026-10-24
 

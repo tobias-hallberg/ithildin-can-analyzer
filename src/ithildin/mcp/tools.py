@@ -6,12 +6,13 @@ Plain Python functions with simple typed signatures. The bridge layer
 wraps these for FastMCP exposure; the dialog uses some of them directly
 to render tables.
 
-Threading: tools are called from the asyncio worker thread. App state
-(``BusReader``, ``Database``, ``AllowlistStore``) is mutated on the GUI
-thread. Reads are eventually-consistent — the worst case for a tool is
-returning stale-by-microseconds data, which is fine for an observation
-API. ``AllowlistStore`` takes its own lock for the send path, where a
-torn read would matter.
+Threading: read tools run on the asyncio loop thread; write tools run on
+an anyio worker thread, one at a time. App state (``BusReader``,
+``Database``, ``AllowlistStore``) is mutated on the GUI thread. Reads are
+eventually-consistent — the worst case for a tool is returning
+stale-by-microseconds data, which is fine for an observation API.
+``AllowlistStore`` takes its own lock for the send path, where a torn
+read would matter.
 
 Note the ``agent`` argument on the write tools is self-declared by the
 caller, so ``AllowRule.agent_filter`` is a convenience for separating
@@ -26,17 +27,18 @@ import math
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, Required, TypedDict
 
 import can
 
 from ithildin.app_state.bus_reader import BusReader
 from ithildin.app_state.database import Database
 from ithildin.core.transmit import encode_tx_message, multiplexer_choices, signal_range
-from ithildin.core.types import FrameRecord
+from ithildin.core.types import BusHealth, FrameRecord
 from ithildin.mcp.audit import AuditWriter
 from ithildin.mcp.permissions import (
     AllowlistStore,
+    DecisionReason,
     SendFrameRequest,
     SendSignalRequest,
     SignalRange,
@@ -51,6 +53,25 @@ _MAX_CLASSIC_DLC = 8
 # Forwards one ``can.Message`` to the named bus (``None`` = the only open
 # bus). In production this is ``BusReader.send_message``.
 type SendCallable = Callable[[can.Message, str | None], None]
+
+# What happened to the frame. SENT means the driver accepted it, not that
+# the bus ACKed it.
+type Outcome = Literal["SENT", "SEND_FAILED", "NOT_SENT", "DRY_RUN", "UNKNOWN"]
+
+
+class AuditEvent(TypedDict, total=False):
+    """One write-tool audit line: the allowlist's ``decision`` and the frame's
+    ``outcome`` are separate, so a failed send is an ALLOW that wasn't SENT."""
+
+    call: Required[str]
+    args: Required[dict[str, Any]]
+    agent: Required[str]
+    decision: Required[Literal["ALLOW", "DENY"]]
+    outcome: Required[Outcome]
+    reason: DecisionReason
+    rule_id: int
+    detail: str
+    dry_run: bool
 
 
 @dataclass(frozen=True)
@@ -81,15 +102,27 @@ class McpWriteContext:
 
 
 def list_buses(ctx: McpReadContext) -> list[dict[str, Any]]:
-    """Return every open bus with its status and how it was configured."""
+    """Return every open bus with its status and how it was configured.
+
+    ``status`` is ``opening`` until the adapter is up, then ``live`` or a
+    degraded health (``errors``, ``bus_off``, ``lost``) with its
+    ``status_detail``.
+    """
     reader = ctx.bus_reader
     out: list[dict[str, Any]] = []
     for name in reader.bus_names():
         cfg = reader.last_config_for(name)
+        health = reader.health(name)
+        if health is None:
+            status, status_detail = "opening", None
+        else:
+            status = "live" if health[0] is BusHealth.OK else health[0].value
+            status_detail = health[1] or None
         out.append(
             {
                 "name": name,
-                "status": "live",
+                "status": status,
+                "status_detail": status_detail,
                 "interface": cfg.interface if cfg else None,
                 "channel": cfg.channel if cfg else None,
                 "bitrate": cfg.bitrate if cfg else None,
@@ -448,39 +481,35 @@ def send_signal(
     signal keeps the low bits a float would round away.
     """
     bus_name = bus if bus is not None else ctx.read.bus_reader.bus_name
-    if bus_name is not None and ctx.read.bus_reader.is_listen_only(bus_name):
-        return _audit_and_return(
-            ctx,
-            call="send_signal",
-            args={"message": message, "signal": signal, "value": value, "bus": bus_name},
-            agent=agent,
-            ok=False,
-            reason="BUS_READ_ONLY",
-            rule_id=None,
-            detail=f"bus {bus_name!r} is listen-only",
-        )
+    event: AuditEvent = {
+        "call": "send_signal",
+        "args": {"message": message, "signal": signal, "value": value, "bus": bus_name},
+        "agent": agent,
+        "decision": "DENY",
+        "outcome": "NOT_SENT",
+    }
+    return _audited(
+        ctx, event, lambda: _attempt_signal(ctx, event, bus_name, message, signal, value, agent)
+    )
+
+
+def _attempt_signal(
+    ctx: McpWriteContext,
+    event: AuditEvent,
+    bus_name: str | None,
+    message: str,
+    signal: str,
+    value: int | float,
+    agent: str,
+) -> dict[str, Any]:
+    refused = _bus_refusal(ctx, event, bus_name)
+    if refused is not None:
+        return refused
     if isinstance(value, float) and not math.isfinite(value):
-        return _audit_and_return(
-            ctx,
-            call="send_signal",
-            args={"message": message, "signal": signal, "value": value, "bus": bus_name},
-            agent=agent,
-            ok=False,
-            reason="BAD_VALUE",
-            rule_id=None,
-            detail=f"value {value!r} is not finite",
-        )
+        return _result(event, "BAD_VALUE", detail=f"value {value!r} is not finite")
     decoder, message_obj = _resolve_message(ctx.read.database, bus_name, message)
     if message_obj is None:
-        return _audit_and_return(
-            ctx,
-            call="send_signal",
-            args={"message": message, "signal": signal, "value": value, "bus": bus_name},
-            agent=agent,
-            ok=False,
-            reason="UNKNOWN_MESSAGE",
-            rule_id=None,
-        )
+        return _result(event, "UNKNOWN_MESSAGE")
 
     request = SendSignalRequest(
         message_id=int(message_obj.frame_id),
@@ -501,71 +530,25 @@ def send_signal(
 
     decision = ctx.read.allowlist.check_signal(request, range_lookup=range_lookup)
     if not decision.allowed:
-        return _audit_and_return(
-            ctx,
-            call="send_signal",
-            args={"message": message, "signal": signal, "value": value, "bus": bus_name},
-            agent=agent,
-            ok=False,
-            reason=decision.reason,
-            rule_id=decision.rule_id,
-            detail=decision.detail,
-        )
+        return _result(event, decision.reason, rule_id=decision.rule_id, detail=decision.detail)
+    _allow(event, decision.rule_id)
 
     if ctx.dry_run:
-        return _audit_and_return(
-            ctx,
-            call="send_signal",
-            args={"message": message, "signal": signal, "value": value, "bus": bus_name},
-            agent=agent,
-            ok=True,
-            reason="DRY_RUN",
-            rule_id=decision.rule_id,
-        )
+        event["outcome"] = "DRY_RUN"
+        return _result(event, "DRY_RUN")
 
     try:
         assert decoder is not None
         data = encode_tx_message(decoder.database, message_obj, {signal: value})
     except Exception as exc:
-        return _audit_and_return(
-            ctx,
-            call="send_signal",
-            args={"message": message, "signal": signal, "value": value, "bus": bus_name},
-            agent=agent,
-            ok=False,
-            reason="ENCODE_FAILED",
-            rule_id=decision.rule_id,
-            detail=str(exc),
-        )
+        return _result(event, "ENCODE_FAILED", detail=str(exc))
 
     can_msg = can.Message(
         arbitration_id=int(message_obj.frame_id),
         data=bytes(data),
         is_extended_id=bool(getattr(message_obj, "is_extended_frame", False)),
     )
-    try:
-        ctx.send(can_msg, bus_name)
-    except Exception as exc:
-        return _audit_and_return(
-            ctx,
-            call="send_signal",
-            args={"message": message, "signal": signal, "value": value, "bus": bus_name},
-            agent=agent,
-            ok=False,
-            reason="BUS_ERROR",
-            rule_id=decision.rule_id,
-            detail=str(exc),
-        )
-
-    return _audit_and_return(
-        ctx,
-        call="send_signal",
-        args={"message": message, "signal": signal, "value": value, "bus": bus_name},
-        agent=agent,
-        ok=True,
-        reason="OK",
-        rule_id=decision.rule_id,
-    )
+    return _send(ctx, event, can_msg, bus_name)
 
 
 def send_frame(
@@ -582,57 +565,52 @@ def send_frame(
     ``bus`` names the target bus; omit it when exactly one is open.
     """
     bus_name = bus if bus is not None else ctx.read.bus_reader.bus_name
-    args = {
-        "message_id": message_id,
-        "data": data_hex,
-        "is_extended": is_extended,
-        "bus": bus_name,
+    event: AuditEvent = {
+        "call": "send_frame",
+        "args": {
+            "message_id": message_id,
+            "data": data_hex,
+            "is_extended": is_extended,
+            "bus": bus_name,
+        },
+        "agent": agent,
+        "decision": "DENY",
+        "outcome": "NOT_SENT",
     }
-    if bus_name is not None and ctx.read.bus_reader.is_listen_only(bus_name):
-        return _audit_and_return(
-            ctx,
-            call="send_frame",
-            args=args,
-            agent=agent,
-            ok=False,
-            reason="BUS_READ_ONLY",
-            rule_id=None,
-            detail=f"bus {bus_name!r} is listen-only",
-        )
+    return _audited(
+        ctx,
+        event,
+        lambda: _attempt_frame(ctx, event, bus_name, message_id, data_hex, is_extended, agent),
+    )
+
+
+def _attempt_frame(
+    ctx: McpWriteContext,
+    event: AuditEvent,
+    bus_name: str | None,
+    message_id: int,
+    data_hex: str,
+    is_extended: bool,
+    agent: str,
+) -> dict[str, Any]:
+    refused = _bus_refusal(ctx, event, bus_name)
+    if refused is not None:
+        return refused
     max_id = _MAX_EXT_ID if is_extended else _MAX_STD_ID
     if not (0 <= message_id <= max_id):
-        return _audit_and_return(
-            ctx,
-            call="send_frame",
-            args=args,
-            agent=agent,
-            ok=False,
-            reason="BAD_ID",
-            rule_id=None,
+        return _result(
+            event,
+            "BAD_ID",
             detail=f"id {message_id} out of range for a {'29' if is_extended else '11'}-bit frame",
         )
     try:
         data = bytes.fromhex(data_hex.replace(" ", ""))
     except ValueError as exc:
-        return _audit_and_return(
-            ctx,
-            call="send_frame",
-            args=args,
-            agent=agent,
-            ok=False,
-            reason="BAD_DATA",
-            rule_id=None,
-            detail=str(exc),
-        )
+        return _result(event, "BAD_DATA", detail=str(exc))
     if len(data) > _MAX_CLASSIC_DLC:
-        return _audit_and_return(
-            ctx,
-            call="send_frame",
-            args=args,
-            agent=agent,
-            ok=False,
-            reason="BAD_LENGTH",
-            rule_id=None,
+        return _result(
+            event,
+            "BAD_LENGTH",
             detail=f"{len(data)} bytes exceeds the classic-CAN max of {_MAX_CLASSIC_DLC}",
         )
 
@@ -643,56 +621,19 @@ def send_frame(
     )
     decision = ctx.read.allowlist.check_frame(request)
     if not decision.allowed:
-        return _audit_and_return(
-            ctx,
-            call="send_frame",
-            args=args,
-            agent=agent,
-            ok=False,
-            reason=decision.reason,
-            rule_id=decision.rule_id,
-            detail=decision.detail,
-        )
+        return _result(event, decision.reason, rule_id=decision.rule_id, detail=decision.detail)
+    _allow(event, decision.rule_id)
 
     if ctx.dry_run:
-        return _audit_and_return(
-            ctx,
-            call="send_frame",
-            args=args,
-            agent=agent,
-            ok=True,
-            reason="DRY_RUN",
-            rule_id=decision.rule_id,
-        )
+        event["outcome"] = "DRY_RUN"
+        return _result(event, "DRY_RUN")
 
     can_msg = can.Message(
         arbitration_id=int(message_id),
         data=data,
         is_extended_id=bool(is_extended),
     )
-    try:
-        ctx.send(can_msg, bus_name)
-    except Exception as exc:
-        return _audit_and_return(
-            ctx,
-            call="send_frame",
-            args=args,
-            agent=agent,
-            ok=False,
-            reason="BUS_ERROR",
-            rule_id=decision.rule_id,
-            detail=str(exc),
-        )
-
-    return _audit_and_return(
-        ctx,
-        call="send_frame",
-        args=args,
-        agent=agent,
-        ok=True,
-        reason="OK",
-        rule_id=decision.rule_id,
-    )
+    return _send(ctx, event, can_msg, bus_name)
 
 
 # --------------------------------------------------------------------------
@@ -721,36 +662,89 @@ def _resolve_message(
     return None, None
 
 
-def _audit_and_return(
-    ctx: McpWriteContext,
+def _audited(
+    ctx: McpWriteContext, event: AuditEvent, attempt: Callable[[], dict[str, Any]]
+) -> dict[str, Any]:
+    """Run one write-tool attempt and append its audit line exactly once.
+
+    The only writer of write-tool audit lines. An attempt that raises is
+    recorded as ``INTERNAL_ERROR`` under the decision and outcome it had
+    reached, then re-raised.
+    """
+    try:
+        return attempt()
+    except BaseException as exc:
+        event["reason"] = "INTERNAL_ERROR"
+        event["detail"] = f"{type(exc).__name__}: {exc}"
+        raise
+    finally:
+        ctx.audit.append(event)
+
+
+def _bus_refusal(
+    ctx: McpWriteContext, event: AuditEvent, bus_name: str | None
+) -> dict[str, Any] | None:
+    """Refuse an unresolved, listen-only or degraded target before the
+    allowlist is asked, so a refused attempt spends no rate-limit token.
+
+    Past this point the target is a concrete name: ``send_message`` given
+    ``None`` would pick whichever single bus is open by then, unchecked.
+    """
+    if bus_name is None:
+        return _result(event, "NO_BUS", detail="no bus named, and not exactly one bus is open")
+    reader = ctx.read.bus_reader
+    if reader.is_listen_only(bus_name):
+        return _result(event, "BUS_READ_ONLY", detail=f"bus {bus_name!r} is listen-only")
+    health = reader.health(bus_name)
+    if health is not None and health[0] is not BusHealth.OK:
+        return _result(
+            event,
+            "BUS_UNHEALTHY",
+            detail=f"bus {bus_name!r} is unhealthy: {health[0].describe(health[1])}",
+        )
+    return None
+
+
+def _allow(event: AuditEvent, rule_id: int | None) -> None:
+    assert rule_id is not None
+    event["decision"] = "ALLOW"
+    event["rule_id"] = rule_id
+
+
+def _send(
+    ctx: McpWriteContext, event: AuditEvent, msg: can.Message, bus_name: str | None
+) -> dict[str, Any]:
+    event["outcome"] = "UNKNOWN"
+    try:
+        ctx.send(msg, bus_name)
+    except Exception as exc:
+        event["outcome"] = "SEND_FAILED"
+        return _result(event, "BUS_ERROR", detail=str(exc))
+    event["outcome"] = "SENT"
+    return _result(event, "OK")
+
+
+def _result(
+    event: AuditEvent,
+    reason: DecisionReason,
     *,
-    call: str,
-    args: dict[str, Any],
-    agent: str,
-    ok: bool,
-    reason: str,
-    rule_id: int | None,
+    rule_id: int | None = None,
     detail: str = "",
 ) -> dict[str, Any]:
-    event: dict[str, Any] = {
-        "call": call,
-        "args": args,
-        "agent": agent,
-        "decision": "ALLOW" if ok else "DENY",
-        "reason": reason,
-    }
+    """Record ``reason`` on the event and build the tool's result from it."""
+    event["reason"] = reason
     if rule_id is not None:
         event["rule_id"] = rule_id
     if detail:
         event["detail"] = detail
-    if ctx.dry_run and ok:
+    dry_run = event["outcome"] == "DRY_RUN"
+    if dry_run:
         event["dry_run"] = True
-    ctx.audit.append(event)
-    out: dict[str, Any] = {"ok": ok, "reason": reason}
-    if rule_id is not None:
-        out["rule_id"] = rule_id
+    out: dict[str, Any] = {"ok": dry_run or event["outcome"] == "SENT", "reason": reason}
+    if "rule_id" in event:
+        out["rule_id"] = event["rule_id"]
     if detail:
         out["detail"] = detail
-    if ctx.dry_run and ok:
+    if dry_run:
         out["dry_run"] = True
     return out

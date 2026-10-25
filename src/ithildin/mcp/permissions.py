@@ -15,7 +15,7 @@ Rule shape (handoff §"Allowlist rule schema"):
         signal,               # signal name OR literal "*"
         rate_hz=None,         # max send rate; None = unlimited
         agent_filter=None,    # match caller name; None = any agent
-        bus_name=None,        # None = any bus (multi-bus v0.2 readiness)
+        bus_name=None,        # None = any bus; else only a request naming it
         enforce_signal_ranges=True,
         created_at,           # ISO-8601 datetime
     )
@@ -66,6 +66,9 @@ DecisionReason = Literal[
     "UNKNOWN_MESSAGE",
     "ENCODE_FAILED",
     "BUS_ERROR",
+    "NO_BUS",
+    "BUS_UNHEALTHY",
+    "INTERNAL_ERROR",
 ]
 
 
@@ -280,9 +283,9 @@ class AllowlistStore:
             rule
             for rule in ordered
             if rule.message_id == message_id
-            and not (
-                rule.bus_name is not None and bus_name is not None and rule.bus_name != bus_name
-            )
+            # A bus-scoped rule needs the request to name its bus: an unnamed
+            # target would let send_message pick whichever bus is open then.
+            and (rule.bus_name is None or rule.bus_name == bus_name)
             and not (rule.agent_filter is not None and rule.agent_filter != agent)
         ]
 

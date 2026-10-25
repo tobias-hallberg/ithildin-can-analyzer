@@ -5,8 +5,11 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 from pathlib import Path
+
+import pytest
 
 from ithildin.mcp.audit import AuditWriter
 
@@ -55,6 +58,33 @@ def test_rotation_at_max_bytes(tmp_path: Path) -> None:
     # Backup exists with at least one prior entry.
     bak_lines = backup.read_text(encoding="utf-8").splitlines()
     assert bak_lines  # non-empty
+
+
+def test_blocked_rotation_keeps_appending(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """On Windows a reader holding the log open blocks the rename. The line
+    still lands, the old backup survives, and the next append rotates."""
+    path = tmp_path / "audit.jsonl"
+    backup = tmp_path / "audit.jsonl.1"
+    # A line is about 140 bytes, so a second line rotates the log.
+    writer = AuditWriter(path, max_bytes=200)
+    for i in range(2):
+        writer.append({"i": i, "filler": "x" * 80})
+
+    def in_use(_src: object, _dst: object) -> None:
+        raise PermissionError(32, "The process cannot access the file")
+
+    def ids(p: Path) -> list[int]:
+        return [json.loads(line)["i"] for line in p.read_text(encoding="utf-8").splitlines()]
+
+    with monkeypatch.context() as m:
+        m.setattr(os, "replace", in_use)
+        writer.append({"i": 2, "filler": "x" * 80})
+    assert ids(backup) == [0]
+    writer.append({"i": 3, "filler": "x" * 80})
+    writer.close()
+
+    assert ids(backup) == [1, 2]
+    assert ids(path) == [3]
 
 
 def test_concurrent_appends_do_not_interleave(tmp_path: Path) -> None:

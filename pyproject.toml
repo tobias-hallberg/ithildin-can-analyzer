@@ -32,6 +32,9 @@ dependencies = [
     "asammdf>=8.0",
     "tomli-w>=1.0",
     "mcp>=1.0",
+    # 4.2 is the first whose CapacityLimiter can be built with no running
+    # loop, as the MCP server builds it on the GUI thread.
+    "anyio>=4.2",
     "uvicorn>=0.30",
     "uptime>=3.0.1",
     "gs-usb>=0.3.1",

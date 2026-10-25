@@ -2,10 +2,13 @@
 # Copyright (C) 2026 Tobias Hallberg
 """JSONL audit log for MCP send attempts.
 
-Every allow/deny decision the bridge makes is appended to this file as
-one JSON object per line. The file rotates when it crosses
+Every send attempt — the allowlist's decision and what then happened to
+the frame (``mcp.tools.AuditEvent``) — is appended to this file as one
+JSON object per line. The file rotates when it crosses
 ``max_bytes`` — the existing log moves to ``<path>.1`` (overwriting any
-previous rotation) and a fresh log opens.
+previous rotation) and a fresh log opens. If the move fails (on Windows,
+while a reader such as the MCP dialog or ``get_audit_log`` has either file
+open), the line goes to the current log and the next append retries.
 
 Pure I/O — no Qt, no asyncio. The bridge calls ``append`` from any
 thread; appends are guarded by a lock so concurrent writers don't
@@ -15,13 +18,17 @@ interleave a line.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import IO, Any
 
 DEFAULT_MAX_BYTES = 50 * 1024 * 1024  # 50 MB
+
+_log = logging.getLogger(__name__)
 
 
 class AuditWriter:
@@ -38,7 +45,7 @@ class AuditWriter:
     def path(self) -> Path:
         return self._path
 
-    def append(self, event: dict[str, Any]) -> None:
+    def append(self, event: Mapping[str, Any]) -> None:
         """Write one JSON line. Adds a ``ts`` ISO-8601 timestamp if missing."""
         if "ts" not in event:
             event = {"ts": datetime.now(UTC).isoformat(), **event}
@@ -77,8 +84,10 @@ class AuditWriter:
             self._fp.close()
             self._fp = None
         backup = self._path.with_suffix(self._path.suffix + ".1")
-        if backup.exists():
-            backup.unlink()
         if self._path.exists():
-            os.replace(self._path, backup)
+            try:
+                os.replace(self._path, backup)
+            except OSError:
+                _log.warning("Could not rotate the audit log %s", self._path, exc_info=True)
+                return
         self._size = 0
