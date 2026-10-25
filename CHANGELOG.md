@@ -16,6 +16,9 @@ once it reaches 1.0.
   written back that way on the next save. On Windows the adapters are
   found by a USB scan; on Linux use SocketCAN. Listen-only refuses to open
   on firmware without a listen-only mode instead of ACKing on the wire.
+- Kvaser Virtual CAN Driver channels are no longer supported: they aren't
+  listed, and a project bus bound to one fails to open. Create the bus
+  again on a physical Kvaser channel.
 
 ### Fixed
 
@@ -25,6 +28,15 @@ once it reaches 1.0.
   the whole UI while the adapter waits.
 - An unplugged `gs_usb` adapter is reported as lost within about a second,
   and its frames carry wall-clock timestamps like every other backend's.
+- A listen-only Kvaser bus no longer ACKs on the wire: silent mode was set
+  on a second handle that couldn't apply it.
+- A Kvaser adapter plugged in, or plugged back in, after launch is found and
+  opens without restarting the app.
+- A Kvaser bus whose adapter is missing fails to open instead of opening a
+  Kvaser Virtual channel in its place.
+- A Kvaser bus refuses a bitrate CANlib has no preset for instead of
+  leaving the channel half-open, and the Create CAN bus dialog no longer
+  offers 800 kbit/s for Kvaser adapters.
 
 ## [0.1.1] - 2026-10-24
 

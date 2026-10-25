@@ -224,17 +224,89 @@ def test_device_found_emits_enriched_grouped_device(qtbot) -> None:  # type: ign
     assert _has_virtual(devices)
 
 
-def test_add_kvaser_firmware_is_a_noop_without_canlib() -> None:
-    """The firmware deepen degrades silently when the kvaser CANlib isn't
-    importable (no Kvaser driver on CI) — it must not raise and must leave
-    the config dicts untouched so enrichment still reports firmware None."""
+def test_add_kvaser_channel_data_is_a_noop_without_canlib(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """The deepen degrades silently when python-can's kvaser wrapper can't be
+    imported — it must not raise and must leave the config dicts untouched
+    so enrichment still keeps the channel and reports firmware None."""
+    monkeypatch.setitem(sys.modules, "can.interfaces.kvaser", None)
     configs: list[dict[str, object]] = [
         {"interface": "kvaser", "channel": 0, "device_name": "Leaf"},
         {"interface": "kvaser", "channel": "weird"},
     ]
-    prober_mod._add_kvaser_firmware(configs)
-    assert "firmware" not in configs[0]
-    assert "firmware" not in configs[1]
+    prober_mod._add_kvaser_channel_data(configs)
+    assert configs == [
+        {"interface": "kvaser", "channel": 0, "device_name": "Leaf"},
+        {"interface": "kvaser", "channel": "weird"},
+    ]
+
+
+def test_add_kvaser_channel_data_reads_card_type_and_firmware(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """Channel 1 is a Virtual channel (canHWTYPE_VIRTUAL) with no firmware;
+    channel 2's query fails, which leaves its dict alone."""
+    from can.interfaces.kvaser import canlib, constants
+
+    def get_channel_data(channel: int, item: int, buf, _size: int) -> int:  # type: ignore[no-untyped-def]
+        if channel == 2:
+            raise RuntimeError("Specified device not found")
+        # buf is a ctypes.byref(); _obj is the buffer it points at.
+        if item == constants.canCHANNELDATA_CARD_TYPE:
+            buf._obj.value = 1 if channel == 1 else 48
+        elif item == constants.canCHANNELDATA_CARD_FIRMWARE_REV and channel == 0:
+            buf._obj[:] = [123, 0, 18, 3]
+        return 0
+
+    monkeypatch.setattr(canlib, "canGetChannelData", get_channel_data, raising=False)
+    configs: list[dict[str, object]] = [
+        {"interface": "kvaser", "channel": 0},
+        {"interface": "kvaser", "channel": 1},
+        {"interface": "kvaser", "channel": 2},
+    ]
+    prober_mod._add_kvaser_channel_data(configs)
+    assert configs == [
+        {"interface": "kvaser", "channel": 0, "card_type": 48, "firmware": "3.18.0.123"},
+        {"interface": "kvaser", "channel": 1, "card_type": 1},
+        {"interface": "kvaser", "channel": 2},
+    ]
+
+
+def test_kvaser_probe_reenumerates_and_detects_under_the_lock(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """Re-enumerating renumbers the channels, so a bus opening in between
+    must not see a half-done probe: the whole probe holds the lock."""
+    import can
+
+    from ithildin.core import bus as bus_mod
+
+    calls: list[tuple[str, bool]] = []
+
+    def record(step: str):  # type: ignore[no-untyped-def]
+        def call(*_args: object, **_kwargs: object) -> list[dict[str, object]]:
+            calls.append((step, bus_mod.KVASER_ENUM_LOCK.locked()))
+            return [{"interface": "kvaser", "channel": 0}] if step == "detect" else []
+
+        return call
+
+    monkeypatch.setattr(bus_mod, "kvaser_enum_hardware", record("enum"))
+    monkeypatch.setattr(can, "detect_available_configs", record("detect"))
+    monkeypatch.setattr(prober_mod, "_add_kvaser_channel_data", record("channel data"))
+
+    assert prober_mod._detect_configs("kvaser") == [{"interface": "kvaser", "channel": 0}]
+    assert calls == [("enum", True), ("detect", True), ("channel data", True)]
+    assert not bus_mod.KVASER_ENUM_LOCK.locked()
+
+
+def test_kvaser_probe_reports_the_driver_busy_while_the_lock_stays_held(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """Behind an open hung in the driver, the probe fails on its own before
+    the backend timeout, so its thread ends instead of staying parked."""
+    from ithildin.core import bus as bus_mod
+
+    assert prober_mod._KVASER_LOCK_WAIT_S < prober_mod.BACKEND_TIMEOUT_S
+    enumerated: list[bool] = []
+    monkeypatch.setattr(bus_mod, "kvaser_enum_hardware", lambda: enumerated.append(True))
+    monkeypatch.setattr(prober_mod, "_KVASER_LOCK_WAIT_S", 0.05)
+
+    with bus_mod.KVASER_ENUM_LOCK, pytest.raises(RuntimeError, match="Kvaser driver busy"):
+        prober_mod._detect_configs("kvaser")
+    assert enumerated == []
 
 
 def test_detect_gs_usb_lists_scanned_adapters_without_opening_them(monkeypatch) -> None:  # type: ignore[no-untyped-def]

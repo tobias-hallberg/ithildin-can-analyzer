@@ -25,7 +25,10 @@ app one thing to start/stop.
 
 from __future__ import annotations
 
+import ctypes
+import importlib
 import logging
+import sys
 import threading
 import time
 from functools import partial
@@ -85,6 +88,10 @@ class _AdapterLostError(Exception):
     """The health probe found the adapter gone; ends the capture as a failure."""
 
 
+class _OpenCancelledError(Exception):
+    """The bus was stopped while its open waited for the driver."""
+
+
 class BusWorker(QObject):
     """Owns a python-can ``BusABC`` and pushes frames into a ``RingBuffer``."""
 
@@ -135,6 +142,8 @@ class BusWorker(QObject):
         try:
             try:
                 bus = self._open_bus()
+            except _OpenCancelledError:
+                return
             except BaseException as exc:
                 _log.warning("Failed to open bus %r", self._name, exc_info=True)
                 self.error.emit(f"Failed to open bus {self._name!r}: {exc}")
@@ -430,7 +439,41 @@ class BusWorker(QObject):
             kwargs["fd"] = True
         if self._config.listen_only:
             _apply_listen_only_kwargs(kwargs, self._config.interface)
+        if self._config.interface == "kvaser":
+            return self._open_kvaser(kwargs)
         return can.Bus(**kwargs)
+
+    def _open_kvaser(self, kwargs: dict[str, Any]) -> can.BusABC:
+        from can.interfaces.kvaser.canlib import BITRATE_FD, BITRATE_OBJS
+
+        presets = BITRATE_FD if kwargs.get("fd") else BITRATE_OBJS
+        bitrate = kwargs["bitrate"]
+        if bitrate not in presets:
+            # KvaserBus hands any other bitrate to CANlib raw, with no segment
+            # times, after it opened the channel. A refusal there leaks that
+            # handle, which keeps init access: later opens of the channel
+            # can't set its bitrate or silent mode.
+            rates = ", ".join(str(rate) for rate in sorted(presets))
+            raise can.CanInitializationError(
+                f"Kvaser has no preset for {bitrate} bit/s (presets: {rates} bit/s)"
+            )
+        # A channel number shifted by an unplugged adapter must fail to open,
+        # not open a Kvaser Virtual channel that looks like a live bus.
+        kwargs["accept_virtual"] = False
+        deadline = time.monotonic() + _KVASER_OPEN_WAIT_S
+        while not KVASER_ENUM_LOCK.acquire(timeout=_RECV_TIMEOUT_S):
+            if self._stop:
+                raise _OpenCancelledError
+            if time.monotonic() >= deadline:
+                raise can.CanInitializationError(
+                    f"Kvaser driver busy: another Kvaser bus or adapter scan has been "
+                    f"in the driver for over {_KVASER_OPEN_WAIT_S:.0f} s"
+                )
+        try:
+            kvaser_enum_hardware()
+            return can.Bus(**kwargs)
+        finally:
+            KVASER_ENUM_LOCK.release()
 
 
 def _worst(*levels: _Level) -> _Level:
@@ -501,10 +544,11 @@ def _apply_listen_only_kwargs(kwargs: dict[str, Any], interface: str) -> None:
 
     Each python-can backend names its silent/passive mode differently:
     PCAN takes ``state=BusState.PASSIVE``, Kvaser takes ``driver_mode=False``
-    (``DRIVER_MODE_SILENT``); gs_usb never gets here, since ``GsUsbBus``
-    takes ``listen_only=`` itself. The ``virtual`` backend has no
-    transceiver and intentionally falls through with no kwarg — the
-    app-level guard in ``BusReader.send_message`` covers that case.
+    (``DRIVER_MODE_SILENT``) on a single handle; gs_usb never gets here,
+    since ``GsUsbBus`` takes ``listen_only=`` itself. The ``virtual``
+    backend has no transceiver and intentionally falls through with no
+    kwarg — the app-level guard in ``BusReader.send_message`` covers that
+    case.
     ``socketcan`` and ``ixxat`` never reach here: they have no python-can
     silent kwarg, so ``BusConfig`` rejects them at validation (see
     ``LISTEN_ONLY_INTERFACES``).
@@ -512,7 +556,46 @@ def _apply_listen_only_kwargs(kwargs: dict[str, Any], interface: str) -> None:
     if interface == "pcan":
         kwargs["state"] = can.BusState.PASSIVE
     elif interface == "kvaser":
-        kwargs["driver_mode"] = False
+        # python-can sets silent mode on its write handle, a second handle
+        # without init access, so CANlib ignores it and the adapter still
+        # ACKs. With one handle it lands on the handle that has init access.
+        # receive_own_messages would only make python-can warn on a single
+        # handle, and a listen-only bus never transmits.
+        kwargs.update(driver_mode=False, single_handle=True, receive_own_messages=False)
+
+
+KVASER_ENUM_LOCK = threading.Lock()
+"""Held across :func:`kvaser_enum_hardware` and every use of the channel
+numbers it produces: a probe's detection, an open. Re-enumerating renumbers
+the channels, so one between a detection and a ``canOpenChannel`` would
+open a different adapter. Wait for it with a timeout: a vendor call that
+hangs keeps holding it."""
+
+_KVASER_OPEN_WAIT_S = 10.0
+"""Longest a Kvaser open queues for :data:`KVASER_ENUM_LOCK` behind other
+opens and probes before it fails as driver busy."""
+
+
+def kvaser_enum_hardware() -> None:
+    """Have CANlib re-enumerate the Kvaser devices. Windows only.
+
+    Without it, CANlib on Windows keeps the channel list from its start, so
+    an adapter plugged in later never appears and a replugged one can't be
+    reopened until the app restarts. Hold :data:`KVASER_ENUM_LOCK`.
+    """
+    if sys.platform != "win32":
+        return
+    # Importing python-can's wrapper runs canInitializeLibrary, which CANlib
+    # needs before any other call.
+    importlib.import_module("can.interfaces.kvaser.canlib")
+    try:
+        canlib32 = ctypes.WinDLL("canlib32")
+    except OSError:
+        return
+    # canlib.h's canEnumHardware isn't exported by the DLL, only this form.
+    status = canlib32.canEnumHardwareEx(ctypes.byref(ctypes.c_int()))
+    if status < 0:
+        _log.warning("Kvaser canEnumHardwareEx failed with status %d", status)
 
 
 class BusController(QObject):

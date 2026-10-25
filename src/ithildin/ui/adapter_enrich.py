@@ -17,9 +17,10 @@ exposes only the interface + channel and leaves the rest ``None`` /
 unknown. ``status`` and ``capabilities`` stay ``None`` unless a backend
 actually probes them (only pcan does today), so the dialog never shows a
 default dressed up as a fact. No enricher here makes blocking calls: the
-kvaser firmware string comes from a ``"firmware"`` key the prober folds
-into each config via an extra CANlib query (see
-``adapter_prober._add_kvaser_firmware``); enrichers just read it.
+kvaser firmware string and card type come from ``"firmware"`` and
+``"card_type"`` keys the prober folds into each config via extra CANlib
+queries (see ``adapter_prober._add_kvaser_channel_data``); enrichers just
+read them.
 """
 
 from __future__ import annotations
@@ -39,6 +40,8 @@ Transport = Literal["USB", "Kernel", "Software", "Unknown"]
 # importing the backend just to read three constants).
 _PCAN_AVAILABLE = 0x01
 _PCAN_OCCUPIED = 0x02
+# CANlib canHWTYPE_VIRTUAL, the card type of Kvaser Virtual channels.
+_KVASER_HWTYPE_VIRTUAL = 0x01
 
 
 @dataclass(frozen=True)
@@ -126,9 +129,15 @@ def _enrich_default(backend: str, configs: list[dict[str, object]]) -> list[Devi
 
 
 def _enrich_kvaser(backend: str, configs: list[dict[str, object]]) -> list[DeviceInfo]:
-    """Group kvaser channels by serial — channels of one dongle share it."""
+    """Group kvaser channels by serial — channels of one dongle share it.
+
+    Virtual channels are left out: buses open Kvaser channels with
+    ``accept_virtual=False``, so they could never be opened.
+    """
     by_serial: OrderedDict[str, list[dict[str, object]]] = OrderedDict()
     for cfg in configs:
+        if cfg.get("card_type") == _KVASER_HWTYPE_VIRTUAL:
+            continue
         serial_raw = cfg.get("serial")
         # CANlib reports 0 for the virtual driver and unkeyed channels.
         serial = str(serial_raw) if serial_raw not in (None, 0) else ""

@@ -58,6 +58,11 @@ BACKEND_TIMEOUT_S = 3.0
 reported via ``backend_failed`` and the worker thread carries on; the
 hung helper thread is a daemon, left to die when the process exits."""
 
+_KVASER_LOCK_WAIT_S = 2.0
+"""Below :data:`BACKEND_TIMEOUT_S`: a Kvaser probe queued behind a slow or
+hung Kvaser open reports the driver busy and its thread ends, instead of
+timing out with the thread parked on ``KVASER_ENUM_LOCK``."""
+
 
 @dataclass(frozen=True)
 class AdapterChoice:
@@ -284,9 +289,19 @@ def _detect_configs(backend: str) -> list[dict[str, object]]:
     # python-can types this as ``Sequence[AutoDetectedConfig]`` (a
     # TypedDict). For our purposes — passing dicts up to the UI to
     # render — they're indistinguishable from plain mappings.
-    configs = [dict(cfg) for cfg in can.detect_available_configs(interfaces=[backend])]
-    if backend == "kvaser":
-        _add_kvaser_firmware(configs)
+    if backend != "kvaser":
+        return [dict(cfg) for cfg in can.detect_available_configs(interfaces=[backend])]
+
+    from ithildin.core.bus import KVASER_ENUM_LOCK, kvaser_enum_hardware
+
+    if not KVASER_ENUM_LOCK.acquire(timeout=_KVASER_LOCK_WAIT_S):
+        raise RuntimeError("Kvaser driver busy: a Kvaser bus or earlier scan is still in it")
+    try:
+        kvaser_enum_hardware()
+        configs = [dict(cfg) for cfg in can.detect_available_configs(interfaces=[backend])]
+        _add_kvaser_channel_data(configs)
+    finally:
+        KVASER_ENUM_LOCK.release()
     return configs
 
 
@@ -304,14 +319,16 @@ def _detect_gs_usb() -> list[dict[str, object]]:
     return [{"interface": "gs_usb", "channel": index} for index in range(len(GsUsb.scan()))]
 
 
-def _add_kvaser_firmware(configs: list[dict[str, object]]) -> None:
-    """Fold the CANlib firmware revision into each kvaser config dict.
+def _add_kvaser_channel_data(configs: list[dict[str, object]]) -> None:
+    """Fold the CANlib card type and firmware revision into each kvaser
+    config dict.
 
     ``detect_available_configs`` gives name/serial/dongle_channel but not
-    firmware; one extra passive ``canGetChannelData`` query per channel
-    adds it (no channel open, so it's cheap and side-effect free). On any
-    CANlib hiccup the ``"firmware"`` key is simply absent — the enricher
-    then reports firmware as ``None``, same as before this deepen.
+    these; two extra passive ``canGetChannelData`` queries per channel
+    add them (no channel open, so it's cheap and side-effect free). The
+    enricher hides Kvaser Virtual channels by ``"card_type"``. On any
+    CANlib hiccup both keys are simply absent — the enricher then keeps
+    the channel and reports firmware as ``None``.
 
     The revision is returned as four 16-bit words. CANlib packs it
     most-significant word first as ``major.minor.build.release``; that
@@ -329,16 +346,24 @@ def _add_kvaser_firmware(configs: list[dict[str, object]]) -> None:
         channel = cfg.get("channel")
         if not isinstance(channel, int):
             continue
+        card_type = ctypes.c_uint()
+        firmware = (ctypes.c_ushort * 4)()
         try:
-            buf = (ctypes.c_ushort * 4)()
+            canlib.canGetChannelData(
+                channel,
+                constants.canCHANNELDATA_CARD_TYPE,
+                ctypes.byref(card_type),
+                ctypes.sizeof(card_type),
+            )
             canlib.canGetChannelData(
                 channel,
                 constants.canCHANNELDATA_CARD_FIRMWARE_REV,
-                ctypes.byref(buf),
-                ctypes.sizeof(buf),
+                ctypes.byref(firmware),
+                ctypes.sizeof(firmware),
             )
         except Exception:
             continue
-        words = tuple(buf)
+        cfg["card_type"] = card_type.value
+        words = tuple(firmware)
         if any(words):
             cfg["firmware"] = ".".join(str(w) for w in reversed(words))

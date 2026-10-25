@@ -234,6 +234,24 @@ MCP layer (`src/ithildin/mcp/`):
   opening on it. Call `libusb_package.get_libusb1_backend()` before
   `GsUsb.scan()` so pyusb loads the bundled libusb. `BusConfig` migrates
   saved `cantact` buses (0.1.0 / 0.1.1) to `gs_usb`.
+- **Kvaser channel numbers are re-enumerated under one lock.**
+  `core/bus.py::kvaser_enum_hardware()` has CANlib re-enumerate (Windows
+  only, via `canEnumHardwareEx`: the DLL doesn't export
+  `canEnumHardware`), so an adapter plugged in after launch is found and
+  a replugged one reopens. Re-enumerating renumbers the channels, so hold
+  `KVASER_ENUM_LOCK` across it and every use of the numbers: the prober's
+  detection and channel-data read, the worker's `can.Bus`. A vendor call
+  that hangs keeps the lock, so never wait for it unbounded: a probe gives
+  up after 2 s (below `BACKEND_TIMEOUT_S`, reported as driver busy rather
+  than a timeout), an open after 10 s or once its bus is stopped. Kvaser
+  buses open through `BusWorker._open_kvaser`: `accept_virtual=False` (a
+  number shifted by an unplugged adapter must fail, not open a Kvaser
+  Virtual channel, so the enricher hides Virtual channels by card type),
+  and only CANlib preset bitrates, checked before any driver call
+  (`KvaserBus` leaks an init-access handle when CANlib refuses one; the
+  Create dialog offers no 800 kbit/s for Kvaser). Listen-only uses a
+  single handle: python-can sets silent mode on its write handle, which
+  has no init access.
 - **Diagnostics go through `logging`.** `diagnostics.install()` is the
   first statement of `app.main`: one log file per launch in
   `~/.ithildin/logs` (newest 10 kept), `None` stdio (the windowed frozen

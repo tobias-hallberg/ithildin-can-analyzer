@@ -277,6 +277,55 @@ def test_info_strip_shows_probed_status_and_capabilities(qapp, qtbot) -> None:  
     assert "CAN 2.0 / CAN FD" in text
 
 
+def _baud_choices(dlg: CreateCanBusDialog) -> list[int]:
+    return [dlg._baud_combo.itemData(i) for i in range(dlg._baud_combo.count())]
+
+
+def _select_new_device(dlg: CreateCanBusDialog, device: DeviceInfo) -> None:
+    dlg._add_device(device)
+    dlg._device_combo.setCurrentIndex(dlg._device_combo.count() - 1)
+
+
+_KVASER = DeviceInfo(
+    interface="kvaser",
+    vendor="Kvaser",
+    model="Leaf Light v2",
+    serial="12345",
+    channels=(ChannelInfo(channel=0, label="ch0"),),
+)
+
+
+def test_kvaser_baud_choices_exclude_800k(qapp, qtbot) -> None:  # type: ignore[no-untyped-def]
+    """CANlib has no 800 kbit/s preset, and a Kvaser bus refuses to open on
+    anything else; a choice no longer offered falls back to 500 kbit/s."""
+    dlg = _make_dialog(qtbot)
+    assert 800_000 in _baud_choices(dlg)
+    dlg._baud_combo.setCurrentIndex(_baud_choices(dlg).index(800_000))
+
+    _select_new_device(dlg, _KVASER)
+
+    assert _baud_choices(dlg) == [125_000, 250_000, 500_000, 1_000_000]
+    assert dlg._baud_combo.currentData() == 500_000
+
+
+def test_baud_choice_kept_while_still_offered(qapp, qtbot) -> None:  # type: ignore[no-untyped-def]
+    dlg = _make_dialog(qtbot)
+    dlg._baud_combo.setCurrentIndex(_baud_choices(dlg).index(1_000_000))
+
+    _select_new_device(dlg, _KVASER)
+    assert dlg._baud_combo.currentData() == 1_000_000
+
+    dlg._device_combo.setCurrentIndex(0)  # back to the virtual device
+    assert _baud_choices(dlg) == [125_000, 250_000, 500_000, 800_000, 1_000_000]
+    assert dlg._baud_combo.currentData() == 1_000_000
+
+    dlg._name_edit.setText("Bench")
+    captured: list[BusConfig] = []
+    dlg.bus_declared.connect(lambda cfg, _dbcs: captured.append(cfg))
+    dlg._on_create()
+    assert captured[0].bitrate == 1_000_000
+
+
 def test_in_use_channel_pill_is_disabled(qapp, qtbot) -> None:  # type: ignore[no-untyped-def]
     dlg = _make_dialog(qtbot)
     dev = DeviceInfo(

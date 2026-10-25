@@ -60,6 +60,11 @@ from ithildin.workspace.schema import LISTEN_ONLY_INTERFACES, BusConfig
 __all__ = ["CreateCanBusDialog"]
 
 _BAUDRATES = (125_000, 250_000, 500_000, 800_000, 1_000_000)
+_BAUDRATES_BY_INTERFACE: dict[str, tuple[int, ...]] = {
+    # CANlib has no 800 kbit/s preset, and a Kvaser bus refuses to open on
+    # anything but a preset (core.bus.BusWorker._open_kvaser).
+    "kvaser": (125_000, 250_000, 500_000, 1_000_000),
+}
 _DEFAULT_BAUD = 500_000
 
 _LISTEN_ONLY_COPY = (
@@ -284,9 +289,7 @@ class CreateCanBusDialog(QDialog):
         # Baudrate
         layout.addWidget(self._field_label("Baudrate"))
         self._baud_combo = QComboBox(self)
-        for br in _BAUDRATES:
-            self._baud_combo.addItem(_format_bitrate(br), br)
-        self._baud_combo.setCurrentText(_format_bitrate(_DEFAULT_BAUD))
+        self._offer_baudrates(_BAUDRATES)
         layout.addWidget(self._baud_combo)
 
         # Listen-only
@@ -545,6 +548,17 @@ class CreateCanBusDialog(QDialog):
         locked = device.interface not in LISTEN_ONLY_INTERFACES
         self._listen_only.set_locked_off(locked)
         self._refresh_safety_hint()
+        self._offer_baudrates(_BAUDRATES_BY_INTERFACE.get(device.interface, _BAUDRATES))
+
+    def _offer_baudrates(self, rates: tuple[int, ...]) -> None:
+        """Fill the baudrate combo, keeping the choice while it is offered."""
+        current = self._baud_combo.currentData()
+        self._baud_combo.clear()
+        for br in rates:
+            self._baud_combo.addItem(_format_bitrate(br), br)
+        self._baud_combo.setCurrentIndex(
+            rates.index(current if current in rates else _DEFAULT_BAUD)
+        )
 
     # -- validation ---------------------------------------------------------
 

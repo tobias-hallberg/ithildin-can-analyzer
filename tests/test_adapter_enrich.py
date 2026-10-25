@@ -47,8 +47,45 @@ def test_kvaser_groups_channels_by_serial() -> None:
     assert dev.firmware is None
 
 
+def test_kvaser_virtual_channels_are_dropped() -> None:
+    """A bus opens Kvaser channels with ``accept_virtual=False``, so a
+    Virtual channel (card type canHWTYPE_VIRTUAL) is never offered."""
+    devices = enrich(
+        "kvaser",
+        [
+            {
+                "interface": "kvaser",
+                "channel": 0,
+                "device_name": "Kvaser Virtual CAN Driver",
+                "serial": 0,
+                "dongle_channel": 1,
+                "card_type": 1,
+            },
+            {
+                "interface": "kvaser",
+                "channel": 1,
+                "device_name": "Kvaser Virtual CAN Driver",
+                "serial": 0,
+                "dongle_channel": 2,
+                "card_type": 1,
+            },
+            {
+                "interface": "kvaser",
+                "channel": 2,
+                "device_name": "Kvaser Leaf Light v2",
+                "serial": 12345,
+                "dongle_channel": 1,
+                "card_type": 48,
+            },
+        ],
+    )
+    assert [(d.model, [c.channel for c in d.channels]) for d in devices] == [
+        ("Kvaser Leaf Light v2", [2])
+    ]
+
+
 def test_kvaser_reads_firmware_folded_in_by_prober() -> None:
-    # The prober adds a "firmware" key (see _add_kvaser_firmware); the
+    # The prober adds a "firmware" key (see _add_kvaser_channel_data); the
     # enricher just surfaces it.
     devices = enrich(
         "kvaser",
