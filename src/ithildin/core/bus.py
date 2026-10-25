@@ -441,7 +441,44 @@ class BusWorker(QObject):
             _apply_listen_only_kwargs(kwargs, self._config.interface)
         if self._config.interface == "kvaser":
             return self._open_kvaser(kwargs)
+        if self._config.interface == "pcan":
+            return self._open_pcan(kwargs)
         return can.Bus(**kwargs)
+
+    def _open_pcan(self, kwargs: dict[str, Any]) -> can.BusABC:
+        from can.interfaces.pcan import basic
+
+        bitrate = kwargs["bitrate"]
+        if not kwargs.get("fd") and bitrate not in basic.PCAN_BITRATES:
+            # PcanBus runs any other bitrate at 500 kbit/s without a word,
+            # which puts error frames on a bus running at another rate.
+            rates = ", ".join(str(rate) for rate in sorted(basic.PCAN_BITRATES))
+            raise can.CanInitializationError(
+                f"PCAN has no preset for {bitrate} bit/s (presets: {rates} bit/s)"
+            )
+        driver = cast(Any, basic.PCANBasic)()
+        channel = kwargs["channel"]
+        handle = channel if isinstance(channel, int) else basic.PCAN_CHANNEL_NAMES[channel]
+        held = _pcan_initialised(driver, handle)
+        try:
+            bus = can.Bus(**kwargs)
+        except BaseException:
+            # PcanBus leaves the channel initialised when a step after
+            # CAN_Initialize fails, or when Initialize returns CAUTION (the
+            # channel opened, at another bitrate), and every later open of it
+            # then fails until the app restarts. Release only a channel this
+            # open initialised: when Initialize itself failed, the channel may
+            # be another bus's in this process.
+            if not held and _pcan_initialised(driver, handle):
+                _log.info("Uninitialising the PCAN channel of %r after its open failed", self._name)
+                driver.Uninitialize(handle)
+            raise
+        try:
+            _finish_pcan_open(driver, handle, bus, listen_only=self._config.listen_only)
+        except BaseException:
+            bus.shutdown()
+            raise
+        return bus
 
     def _open_kvaser(self, kwargs: dict[str, Any]) -> can.BusABC:
         from can.interfaces.kvaser.canlib import BITRATE_FD, BITRATE_OBJS
@@ -506,6 +543,46 @@ def _pcan_level(code: int) -> _Level:
     if code & (basic.PCAN_ERROR_BUSLIGHT | basic.PCAN_ERROR_BUSHEAVY):
         return _PCAN_WARNING
     return _OK
+
+
+def _pcan_initialised(driver: Any, handle: Any) -> bool:
+    """Whether this process has the PCAN channel initialised: GetStatus
+    reports PCAN_ERROR_INITIALIZE for a channel missing from the calling
+    process's list."""
+    from can.interfaces.pcan import basic
+
+    return not driver.GetStatus(handle) & basic.PCAN_ERROR_INITIALIZE
+
+
+def _finish_pcan_open(driver: Any, handle: Any, bus: Any, *, listen_only: bool) -> None:
+    """Make a PCAN channel PcanBus just opened safe to read, or raise
+    CanInitializationError."""
+    from can.interfaces.pcan import basic
+
+    # PcanBus doesn't check the status-message type (MSGTYPE 0x80), so a
+    # status message can read as a data frame. Bus state comes from the
+    # health tick's status() instead.
+    result = driver.SetValue(handle, basic.PCAN_ALLOW_STATUS_FRAMES, basic.PCAN_PARAMETER_OFF)
+    if result != basic.PCAN_ERROR_OK:
+        text = bus._get_formatted_error(result)
+        raise can.CanInitializationError(f"PCAN driver refused to turn off status frames: {text}")
+    # Those queued since CAN_Initialize stay queued. Reset empties the queues
+    # without touching the controller, and nothing has been sent yet.
+    result = driver.Reset(handle)
+    if result != basic.PCAN_ERROR_OK:
+        text = bus._get_formatted_error(result)
+        raise can.CanInitializationError(f"PCAN driver couldn't empty the receive queue: {text}")
+    if not listen_only:
+        return
+    # PcanBus ignores the result of setting listen-only.
+    result, value = driver.GetValue(handle, basic.PCAN_LISTEN_ONLY)
+    if result != basic.PCAN_ERROR_OK:
+        text = bus._get_formatted_error(result)
+        raise can.CanInitializationError(f"PCAN driver couldn't confirm listen-only mode: {text}")
+    if value != basic.PCAN_PARAMETER_ON:
+        raise can.CanInitializationError(
+            "PCAN channel did not enter listen-only mode, so it would ACK on the wire"
+        )
 
 
 def _pcan_overrun(bus: can.BusABC, exc: can.CanOperationError) -> bool:

@@ -37,6 +37,15 @@ once it reaches 1.0.
 - A Kvaser bus refuses a bitrate CANlib has no preset for instead of
   leaving the channel half-open, and the Create CAN bus dialog no longer
   offers 800 kbit/s for Kvaser adapters.
+- A PCAN bus whose open failed partway, for instance on an older
+  PCAN-Basic driver, no longer leaves the channel held: the next open works
+  without restarting the app.
+- A PCAN bus refuses a bitrate PCAN-Basic has no preset for instead of
+  running at 500 kbit/s.
+- PCAN status messages no longer show up as data frames in the Trace,
+  recordings and decoded signals.
+- A listen-only PCAN bus refuses to open when the adapter doesn't enter
+  listen-only mode, instead of ACKing on the wire.
 
 ## [0.1.1] - 2026-10-24
 

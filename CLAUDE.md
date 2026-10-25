@@ -252,6 +252,23 @@ MCP layer (`src/ithildin/mcp/`):
   Create dialog offers no 800 kbit/s for Kvaser). Listen-only uses a
   single handle: python-can sets silent mode on its write handle, which
   has no init access.
+- **PCAN buses open through `BusWorker._open_pcan`.** Only PCAN-Basic
+  preset bitrates (`PCAN_BITRATES`), checked before any driver call:
+  `PcanBus` runs any other rate at 500 kbit/s without a word (the Create
+  dialog's default rates are all presets). An open that fails after
+  `CAN_Initialize` initialised the channel — a later step failed, or
+  Initialize returned CAUTION — uninitialises it, or every later open of
+  it fails until a restart. Whether this open initialised it comes from
+  `GetStatus` before and after (`_pcan_initialised`), never from the
+  error: when Initialize itself fails, the channel may be another bus's
+  in this process. Status frames are turned off after the open (`PcanBus`
+  doesn't check the status-message type, so they can read as data frames),
+  which leaves the health tick's `status()` as pcan's only bus-state
+  source; `CAN_Reset` then empties the queues of those queued since
+  Initialize (it leaves the controller alone). Listen-only is read back
+  with `GetValue(PCAN_LISTEN_ONLY)` and the open refused unless the read
+  succeeds and it is on: `PcanBus` ignores that `SetValue`'s result.
+  `_finish_pcan_open` runs these steps; any failure shuts the bus down.
 - **Diagnostics go through `logging`.** `diagnostics.install()` is the
   first statement of `app.main`: one log file per launch in
   `~/.ithildin/logs` (newest 10 kept), `None` stdio (the windowed frozen
@@ -383,7 +400,9 @@ widget (drops on the inner GraphicsView don't propagate reliably).
   `block` hang the open or `recv` like a stuck vendor call until the
   event is set; set it before the test ends. Extend it rather than
   writing another fake. `GsUsbBus` itself runs against a fake `GsUsb`
-  adapter in `tests/test_gs_usb_bus.py`.
+  adapter in `tests/test_gs_usb_bus.py`, and `_open_pcan` runs
+  python-can's own `PcanBus` against a fake PCAN-Basic driver
+  (`tests/test_bus.py::_PcanBasic`).
 - The conftest fails a test whose `make_app_context` reader still has a
   worker running after `shutdown()`.
 - For Qt signals fired during a method call, use

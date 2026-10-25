@@ -13,6 +13,9 @@ import uuid
 
 import can
 import pytest
+from can.interfaces.pcan import basic
+from can.interfaces.pcan import pcan as pcan_mod
+from can.interfaces.pcan.pcan import PcanCanInitializationError
 from can.interfaces.virtual import VirtualBus
 from PySide6.QtCore import Qt
 
@@ -412,6 +415,266 @@ def test_kvaser_enum_hardware_does_nothing_off_windows(monkeypatch) -> None:  # 
     bus_mod.kvaser_enum_hardware()
 
     assert names == []
+
+
+_USBBUS1 = basic.PCAN_USBBUS1.value
+
+
+class _PcanBasic:
+    """PCAN-Basic for one process, under python-can's real ``PcanBus``.
+
+    Like the driver it keeps the channels this process has initialised:
+    ``Initialize`` refuses one already initialised, ``GetStatus`` reports
+    ``PCAN_ERROR_INITIALIZE`` for one that isn't. ``init_result`` is what
+    ``Initialize`` returns otherwise (CAUTION initialises too); ``refused``
+    maps a parameter to the error ``SetValue`` returns for it, ``raises`` to
+    the exception it raises, and ``unreadable`` to the error ``GetValue``
+    returns for it. Listen-only set before ``Initialize`` is read back after
+    it, until ``Uninitialize``. ``received`` is the receive queue: ``Read``
+    pops it, ``Reset`` empties it.
+    """
+
+    def __init__(self, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+        self.initialised: set[int] = set()
+        self.init_result = basic.PCAN_ERROR_OK
+        self.refused: dict[int, int] = {}
+        self.raises: dict[int, BaseException] = {}
+        self.unreadable: dict[int, int] = {}
+        self.values: dict[int, object] = {}
+        self.received: list[basic.TPCANMsg] = []
+        self.calls: list[tuple[str, int]] = []
+        self.uninitialised: list[int] = []
+        monkeypatch.setattr(basic, "PCANBasic", lambda: self)
+        monkeypatch.setattr(pcan_mod, "PCANBasic", lambda: self)
+
+    def Initialize(self, channel: ctypes.c_ushort, btr0btr1: ctypes.c_ushort, *_: object) -> int:
+        self.calls.append(("Initialize", btr0btr1.value))
+        if channel.value in self.initialised:
+            return basic.PCAN_ERROR_INITIALIZE
+        if self.init_result in (basic.PCAN_ERROR_OK, basic.PCAN_ERROR_CAUTION):
+            self.initialised.add(channel.value)
+        return self.init_result
+
+    def SetValue(self, _channel: ctypes.c_ushort, parameter: ctypes.c_ubyte, value: object) -> int:
+        self.calls.append(("SetValue", parameter.value))
+        if parameter.value in self.raises:
+            raise self.raises[parameter.value]
+        status = self.refused.get(parameter.value, basic.PCAN_ERROR_OK)
+        if status == basic.PCAN_ERROR_OK:
+            self.values[parameter.value] = value
+        return status
+
+    def GetValue(self, _channel: ctypes.c_ushort, parameter: ctypes.c_ubyte) -> tuple[int, object]:
+        if parameter.value == basic.PCAN_API_VERSION.value:
+            return basic.PCAN_ERROR_OK, b"4.6.0.0"
+        if parameter.value in self.unreadable:
+            return self.unreadable[parameter.value], 0
+        return basic.PCAN_ERROR_OK, self.values.get(parameter.value, 0)
+
+    def Read(self, _channel: ctypes.c_ushort) -> tuple[int, basic.TPCANMsg, basic.TPCANTimestamp]:
+        if not self.received:
+            return basic.PCAN_ERROR_QRCVEMPTY, basic.TPCANMsg(), basic.TPCANTimestamp()
+        return basic.PCAN_ERROR_OK, self.received.pop(0), basic.TPCANTimestamp()
+
+    def Reset(self, _channel: ctypes.c_ushort) -> int:
+        self.received.clear()
+        return basic.PCAN_ERROR_OK
+
+    def GetStatus(self, channel: ctypes.c_ushort) -> int:
+        if channel.value in self.initialised:
+            return basic.PCAN_ERROR_OK
+        return basic.PCAN_ERROR_INITIALIZE
+
+    def Uninitialize(self, channel: ctypes.c_ushort) -> int:
+        self.uninitialised.append(channel.value)
+        if channel.value not in self.initialised:
+            return basic.PCAN_ERROR_INITIALIZE
+        self.initialised.discard(channel.value)
+        self.values.clear()
+        return basic.PCAN_ERROR_OK
+
+    def GetErrorText(self, error: int, _language: int = 0) -> tuple[int, bytes]:
+        return basic.PCAN_ERROR_OK, f"PCAN error 0x{error:X}".encode()
+
+
+def _pcan_worker(*, bitrate: int = 500_000, listen_only: bool = False) -> BusWorker:
+    cfg = BusConfig(
+        name="P",
+        interface="pcan",
+        channel="PCAN_USBBUS1",
+        bitrate=bitrate,
+        listen_only=listen_only,
+    )
+    return BusWorker(cfg.name, cfg, RingBuffer(8))
+
+
+def test_pcan_open_turns_status_frames_off(qapp, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """PcanBus would hand status messages (MSGTYPE 0x80) on as data frames."""
+    driver = _PcanBasic(monkeypatch)
+
+    bus = _pcan_worker()._open_bus()
+
+    status_frames = basic.PCAN_ALLOW_STATUS_FRAMES.value
+    assert driver.values[status_frames] == basic.PCAN_PARAMETER_OFF
+    assert driver.calls.index(("SetValue", status_frames)) > driver.calls.index(
+        ("Initialize", basic.PCAN_BAUD_500K.value)
+    )
+    bus.shutdown()
+    assert driver.initialised == set()
+
+
+@pytest.mark.parametrize("bitrate", [33_333, 83_333, 2_000_000])
+def test_pcan_open_refuses_non_preset_bitrate_before_any_driver_call(  # type: ignore[no-untyped-def]
+    qapp, monkeypatch, bitrate: int
+) -> None:
+    """PcanBus would run the bus at 500 kbit/s instead."""
+    driver = _PcanBasic(monkeypatch)
+
+    with pytest.raises(can.CanInitializationError, match=f"no preset for {bitrate} bit/s"):
+        _pcan_worker(bitrate=bitrate)._open_bus()
+    assert driver.calls == []
+
+
+def test_pcan_open_failing_after_initialize_releases_the_channel(qapp, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """A PCANBasic older than 4.6 refuses echo frames after Initialize; the
+    channel stayed initialised and every later open failed until a restart."""
+    driver = _PcanBasic(monkeypatch)
+    driver.refused[basic.PCAN_ALLOW_ECHO_FRAMES.value] = basic.PCAN_ERROR_ILLPARAMTYPE
+
+    with pytest.raises(PcanCanInitializationError):
+        _pcan_worker()._open_bus()
+    assert driver.uninitialised == [_USBBUS1]
+    assert driver.initialised == set()
+
+    driver.refused.clear()
+    _pcan_worker()._open_bus().shutdown()
+
+
+@pytest.mark.parametrize(
+    ("parameter", "uninitialised"),
+    [(basic.PCAN_LISTEN_ONLY.value, []), (basic.PCAN_ALLOW_ECHO_FRAMES.value, [_USBBUS1])],
+    ids=["before-initialize", "after-initialize"],
+)
+def test_pcan_open_raising_passes_through_and_releases_only_its_channel(  # type: ignore[no-untyped-def]
+    qapp, monkeypatch, parameter: int, uninitialised: list[int]
+) -> None:
+    """A driver step can raise instead of returning an error code, such as
+    CreateEvent's OSError after Initialize."""
+    driver = _PcanBasic(monkeypatch)
+    error = OSError("driver call failed")
+    driver.raises[parameter] = error
+
+    with pytest.raises(OSError) as raised:
+        _pcan_worker()._open_bus()
+    assert raised.value is error
+    assert driver.uninitialised == uninitialised
+    assert driver.initialised == set()
+
+
+def test_pcan_initialize_caution_releases_the_channel(qapp, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """CAUTION opens the channel at another bitrate, and PcanBus raises."""
+    driver = _PcanBasic(monkeypatch)
+    driver.init_result = basic.PCAN_ERROR_CAUTION
+
+    with pytest.raises(PcanCanInitializationError):
+        _pcan_worker()._open_bus()
+    assert driver.initialised == set()
+
+
+def test_pcan_failed_initialize_leaves_the_driver_alone(qapp, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    driver = _PcanBasic(monkeypatch)
+    driver.init_result = basic.PCAN_ERROR_ILLHW
+
+    with pytest.raises(PcanCanInitializationError):
+        _pcan_worker()._open_bus()
+    assert driver.uninitialised == []
+
+
+def test_pcan_open_of_a_channel_open_in_this_process_never_releases_it(  # type: ignore[no-untyped-def]
+    qapp, monkeypatch
+) -> None:
+    """Initialize refuses a channel another bus of this process holds; that
+    bus must keep it."""
+    driver = _PcanBasic(monkeypatch)
+    driver.initialised.add(_USBBUS1)
+
+    with pytest.raises(PcanCanInitializationError):
+        _pcan_worker()._open_bus()
+    assert driver.uninitialised == []
+    assert driver.initialised == {_USBBUS1}
+
+
+def test_pcan_open_refused_status_frames_fails_and_releases(qapp, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    driver = _PcanBasic(monkeypatch)
+    driver.refused[basic.PCAN_ALLOW_STATUS_FRAMES.value] = basic.PCAN_ERROR_ILLPARAMTYPE
+
+    with pytest.raises(can.CanInitializationError, match="status frames"):
+        _pcan_worker()._open_bus()
+    assert driver.initialised == set()
+
+
+def test_pcan_open_drops_status_messages_queued_before_they_were_turned_off(  # type: ignore[no-untyped-def]
+    qapp, monkeypatch
+) -> None:
+    """A bus fault right after CAN_Initialize queues a status message, which
+    PcanBus would read as a data frame."""
+    driver = _PcanBasic(monkeypatch)
+    initialize = driver.Initialize
+
+    def initialize_onto_a_faulty_bus(*args: ctypes.c_ushort) -> int:
+        result = initialize(*args)
+        driver.received.append(basic.TPCANMsg(MSGTYPE=basic.PCAN_MESSAGE_STATUS.value, LEN=4))
+        return result
+
+    monkeypatch.setattr(driver, "Initialize", initialize_onto_a_faulty_bus)
+
+    bus = _pcan_worker()._open_bus()
+
+    assert bus.recv(0) is None
+    bus.shutdown()
+
+
+def test_pcan_open_failing_to_empty_the_queues_fails_and_releases(qapp, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    driver = _PcanBasic(monkeypatch)
+    monkeypatch.setattr(driver, "Reset", lambda _channel: basic.PCAN_ERROR_ILLHW)
+
+    with pytest.raises(can.CanInitializationError, match="receive queue: PCAN error 0x1400"):
+        _pcan_worker()._open_bus()
+    assert driver.initialised == set()
+
+
+def test_pcan_listen_only_is_read_back(qapp, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    driver = _PcanBasic(monkeypatch)
+
+    bus = _pcan_worker(listen_only=True)._open_bus()
+
+    assert driver.values[basic.PCAN_LISTEN_ONLY.value] == basic.PCAN_PARAMETER_ON
+    bus.shutdown()
+
+
+def test_pcan_listen_only_not_entered_refuses_the_open(qapp, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """PcanBus ignores the driver refusing listen-only, and the channel
+    would ACK on the wire."""
+    driver = _PcanBasic(monkeypatch)
+    driver.refused[basic.PCAN_LISTEN_ONLY.value] = basic.PCAN_ERROR_ILLPARAMTYPE
+
+    with pytest.raises(can.CanInitializationError, match="would ACK"):
+        _pcan_worker(listen_only=True)._open_bus()
+    assert driver.initialised == set()
+
+
+def test_pcan_listen_only_unreadable_refuses_the_open_with_the_driver_error(  # type: ignore[no-untyped-def]
+    qapp, monkeypatch
+) -> None:
+    """A failed read-back is not a channel that ACKs."""
+    driver = _PcanBasic(monkeypatch)
+    driver.unreadable[basic.PCAN_LISTEN_ONLY.value] = basic.PCAN_ERROR_ILLPARAMTYPE
+
+    with pytest.raises(
+        can.CanInitializationError, match="couldn't confirm listen-only mode: PCAN error 0x"
+    ):
+        _pcan_worker(listen_only=True)._open_bus()
+    assert driver.initialised == set()
 
 
 def test_listen_only_virtual_is_noop() -> None:

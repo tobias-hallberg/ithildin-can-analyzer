@@ -13,6 +13,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from can.interfaces.pcan.basic import PCAN_BITRATES
 
 from ithildin.ui import adapter_prober as prober_mod
 from ithildin.ui.adapter_enrich import ChannelInfo, DeviceInfo
@@ -324,6 +325,24 @@ def test_baud_choice_kept_while_still_offered(qapp, qtbot) -> None:  # type: ign
     dlg.bus_declared.connect(lambda cfg, _dbcs: captured.append(cfg))
     dlg._on_create()
     assert captured[0].bitrate == 1_000_000
+
+
+def test_pcan_baud_choices_are_pcan_presets(qapp, qtbot) -> None:  # type: ignore[no-untyped-def]
+    """A PCAN bus refuses to open on a bitrate PCAN-Basic has no preset for."""
+    dlg = _make_dialog(qtbot)
+
+    _select_new_device(
+        dlg,
+        DeviceInfo(
+            interface="pcan",
+            vendor="PEAK-System",
+            model="PCAN-USB",
+            channels=(ChannelInfo(channel="PCAN_USBBUS1", label="PCAN_USBBUS1"),),
+        ),
+    )
+
+    assert 800_000 in _baud_choices(dlg)
+    assert set(_baud_choices(dlg)) <= PCAN_BITRATES.keys()
 
 
 def test_in_use_channel_pill_is_disabled(qapp, qtbot) -> None:  # type: ignore[no-untyped-def]
