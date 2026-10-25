@@ -32,6 +32,7 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import QSizePolicy, QWidget
 
 from ithildin.ui.fonts import tabular_font
+from ithildin.ui.icons import themed_callback
 from ithildin.ui.theme import ThemeManager
 
 
@@ -61,7 +62,7 @@ class TxMasterPill(QWidget):
         self._anim = QPropertyAnimation(self, b"thumbPos", self)
         self._anim.setDuration(140)
         self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-        ThemeManager.instance().theme_changed.connect(lambda _t: self.update())
+        themed_callback(self.update)
 
     # ------------------------------------------------------------------
     # State

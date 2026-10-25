@@ -12,7 +12,9 @@ This module owns two responsibilities:
 2. **Engine.** :class:`TxScheduler` reconciles a :class:`TxSetup` against
    live ``python-can`` cyclic tasks via :meth:`BusReader.start_periodic`
    and ``CyclicSendTask.modify_data`` — see handoff §2 for the two-tier
-   master / per-row semantics.
+   master / per-row semantics. Anything that stops TX behind the user's
+   back (bus closed or lost, a task failing) turns the master OFF; nothing
+   ever restarts on its own.
 
 The shared :func:`encode_tx_message` helper is also called by the MCP
 ``send_signal`` tool so the two transmit paths can never drift.
@@ -26,9 +28,10 @@ from typing import Any, Literal
 
 import can
 import cantools.database
+from can.broadcastmanager import ThreadBasedCyclicSendTask
 from PySide6.QtCore import QObject, Signal
 
-from ithildin.app_state.bus_reader import BusReader, BusReadOnlyError
+from ithildin.app_state.bus_reader import BusReader
 from ithildin.app_state.database import Database
 
 TxSignalKind = Literal[
@@ -324,21 +327,30 @@ class TxScheduler(QObject):
     Lifecycle:
       * :meth:`apply` is the single reconciliation point — diff the new
         setup against currently-running tasks and start / stop / modify
-        accordingly. Cheap to call after every UI change.
+        accordingly. Cheap to call after every UI change. The scheduler
+        keeps the setup object it is given, and mutates its
+        ``master_enabled`` when it disarms.
       * :meth:`set_master` flips the global gate. ``False`` stops every
         task but leaves the setup intact; ``True`` re-applies.
       * :meth:`send_one_shot` dispatches a single send via
-        :meth:`BusReader.send_message`. Refused with an ``error`` signal
-        when master is OFF (handoff §15 open Q3 — *refuse + toast*).
-      * :meth:`shutdown` stops every task; the TX window calls this on
-        close.
+        :meth:`BusReader.send_message_async`. Refused with an ``error``
+        signal when master is OFF (handoff §15 open Q3 — *refuse + toast*).
+      * :meth:`shutdown` turns master OFF, which stops every task; the
+        TX window calls this on close.
 
-    Listen-only buses are honoured up front: enabling master while any
-    active transmit targets a listen-only bus emits ``error`` and the
-    master stays OFF.
+    Invariant: while master is ON, every active periodic row has a live
+    task. When that can't hold (a task fails or won't start, or a bus an
+    active row targets closes or fails) the scheduler disarms: master
+    OFF, every task stopped, queued frames flushed, ``disarmed`` emitted.
+    Nothing starts while master is OFF, so a reopened bus or a later edit
+    never resumes TX by itself.
+
+    Arming is refused up front, with ``error`` and master left OFF, while
+    an active transmit targets a listen-only or closed bus.
     """
 
     error = Signal(int, str)  # (message_id, message); 0 for non-row errors
+    disarmed = Signal(str)  # reason
 
     def __init__(
         self,
@@ -350,8 +362,11 @@ class TxScheduler(QObject):
         self._bus_reader = bus_reader
         self._database = database
         self._setup = TxSetup()
-        self._tasks: dict[int, object] = {}
-        self._bus_reader.bus_stopped.connect(self._on_bus_stopped)
+        self._tasks: dict[tuple[str, int], ThreadBasedCyclicSendTask] = {}
+        bus_reader.bus_failed.connect(self._on_bus_failed)
+        bus_reader.bus_stopped.connect(self._on_bus_stopped)
+        bus_reader.cyclic_failed.connect(self._on_cyclic_failed)
+        bus_reader.send_failed.connect(self._on_send_failed)
 
     @property
     def setup(self) -> TxSetup:
@@ -365,14 +380,17 @@ class TxScheduler(QObject):
     def set_master(self, enabled: bool) -> None:
         """Toggle the global TX gate.
 
-        Turning ON checks every active row's bus for listen-only; any
-        match refuses the toggle and emits :attr:`error` so the UI can
-        revert the switch and toast.
+        Turning ON checks every active row's bus is open and not
+        listen-only; a failing check refuses the toggle and emits
+        :attr:`error` so the UI can revert the switch and toast. Turning
+        OFF also discards whatever the adapters still have queued.
         """
-        if enabled and not self._check_listen_only_clear():
+        if enabled and not (self._check_listen_only_clear() and self._check_buses_open()):
             return
         self._setup.master_enabled = enabled
         self._reconcile()
+        if not enabled:
+            self._flush_targets()
 
     def toggle_active(self, idx: int) -> None:
         if not (0 <= idx < len(self._setup.transmits)):
@@ -397,56 +415,78 @@ class TxScheduler(QObject):
         if msg is None:
             return
         try:
-            self._bus_reader.send_message(msg, tx.bus_name)
-        except BusReadOnlyError as exc:
+            self._bus_reader.send_message_async(msg, tx.bus_name)
+        except RuntimeError as exc:
             self.error.emit(tx.message_id, str(exc))
-        except Exception as exc:  # pragma: no cover — defensive
-            self.error.emit(tx.message_id, f"send failed: {exc}")
 
     def shutdown(self) -> None:
-        for task in list(self._tasks.values()):
-            self._bus_reader.stop_periodic(task)
-        self._tasks.clear()
+        # Tasks only run while master is ON, and turning it OFF flushed.
+        if self._setup.master_enabled:
+            self.set_master(False)
+
+    def is_transmitting(self, tx: TxMessage) -> bool:
+        """Whether ``tx`` is live right now; what the UI shows as transmitting.
+
+        A periodic row counts only while its task runs, so a task that died
+        on a send error stops showing at once, before the disarm arrives.
+        """
+        if tx.mode == "periodic":
+            task = self._tasks.get((tx.bus_name, tx.message_id))
+            return task is not None and not task.stopped
+        return self._setup.master_enabled and tx.active
 
     # ---- Internal ----
 
     def _reconcile(self) -> None:
         """Bring live cyclic tasks into agreement with the setup."""
-        target_ids: set[int] = set()
+        failure = self._sync_tasks()
+        if failure is not None:
+            self._disarm(failure)
+
+    def _sync_tasks(self) -> str | None:
+        """Start, stop and modify tasks to match the setup; the failure reason, if any."""
+        wanted: dict[tuple[str, int], TxMessage] = {}
         if self._setup.master_enabled:
             for tx in self._setup.transmits:
-                if not tx.active or tx.mode != "periodic":
-                    continue
-                target_ids.add(tx.message_id)
-        # Stop tasks no longer wanted.
-        for mid in list(self._tasks):
-            if mid not in target_ids:
-                self._bus_reader.stop_periodic(self._tasks.pop(mid))
-        # Start or update tasks we want.
-        for tx in self._setup.transmits:
-            if tx.message_id not in target_ids:
-                continue
+                if tx.active and tx.mode == "periodic":
+                    wanted[(tx.bus_name, tx.message_id)] = tx
+        for key, task in list(self._tasks.items()):
+            wanted_tx = wanted.get(key)
+            # python-can can't change a running task's period: restart it.
+            if wanted_tx is None or task.period_ms != wanted_tx.period_ms:
+                del self._tasks[key]
+                self._bus_reader.stop_periodic(key[0], task)
+        for key, tx in wanted.items():
             msg = self._encode(tx)
             if msg is None:
+                return f"Periodic 0x{tx.message_id:X} on {tx.bus_name} can't be encoded"
+            running = self._tasks.get(key)
+            if running is not None:
+                running.modify_data(msg)
                 continue
-            existing = self._tasks.get(tx.message_id)
-            if existing is None:
-                try:
-                    task = self._bus_reader.start_periodic(msg, tx.bus_name, tx.period_ms / 1000.0)
-                except BusReadOnlyError as exc:
-                    self.error.emit(tx.message_id, str(exc))
-                    continue
-                except Exception as exc:
-                    self.error.emit(tx.message_id, f"start_periodic failed: {exc}")
-                    continue
-                self._tasks[tx.message_id] = task
-            else:
-                modify = getattr(existing, "modify_data", None)
-                if callable(modify):
-                    try:
-                        modify(msg)
-                    except Exception as exc:
-                        self.error.emit(tx.message_id, f"modify_data failed: {exc}")
+            try:
+                self._tasks[key] = self._bus_reader.start_periodic(
+                    msg, tx.bus_name, tx.period_ms / 1000.0
+                )
+            except RuntimeError as exc:
+                return f"Periodic 0x{tx.message_id:X} on {tx.bus_name} didn't start ({exc})"
+        return None
+
+    def _disarm(self, reason: str) -> None:
+        """The single disarm path: master OFF, stop everything, flush, tell the UI."""
+        if not self._setup.master_enabled:
+            return
+        self._setup.master_enabled = False
+        self._reconcile()
+        self._flush_targets()
+        self.disarmed.emit(reason)
+
+    def _flush_targets(self) -> None:
+        for bus_name in {tx.bus_name for tx in self._setup.transmits}:
+            self._bus_reader.flush_tx(bus_name)
+
+    def _targets_actively(self, bus_name: str) -> bool:
+        return any(tx.active and tx.bus_name == bus_name for tx in self._setup.transmits)
 
     def _encode(self, tx: TxMessage) -> can.Message | None:
         decoder = self._database.decoder_for_bus(tx.bus_name)
@@ -482,14 +522,38 @@ class TxScheduler(QObject):
                 return False
         return True
 
+    def _check_buses_open(self) -> bool:
+        """Verify every active transmit's bus is connected."""
+        open_buses = set(self._bus_reader.bus_names())
+        for tx in self._setup.transmits:
+            if tx.active and tx.bus_name not in open_buses:
+                self.error.emit(
+                    tx.message_id,
+                    f"bus {tx.bus_name!r} is not connected — connect it first",
+                )
+                return False
+        return True
+
+    def _on_bus_failed(self, bus_name: str, error: str) -> None:
+        # Fires just before bus_stopped, so this more specific reason wins.
+        if self._targets_actively(bus_name):
+            self._disarm(f"Bus {bus_name} lost ({error})")
+
     def _on_bus_stopped(self, bus_name: str) -> None:
-        """Tear down tasks bound to a bus that just closed."""
-        for tx in list(self._setup.transmits):
-            if tx.bus_name != bus_name:
-                continue
-            task = self._tasks.pop(tx.message_id, None)
-            if task is not None:
-                self._bus_reader.stop_periodic(task)
+        for key in [key for key in self._tasks if key[0] == bus_name]:
+            self._bus_reader.stop_periodic(bus_name, self._tasks.pop(key))
+        if self._targets_actively(bus_name):
+            self._disarm(f"Bus {bus_name} closed")
+
+    def _on_cyclic_failed(self, bus_name: str, message_id: int, error: str) -> None:
+        if (bus_name, message_id) in self._tasks:
+            self._disarm(f"Periodic 0x{message_id:X} on {bus_name} failed ({error})")
+
+    def _on_send_failed(self, bus_name: str, message_id: int, error: str) -> None:
+        if any(
+            tx.bus_name == bus_name and tx.message_id == message_id for tx in self._setup.transmits
+        ):
+            self.error.emit(message_id, f"send failed: {error}")
 
 
 # --------------------------------------------------------------------------

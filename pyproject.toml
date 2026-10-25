@@ -24,7 +24,7 @@ classifiers = [
     "Topic :: System :: Hardware",
 ]
 dependencies = [
-    "python-can>=4.4",
+    "python-can>=4.6.1",
     "cantools>=39",
     "pyside6>=6.7",
     "pyqtgraph>=0.13",

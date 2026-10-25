@@ -24,7 +24,10 @@ the bottom of every Trace window. Hardware / Settings / MCP / About are
 Process-level singletons live in `app_state/`:
 
 - `BusReader` (`bus_reader.py`) — wraps `core/bus.py`'s `BusController`,
-  exposes `bus_started / bus_stopped / frames_received(list) / error`.
+  exposes `bus_started / bus_stopped / bus_failed / frames_received(list)
+  / error`, plus `cyclic_failed / send_failed` for TX. `send_message` is
+  synchronous and callable from any thread (Replay, MCP);
+  `send_message_async` is the TX window's one-shot path.
 - `Database` (`database.py`) — wraps `core/decoder.py`'s `Decoder`,
   emits `database_changed / error`.
 - `Project` (`project.py`) — `.itp` file loader + legacy migration.
@@ -60,6 +63,38 @@ MCP layer (`src/ithildin/mcp/`):
 - **Bus worker shutdown** uses `Qt.ConnectionType.DirectConnection` for
   `worker.stopped → thread.quit`. The main thread blocks on
   `thread.wait()`; a queued slot can't fire there.
+- **One send lock per bus.** `BusWorker._send_lock` serialises every
+  touch of a python-can bus other than `recv()`: `send` (from any
+  thread), cyclic tasks, task creation, the TX flush and `_close_bus`.
+  `send` reads `_bus` once under it, so after a close every sender gets
+  `RuntimeError("… not open")`. Take it without a timeout.
+- **Cyclic tasks are app-built.** `BusWorker.send_periodic` builds a
+  `ThreadBasedCyclicSendTask(bus, lock, …)` for every backend; never call
+  `bus.send_periodic` (IXXAT's hardware scheduler raises when stopped
+  twice, has no `modify_data` and doesn't echo). Its `on_error` emits
+  `cyclic_failed` and returns `False`, so a failing task stops instead of
+  retrying. Stop tasks through `BusReader.stop_periodic(bus, task)`.
+- **TX flush runs on the worker thread.** `BusReader.flush_tx(bus)` →
+  `BusWorker.request_flush()` sets a flag the capture loop services under
+  the send lock: pcan `reset()` (also empties the RX queue), kvaser
+  `flush_tx_buffer()`; never IXXAT (its flush waits INFINITE), never a
+  listen-only bus. Flush on master OFF, on every disarm and on scheduler
+  shutdown only — not when a row stops.
+- **TX disarms and never resumes implicitly.** `TxScheduler._disarm(reason)`
+  is the single path: master OFF, stop every task, flush, emit
+  `disarmed` (the TX window shows an amber banner and a Report entry). It
+  runs when a bus an *active* row targets closes or fails, when a cyclic
+  task fails, and when a wanted task can't start while armed. Arming is
+  refused while an active row's bus is closed or listen-only. Nothing
+  starts while master is OFF, so a reopened bus or a later edit never
+  restarts TX — the user re-arms. The TX window and its scheduler share
+  one `TxSetup`; what the UI shows as transmitting comes from
+  `TxScheduler.is_transmitting`.
+- **Connect app-lifetime emitters to bound methods.** `BusReader`,
+  `ThemeManager` and `UiEvents` outlive every view. A lambda capturing
+  `self` keeps firing into a deleted widget; a bound QObject method
+  disconnects itself. For theme reactions use
+  `icons.themed_callback(self._restyle)`, which holds the widget weakly.
 - **`Qt.WA_DeleteOnClose`** is set on every child view. The
   `WindowManager` listens to `QObject.destroyed` (not `closeEvent`) to
   deregister — `closeEvent` runs while the C++ object is still alive,
@@ -151,7 +186,9 @@ strip — uses `setObjectName("ErrorBanner" | "WarnBanner" | "InfoBanner")`
 + `WA_StyledBackground` so the QSS rules tint it. `ui/report_dock.py`'s
 `ReportDockWidget` is the cross-window event log living in MainWindow's
 bottom dock. `MainWindow.report(msg, kind=...)` is the public hook —
-`BusReader.error` and `Database.error` already wire into it.
+`BusReader.error / send_failed / cyclic_failed` and `Database.error`
+already wire into it. Views, which hold no `MainWindow` reference, emit
+`ctx.events.report_requested(msg, kind)` instead.
 
 ### Toolbar buttons
 
@@ -214,6 +251,12 @@ widget (drops on the inner GraphicsView don't propagate reliably).
   `tests/test_signal_plot.py::test_filter_then_decode_updates_curve` for
   a complete end-to-end pattern: open a channel, send via `can.Bus`,
   assert via `qtbot.waitUntil`.
+- For bus fault paths, `tests/fake_bus.py`: `use_fake_bus(monkeypatch)`
+  makes every `BusWorker` open a scriptable `FakeBus` (raising
+  `send`/`recv`, flush counters, the sending thread and lock state per
+  frame), so a `pcan` / `kvaser` / `ixxat` config runs that backend's
+  branches without importing a vendor module. Extend it rather than
+  writing another fake.
 - For Qt signals fired during a method call, use
   `with qtbot.waitSignal(sig, timeout=…):` not `QSignalSpy().wait()` —
   the spy can miss signals fired before `wait()` returns.

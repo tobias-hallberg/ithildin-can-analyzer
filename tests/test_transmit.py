@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -28,6 +29,7 @@ from ithildin.core.transmit import (
 )
 from ithildin.ui.transmit.controls import TxSlider, control_for_signal
 from ithildin.workspace.schema import BusConfig
+from tests.fake_bus import use_fake_bus
 
 # ---------------------------------------------------------------------------
 # Shared encoder
@@ -298,9 +300,9 @@ def test_scheduler_one_shot_routes_through_bus_reader(qapp, qtbot, example_dbc_p
         )
     )
 
-    # Patch the reader's send_message to capture the call.
+    # Patch the reader's one-shot send to capture the call.
     sent: list[can.Message] = []
-    reader.send_message = lambda msg, bus_name=None: sent.append(msg)  # type: ignore[method-assign]
+    reader.send_message_async = lambda msg, bus_name: sent.append(msg)  # type: ignore[method-assign]
     sched.send_one_shot(0)
     assert len(sent) == 1
     assert sent[0].arbitration_id == 0x100
@@ -343,7 +345,7 @@ def test_scheduler_periodic_starts_and_modifies(qapp, qtbot, example_dbc_path: P
     db.add_dbc(example_dbc_path, ["CAN_1"])
     _open_virtual_bus(reader, qtbot)
 
-    task = MagicMock()
+    task = MagicMock(period_ms=50, stopped=False)
     reader.start_periodic = MagicMock(return_value=task)  # type: ignore[method-assign]
     reader.stop_periodic = MagicMock()  # type: ignore[method-assign]
 
@@ -377,7 +379,9 @@ def test_scheduler_master_off_stops_periodic(qapp, qtbot, example_dbc_path: Path
     db.add_dbc(example_dbc_path, ["CAN_1"])
     _open_virtual_bus(reader, qtbot)
 
-    reader.start_periodic = MagicMock(return_value=MagicMock())  # type: ignore[method-assign]
+    reader.start_periodic = MagicMock(  # type: ignore[method-assign]
+        return_value=MagicMock(period_ms=50, stopped=False)
+    )
     reader.stop_periodic = MagicMock()  # type: ignore[method-assign]
 
     sched = TxScheduler(reader, db)
@@ -586,3 +590,260 @@ def test_signal_change_modifies_live_payload(qapp, qtbot, example_dbc_path: Path
         receiver.shutdown()
         sched.shutdown()
         reader.close()
+
+
+# ---------------------------------------------------------------------------
+# Disarm: anything that stops TX behind the user's back turns master OFF,
+# and nothing restarts on its own.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def tx_reader():  # type: ignore[no-untyped-def]
+    reader = BusReader()
+    yield reader
+    reader.close()
+
+
+def _db(dbc_path: Path, buses: list[str] | None = None) -> Database:
+    db = Database()
+    db.add_dbc(dbc_path, buses or ["CAN_1"])
+    return db
+
+
+def _periodic(bus: str = "CAN_1", *, period_ms: int = 20, active: bool = True) -> TxMessage:
+    return TxMessage(
+        bus_name=bus,
+        message_id=0x100,
+        message_name="EngineCommand",
+        mode="periodic",
+        period_ms=period_ms,
+        active=active,
+        signal_values={"EngineSpeed": 800.0},
+    )
+
+
+def _one_shot() -> TxMessage:
+    return TxMessage(
+        bus_name="CAN_1",
+        message_id=0x100,
+        message_name="EngineCommand",
+        signal_values={"EngineSpeed": 800.0},
+    )
+
+
+def _open_fake(reader: BusReader, qtbot, interface: str = "pcan") -> None:  # type: ignore[no-untyped-def]
+    cfg = BusConfig(name="CAN_1", interface=interface, channel="X", bitrate=500000)  # type: ignore[arg-type]
+    with qtbot.waitSignal(reader.bus_started, timeout=2000):
+        reader.open(cfg)
+
+
+def test_disconnect_disarms_and_reconnect_does_not_resume(  # type: ignore[no-untyped-def]
+    qapp, qtbot, example_dbc_path: Path, tx_reader
+) -> None:
+    channel = f"e2e-{uuid.uuid4().hex[:8]}"
+    _open_reader_with_channel(tx_reader, qtbot, channel)
+    sched = TxScheduler(tx_reader, _db(example_dbc_path))
+    tx = _periodic()
+    receiver = can.Bus(interface="virtual", channel=channel)
+    try:
+        sched.apply(TxSetup(master_enabled=True, transmits=[tx]))
+        assert receiver.recv(timeout=1.0) is not None
+
+        with qtbot.waitSignal(sched.disarmed, timeout=2000) as blocker:
+            tx_reader.close("CAN_1")
+        assert blocker.args == ["Bus CAN_1 closed"]
+        assert sched.setup.master_enabled is False
+        while receiver.recv(timeout=0.05) is not None:
+            pass
+
+        _open_reader_with_channel(tx_reader, qtbot, channel)
+        tx.signal_values["EngineSpeed"] = 1000.0
+        tx.period_ms = 10
+        sched.apply(sched.setup)
+        assert receiver.recv(timeout=0.3) is None
+        assert sched._tasks == {}
+    finally:
+        receiver.shutdown()
+        sched.shutdown()
+
+
+def test_closing_a_bus_without_active_rows_keeps_master_on(  # type: ignore[no-untyped-def]
+    qapp, qtbot, example_dbc_path: Path, tx_reader
+) -> None:
+    _open_virtual_bus(tx_reader, qtbot)
+    sched = TxScheduler(tx_reader, _db(example_dbc_path))
+    sched.apply(TxSetup(master_enabled=True, transmits=[_periodic(active=False)]))
+    disarms: list[str] = []
+    sched.disarmed.connect(disarms.append)
+
+    with qtbot.waitSignal(tx_reader.bus_stopped, timeout=2000):
+        tx_reader.close("CAN_1")
+    assert sched.setup.master_enabled is True
+    assert disarms == []
+
+
+def test_bus_failure_disarms_with_reason(  # type: ignore[no-untyped-def]
+    qapp, qtbot, monkeypatch, example_dbc_path: Path, tx_reader
+) -> None:
+    fake = use_fake_bus(monkeypatch)
+    _open_fake(tx_reader, qtbot)
+    sched = TxScheduler(tx_reader, _db(example_dbc_path))
+    sched.apply(TxSetup(master_enabled=True, transmits=[_periodic()]))
+    qtbot.waitUntil(lambda: len(fake.sent) >= 1, timeout=2000)
+
+    with qtbot.waitSignal(sched.disarmed, timeout=2000) as blocker:
+        fake.recv_exc = can.CanOperationError("adapter gone")
+    assert blocker.args[0].startswith("Bus CAN_1 lost (")
+    assert "adapter gone" in blocker.args[0]
+    assert sched.setup.master_enabled is False
+    assert sched._tasks == {}
+
+
+def test_cyclic_failure_disarms_and_flushes(  # type: ignore[no-untyped-def]
+    qapp, qtbot, monkeypatch, example_dbc_path: Path, tx_reader
+) -> None:
+    fake = use_fake_bus(monkeypatch)
+    _open_fake(tx_reader, qtbot, "pcan")
+    sched = TxScheduler(tx_reader, _db(example_dbc_path))
+    sched.apply(TxSetup(master_enabled=True, transmits=[_periodic(period_ms=10)]))
+    qtbot.waitUntil(lambda: len(fake.sent) >= 1, timeout=2000)
+
+    with qtbot.waitSignal(sched.disarmed, timeout=2000) as blocker:
+        fake.send_exc = can.CanOperationError("transmit queue full")
+    assert blocker.args == ["Periodic 0x100 on CAN_1 failed (transmit queue full)"]
+    assert sched.setup.master_enabled is False
+    qtbot.waitUntil(lambda: fake.resets >= 1, timeout=2000)
+
+    fake.send_exc = None
+    sent = len(fake.sent)
+    qtbot.wait(100)
+    assert len(fake.sent) == sent
+
+
+def test_period_change_restarts_task(  # type: ignore[no-untyped-def]
+    qapp, qtbot, example_dbc_path: Path, tx_reader
+) -> None:
+    """Regression: python-can can't retime a task, so a period edit had no effect."""
+    _open_virtual_bus(tx_reader, qtbot)
+    sched = TxScheduler(tx_reader, _db(example_dbc_path))
+    tx = _periodic(period_ms=100)
+    sched.apply(TxSetup(master_enabled=True, transmits=[tx]))
+    old = sched._tasks[("CAN_1", 0x100)]
+
+    tx.period_ms = 50
+    sched.apply(sched.setup)
+    new = sched._tasks[("CAN_1", 0x100)]
+    assert new is not old
+    assert old.stopped
+    assert new.period_ms == 50
+    assert not new.stopped
+    sched.shutdown()
+
+
+def test_master_off_flushes_targeted_buses(  # type: ignore[no-untyped-def]
+    qapp, qtbot, monkeypatch, example_dbc_path: Path, tx_reader
+) -> None:
+    """Queued one-shots are discarded too, not only periodic rows' frames."""
+    fake = use_fake_bus(monkeypatch)
+    _open_fake(tx_reader, qtbot, "kvaser")
+    sched = TxScheduler(tx_reader, _db(example_dbc_path))
+    sched.apply(TxSetup(transmits=[_one_shot()]))
+    sched.set_master(True)
+    assert sched.setup.master_enabled is True
+
+    sched.set_master(False)
+    qtbot.waitUntil(lambda: fake.flushes == 1, timeout=2000)
+
+
+def test_shutdown_turns_master_off_and_flushes(  # type: ignore[no-untyped-def]
+    qapp, qtbot, monkeypatch, example_dbc_path: Path, tx_reader
+) -> None:
+    """The closing TX window's scheduler goes inert: a later bus stop is no disarm."""
+    fake = use_fake_bus(monkeypatch)
+    _open_fake(tx_reader, qtbot, "kvaser")
+    sched = TxScheduler(tx_reader, _db(example_dbc_path))
+    sched.apply(TxSetup(master_enabled=True, transmits=[_periodic()]))
+    task = sched._tasks[("CAN_1", 0x100)]
+    disarms: list[str] = []
+    sched.disarmed.connect(disarms.append)
+
+    sched.shutdown()
+    assert task.stopped
+    assert sched.setup.master_enabled is False
+    qtbot.waitUntil(lambda: fake.flushes == 1, timeout=2000)
+    with qtbot.waitSignal(tx_reader.bus_stopped, timeout=2000):
+        tx_reader.close("CAN_1")
+    assert disarms == []
+
+
+def test_arming_refused_when_target_bus_closed(  # type: ignore[no-untyped-def]
+    qapp, qtbot, example_dbc_path: Path, tx_reader
+) -> None:
+    sched = TxScheduler(tx_reader, _db(example_dbc_path))
+    sched.apply(TxSetup(transmits=[_periodic()]))
+    errors: list[str] = []
+    sched.error.connect(lambda _mid, msg: errors.append(msg))
+
+    sched.set_master(True)
+    assert sched.setup.master_enabled is False
+    assert errors == ["bus 'CAN_1' is not connected — connect it first"]
+
+
+def test_start_failure_disarms(  # type: ignore[no-untyped-def]
+    qapp, qtbot, example_dbc_path: Path, tx_reader
+) -> None:
+    _open_virtual_bus(tx_reader, qtbot)
+    sched = TxScheduler(tx_reader, _db(example_dbc_path, ["CAN_1", "CAN_2"]))
+    sched.apply(TxSetup(transmits=[_periodic(), _periodic("CAN_2", active=False)]))
+    sched.set_master(True)
+    assert sched.setup.master_enabled is True
+
+    with qtbot.waitSignal(sched.disarmed, timeout=1000) as blocker:
+        sched.toggle_active(1)
+    assert blocker.args[0].startswith("Periodic 0x100 on CAN_2 didn't start")
+    assert sched.setup.master_enabled is False
+    assert sched._tasks == {}
+
+
+def test_one_shot_sends_off_gui_thread(  # type: ignore[no-untyped-def]
+    qapp, qtbot, monkeypatch, example_dbc_path: Path, tx_reader
+) -> None:
+    fake = use_fake_bus(monkeypatch)
+    _open_fake(tx_reader, qtbot)
+    sched = TxScheduler(tx_reader, _db(example_dbc_path))
+    sched.apply(TxSetup(master_enabled=True, transmits=[_one_shot()]))
+
+    sched.send_one_shot(0)
+    qtbot.waitUntil(lambda: len(fake.sent) == 1, timeout=2000)
+    msg, thread, _held = fake.sent[0]
+    assert msg.arbitration_id == 0x100
+    assert thread is not threading.main_thread()
+
+
+def test_one_shot_failure_reports_error(  # type: ignore[no-untyped-def]
+    qapp, qtbot, monkeypatch, example_dbc_path: Path, tx_reader
+) -> None:
+    fake = use_fake_bus(monkeypatch)
+    fake.send_exc = can.CanOperationError("no ACK")
+    _open_fake(tx_reader, qtbot)
+    sched = TxScheduler(tx_reader, _db(example_dbc_path))
+    sched.apply(TxSetup(master_enabled=True, transmits=[_one_shot()]))
+
+    with qtbot.waitSignal(sched.error, timeout=2000) as blocker:
+        sched.send_one_shot(0)
+    assert blocker.args == [0x100, "send failed: no ACK"]
+    assert sched.setup.master_enabled is True
+
+
+def test_same_id_on_two_buses_gets_two_tasks(  # type: ignore[no-untyped-def]
+    qapp, qtbot, example_dbc_path: Path, tx_reader
+) -> None:
+    _open_virtual_bus(tx_reader, qtbot, name="CAN_1")
+    _open_virtual_bus(tx_reader, qtbot, name="CAN_2")
+    sched = TxScheduler(tx_reader, _db(example_dbc_path, ["CAN_1", "CAN_2"]))
+    sched.apply(TxSetup(master_enabled=True, transmits=[_periodic("CAN_1"), _periodic("CAN_2")]))
+
+    assert set(sched._tasks) == {("CAN_1", 0x100), ("CAN_2", 0x100)}
+    assert not any(task.stopped for task in sched._tasks.values())
+    sched.shutdown()

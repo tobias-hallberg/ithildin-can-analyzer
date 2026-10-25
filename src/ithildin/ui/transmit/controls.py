@@ -54,6 +54,7 @@ from PySide6.QtWidgets import (
 
 from ithildin.core.transmit import TxSignalKind, TxSignalSpec
 from ithildin.ui.fonts import tabular_font
+from ithildin.ui.icons import themed_callback
 from ithildin.ui.theme import ThemeManager
 
 # ---------------------------------------------------------------------------
@@ -219,8 +220,7 @@ class TxSegmented(QFrame):
             btn.clicked.connect(lambda _c=False, k=raw: self._select(k))
             row.addWidget(btn)
             self._buttons[raw] = btn
-        self._restyle()
-        ThemeManager.instance().theme_changed.connect(lambda _t: self._restyle())
+        themed_callback(self._restyle)
 
     @property
     def value(self) -> int:
@@ -344,8 +344,7 @@ class TxSlider(QWidget):
         row.addWidget(self._slider, 1)
         self._readout = _readout_pill(self._format_readout(value), self)
         row.addWidget(self._readout)
-        self._restyle()
-        ThemeManager.instance().theme_changed.connect(lambda _t: self._restyle())
+        themed_callback(self._restyle)
 
     @property
     def value(self) -> float:
@@ -473,8 +472,7 @@ class TxStepper(QFrame):
         self._range.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._range.setMinimumWidth(80)
         row.addWidget(self._range)
-        self._restyle()
-        ThemeManager.instance().theme_changed.connect(lambda _t: self._restyle())
+        themed_callback(self._restyle)
 
     @property
     def value(self) -> float:
@@ -584,8 +582,7 @@ class TxSignedSlider(QWidget):
         row.addWidget(self._bar, 1)
         self._readout = _readout_pill(self._format(value), self)
         row.addWidget(self._readout)
-        self._restyle()
-        ThemeManager.instance().theme_changed.connect(lambda _t: self._restyle())
+        themed_callback(self._restyle)
 
     @property
     def value(self) -> float:
@@ -741,8 +738,7 @@ class TxHexGrid(QWidget):
         row.addStretch(1)
         self.set_value(value)
         self._emitted = self.value
-        self._restyle()
-        ThemeManager.instance().theme_changed.connect(lambda _t: self._restyle())
+        themed_callback(self._restyle)
 
     @property
     def value(self) -> int:
@@ -819,8 +815,7 @@ class TxAutoBadge(QFrame):
         tag.setObjectName("TxAutoTag")
         row.addWidget(tag)
         row.addStretch(1)
-        self._restyle()
-        ThemeManager.instance().theme_changed.connect(lambda _t: self._restyle())
+        themed_callback(self._restyle)
 
     @property
     def value(self) -> int | float:

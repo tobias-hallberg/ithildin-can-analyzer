@@ -27,6 +27,10 @@ class UiEvents(QObject):
     (e.g. the toolbar Connect action) re-derive their state from
     ``project.workspace.bus``. No payload — keeps the signal cheap and
     independent of the project lifecycle."""
+    report_requested = Signal(str, str)
+    """``(message, kind)`` for the Report dock, from views that hold no
+    ``MainWindow`` reference. ``kind`` is ``"info"``, ``"warn"`` or
+    ``"error"``, as for ``MainWindow.report``."""
 
     def __init__(self) -> None:
         super().__init__()

@@ -10,9 +10,12 @@ Two-tier control:
 * **Per-row active flag** — each row has its own start/stop button.
   Effective transmission = ``master_enabled && tx.active``.
 
-The window owns a :class:`TxScheduler` (``core.transmit``). Closing the
-window calls :meth:`TxScheduler.shutdown` — equivalent to master OFF
-plus stopping every cyclic task.
+The window owns a :class:`TxScheduler` (``core.transmit``) and shares
+its :class:`TxSetup` with it. Closing the window calls
+:meth:`TxScheduler.shutdown` — equivalent to master OFF plus stopping
+every cyclic task. When the scheduler disarms (a bus closed or lost, a
+periodic task failed) the window shows why in an amber banner and in the
+Report dock; the user re-arms by hand.
 
 Visuals follow ``design_handoff_tx_window/TX window.html``: large pill
 master switch, custom list-row delegate (tri-state run button + period
@@ -113,13 +116,15 @@ class TransmitWindow(ChildView):
 
         bus_reader: BusReader = ctx.bus_reader
         self._scheduler = TxScheduler(bus_reader, ctx.database, parent=self)
+        self._scheduler.apply(self._setup)
         self._scheduler.error.connect(self._on_scheduler_error)
+        self._scheduler.disarmed.connect(self._on_disarmed)
+        self._list_delegate.set_transmitting_predicate(self._scheduler.is_transmitting)
         self._payload_preview.set_database(ctx.database)
-        # When a bus closes or its listen-only state changes (only on
-        # reopen), the master may need to drop and the status bar's bus
-        # info needs to refresh.
-        bus_reader.bus_started.connect(lambda _name: self._refresh_listen_only_gate())
-        bus_reader.bus_stopped.connect(lambda _name: self._refresh_listen_only_gate())
+        # Bound methods, not lambdas: BusReader outlives this window, and a
+        # lambda would keep calling into it after it is deleted.
+        bus_reader.bus_started.connect(self._on_bus_topology_changed)
+        bus_reader.bus_stopped.connect(self._on_bus_topology_changed)
         self._refresh_listen_only_gate()
         self._refresh_status_bar()
 
@@ -176,6 +181,9 @@ class TransmitWindow(ChildView):
         self._apply()
 
     def closeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        # A trailing edit must not reconcile after shutdown; the window can
+        # outlive close() until its deferred delete runs.
+        self._apply_debounce.stop()
         if self._scheduler is not None:
             self._scheduler.shutdown()
         super().closeEvent(event)
@@ -197,6 +205,11 @@ class TransmitWindow(ChildView):
         # exist before the toolbar wires its toggle.
         status_widget = self._build_status_bar()
         outer.addWidget(self._build_toolbar())
+        # The disarm is global, so its banner sits under the toolbar rather
+        # than in the row editor.
+        self._disarm_banner = Banner(kind="warn", parent=self)
+        self._disarm_banner.dismissed.connect(self._refresh_master_off_banner)
+        outer.addWidget(self._disarm_banner)
 
         splitter = QSplitter(Qt.Orientation.Horizontal, self)
         splitter.setChildrenCollapsible(False)
@@ -596,11 +609,8 @@ class TransmitWindow(ChildView):
             self._setup.master_enabled = checked
         else:
             self._scheduler.set_master(checked)
-            # Listen-only refusal: scheduler may not have flipped.
-            actual = self._scheduler.setup.master_enabled
-            if actual != checked:
-                self._master_btn.set_enabled_state(actual)
-            self._setup.master_enabled = actual
+            if self._setup.master_enabled:
+                self._disarm_banner.hide()
         self._sync_master_button()
         self._refresh_counts()
         self._refresh_status_bar()
@@ -777,6 +787,26 @@ class TransmitWindow(ChildView):
     def _on_scheduler_error(self, _mid: int, message: str) -> None:
         self._toast(message)
 
+    def _on_disarmed(self, reason: str) -> None:
+        self._sync_master_button()
+        self._disarm_banner.show_message(
+            f"{reason} — TX disarmed. Switch TX Master on to transmit again."
+        )
+        if self._ctx is not None:
+            self._ctx.events.report_requested.emit(f"TX disarmed: {reason}", "warn")
+        self._refresh_counts()
+        self._refresh_status_bar()
+        self._refresh_master_off_banner()
+        self._rebuild_list_glyphs()
+        self._refresh_action_button()
+
+    def _on_bus_topology_changed(self, _name: str) -> None:
+        # A reopened bus may now be listen-only; a closed one shows as such.
+        self._refresh_listen_only_gate()
+        self._refresh_counts()
+        self._refresh_status_bar()
+        self._rebuild_list_glyphs()
+
     # ---- Refresh helpers ----
 
     def _sync_master_button(self) -> None:
@@ -789,10 +819,13 @@ class TransmitWindow(ChildView):
         self._status_label.style().unpolish(self._status_label)
         self._status_label.style().polish(self._status_label)
 
+    def _transmitting_count(self) -> int:
+        if self._scheduler is None:
+            return 0
+        return sum(1 for tx in self._setup.transmits if self._scheduler.is_transmitting(tx))
+
     def _refresh_counts(self) -> None:
-        active = sum(1 for tx in self._setup.transmits if tx.active)
-        transmitting = active if self._setup.master_enabled else 0
-        self._count_label.setText(f"{transmitting} / {len(self._setup.transmits)}")
+        self._count_label.setText(f"{self._transmitting_count()} / {len(self._setup.transmits)}")
 
     def _refresh_bulk_buttons(self) -> None:
         total = len(self._setup.transmits)
@@ -809,7 +842,7 @@ class TransmitWindow(ChildView):
         else:
             sel = "(no selection)"
             bus_info = self._bus_info_text(None)
-        transmitting = sum(1 for tx in self._setup.transmits if tx.active) if on else 0
+        transmitting = self._transmitting_count()
         prefix = "● BUS TX ENABLED" if on else "○ BUS TX DISABLED"
         sep = "      "
         # Handoff §8 lists a trailing ``bus load N%`` field; ithildin has
@@ -824,7 +857,8 @@ class TransmitWindow(ChildView):
 
     def _refresh_master_off_banner(self) -> None:
         show = False
-        if 0 <= self._selected < len(self._setup.transmits):
+        # The disarm banner already says why master is OFF; don't stack two.
+        if self._disarm_banner.isHidden() and 0 <= self._selected < len(self._setup.transmits):
             tx = self._setup.transmits[self._selected]
             show = tx.active and not self._setup.master_enabled
         if show:
@@ -846,11 +880,8 @@ class TransmitWindow(ChildView):
         if listen_only_buses:
             self._master_btn.setEnabled(False)
             self._master_btn.setToolTip("Active bus is listen-only — cannot transmit.")
-            if self._setup.master_enabled:
-                self._setup.master_enabled = False
-                self._master_btn.set_enabled_state(False)
-                if self._scheduler is not None:
-                    self._scheduler.set_master(False)
+            if self._setup.master_enabled and self._scheduler is not None:
+                self._scheduler.set_master(False)
                 self._sync_master_button()
         else:
             self._master_btn.setEnabled(True)
@@ -863,9 +894,6 @@ class TransmitWindow(ChildView):
         self._action_btn.set_state(tx.mode, tx.active, master_on=self._setup.master_enabled)
 
     def _rebuild_list_glyphs(self) -> None:
-        # The delegate holds master state of its own — it must be pushed
-        # before the repaint or rows paint the pre-toggle glyph.
-        self._list_delegate.set_master_enabled(self._setup.master_enabled)
         # The delegate reads live from the mutable TxMessage stashed on
         # each item via TX_ROW_ROLE, so a model rebuild is never needed
         # when only mode / period / active flips on existing rows. A
@@ -877,14 +905,15 @@ class TransmitWindow(ChildView):
     def _bus_info_text(self, bus_name: str | None) -> str:
         if not bus_name or self._ctx is None:
             return ""
-        for cfg in self._ctx.bus_reader.last_configs():
-            if cfg.name == bus_name:
-                return f"{cfg.name} · {cfg.bitrate // 1000} kbps"
-        # Fall back to project config when bus isn't currently open.
-        for cfg in self._ctx.project.workspace.bus:
-            if cfg.name == bus_name:
-                return f"{cfg.name} · {cfg.bitrate // 1000} kbps (closed)"
-        return bus_name
+        reader = self._ctx.bus_reader
+        closed = "" if bus_name in reader.bus_names() else " (closed)"
+        cfg = reader.last_config_for(bus_name)
+        if cfg is None:
+            # Never opened this session: the project's declaration.
+            cfg = next((c for c in self._ctx.project.workspace.bus if c.name == bus_name), None)
+        if cfg is None:
+            return f"{bus_name}{closed}"
+        return f"{cfg.name} · {cfg.bitrate // 1000} kbps{closed}"
 
     def _toast(self, message: str) -> None:
         """Brief status-bar toast — restored to the live status after _ERROR_TOAST_MS."""

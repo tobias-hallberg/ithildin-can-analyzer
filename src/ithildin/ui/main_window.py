@@ -500,9 +500,24 @@ class MainWindow(QMainWindow):
             self._bus.bus_started.connect(lambda _name: self._refresh_connect_action())
             self._bus.bus_stopped.connect(lambda _name: self._refresh_connect_action())
             self._bus.error.connect(lambda msg: self.report(msg, kind="error"))
+            # Bound slots, so the off-GUI-thread send_failed is queued here.
+            self._bus.send_failed.connect(self._on_send_failed)
+            self._bus.cyclic_failed.connect(self._on_cyclic_failed)
         if self._db is not None:
             self._db.error.connect(lambda msg: self.report(msg, kind="error"))
         self._refresh_connect_action()
+
+    @Slot(str, int, str)
+    def _on_send_failed(self, bus_name: str, message_id: int, error: str) -> None:
+        self.report(f"TX 0x{message_id:X} on {bus_name} failed: {error}", kind="error")
+
+    @Slot(str, int, str)
+    def _on_cyclic_failed(self, bus_name: str, message_id: int, error: str) -> None:
+        self.report(f"Periodic TX 0x{message_id:X} on {bus_name} stopped: {error}", kind="error")
+
+    @Slot(str, str)
+    def _on_report_requested(self, message: str, kind: str) -> None:
+        self.report(message, kind=kind)
 
     def bind_events(self, ctx: AppContext) -> None:
         """Subscribe to UI-event hub events + bind the left dock.
@@ -515,6 +530,7 @@ class MainWindow(QMainWindow):
         self._ctx = ctx
         self._current_project = ctx.project
         ctx.events.buses_changed.connect(self._refresh_connect_action)
+        ctx.events.report_requested.connect(self._on_report_requested)
         bridge = ctx.mcp_bridge
         bridge.started.connect(self._on_mcp_started)
         bridge.stopped.connect(self._on_mcp_stopped)

@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (
 )
 
 from ithildin.ui.fonts import tabular_font
-from ithildin.ui.icons import themed_icon
+from ithildin.ui.icons import themed_callback, themed_icon
 from ithildin.ui.theme import ThemeManager
 
 # Shared height for the three header controls so the mode picker, period
@@ -60,8 +60,7 @@ class ModeSegmented(QFrame):
             self._buttons[label] = btn
         self._current = "one-shot"
         self._buttons["one-shot"].setProperty("active", True)
-        self._restyle()
-        ThemeManager.instance().theme_changed.connect(lambda _t: self._restyle())
+        themed_callback(self._restyle)
 
     def set_mode(self, mode: str) -> None:
         if mode == self._current:
@@ -134,8 +133,7 @@ class PeriodField(QFrame):
         suffix.setFont(tabular_font())
         row.addWidget(suffix)
         self._last_emitted = 50
-        self._restyle()
-        ThemeManager.instance().theme_changed.connect(lambda _t: self._restyle())
+        themed_callback(self._restyle)
 
     def set_value(self, v: int) -> None:
         s = str(int(v))
@@ -211,8 +209,7 @@ class ActionButton(QWidget):
         self._mode = "one-shot"
         self._active = False
         self._master_on = False
-        self._restyle()
-        ThemeManager.instance().theme_changed.connect(lambda _t: self._restyle())
+        themed_callback(self._restyle)
         self.set_state("one-shot", False, master_on=False)
 
     def set_state(self, mode: str, active: bool, *, master_on: bool) -> None:

@@ -4,16 +4,23 @@
 
 from __future__ import annotations
 
+import gc
 import uuid
+import weakref
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import can
+from PySide6.QtCore import Qt
+
 from ithildin.core.transmit import TxMessage, TxSetup
 from ithildin.ui._drag_payload import MessagePayload, SignalPayload
+from ithildin.ui.theme import ThemeManager
 from ithildin.ui.transmit.controls import TxDropdown
 from ithildin.ui.transmit_window import TransmitWindow
 from ithildin.workspace.schema import BusConfig
 from tests.conftest import make_app_context
+from tests.fake_bus import use_fake_bus
 
 
 def _open_virtual_bus(ctx, qtbot, *, name: str = "CAN_1", listen_only: bool = False):  # type: ignore[no-untyped-def]
@@ -94,18 +101,22 @@ def test_master_toggle_flips_status_bar_object_name(qapp, qtbot, tmp_path: Path)
     assert win._status_label.objectName() == "TxStatusBarOff"
 
 
-def test_master_toggle_syncs_delegate_master_state(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
-    """The row delegate paints from its own master flag — it must be pushed."""
+def test_master_toggle_syncs_delegate_transmitting_state(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    """The row delegate paints from the scheduler's view of what is live."""
+    ctx = make_app_context(tmp_path)
+    _open_virtual_bus(ctx, qtbot)
     win = TransmitWindow(instance_id="tx1")
     qtbot.addWidget(win)
-    win.bind(make_app_context(tmp_path))
+    win.bind(ctx)
     _seed(win, 2)
     win._setup.transmits[0].active = True
+    win._apply()
+    tx = win._setup.transmits[0]
 
     win._on_master_toggled(True)
-    assert win._list_delegate._master_enabled is True
+    assert win._list_delegate._is_transmitting(tx) is True
     win._on_master_toggled(False)
-    assert win._list_delegate._master_enabled is False
+    assert win._list_delegate._is_transmitting(tx) is False
 
 
 def test_master_toggle_restates_selected_action_button(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
@@ -182,6 +193,8 @@ def _seed(win: TransmitWindow, n: int = 2) -> None:
         ],
     )
     win._rebuild_list()
+    # Hands the new setup to the scheduler, as restore_state does.
+    win._apply()
 
 
 def test_empty_state_hides_header_widgets(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
@@ -426,3 +439,161 @@ def test_apply_is_debounced_for_signal_changes(qapp, qtbot, tmp_path: Path) -> N
     qtbot.wait(80)
     # Exactly one reconcile after the burst.
     assert win._scheduler.apply.call_count == 1  # type: ignore[union-attr]
+
+
+# ---------- disarm and bus lifecycle ----------
+
+
+def _armed_window(ctx, qtbot) -> TransmitWindow:  # type: ignore[no-untyped-def]
+    """A bound window transmitting EngineCommand periodically on CAN_1."""
+    win = TransmitWindow(instance_id="tx1")
+    qtbot.addWidget(win)
+    win.bind(ctx)
+    win._on_transmit_chosen("CAN_1", 0x100, "EngineCommand")
+    tx = win._setup.transmits[0]
+    tx.mode = "periodic"
+    tx.period_ms = 20
+    tx.active = True
+    win._apply()
+    win._on_master_toggled(True)
+    assert win._setup.master_enabled is True
+    return win
+
+
+def test_closed_window_ignores_bus_signals(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    """Regression: lambdas capturing the window kept firing after it was deleted."""
+    ctx = make_app_context(tmp_path)
+    win = TransmitWindow(instance_id="tx1")
+    win.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+    win.bind(ctx)
+    with qtbot.waitSignal(win.destroyed, timeout=2000):
+        win.close()
+
+    ctx.bus_reader.bus_started.emit("CAN_1")
+    ctx.bus_reader.bus_stopped.emit("CAN_1")
+    ctx.bus_reader.bus_failed.emit("CAN_1", "gone")
+    ctx.bus_reader.cyclic_failed.emit("CAN_1", 0x100, "boom")
+    ctx.bus_reader.send_failed.emit("CAN_1", 0x100, "boom")
+
+
+def test_bus_loss_turns_master_off_and_shows_banner(  # type: ignore[no-untyped-def]
+    qapp, qtbot, monkeypatch, tmp_path: Path, example_dbc_path: Path
+) -> None:
+    fake = use_fake_bus(monkeypatch)
+    ctx = make_app_context(tmp_path)
+    ctx.database.add_dbc(example_dbc_path, ["CAN_1"])
+    with qtbot.waitSignal(ctx.bus_reader.bus_started, timeout=2000):
+        ctx.bus_reader.open(BusConfig(name="CAN_1", interface="pcan", channel="X", bitrate=500000))
+    win = _armed_window(ctx, qtbot)
+    reports: list[tuple[str, str]] = []
+    ctx.events.report_requested.connect(lambda msg, kind: reports.append((msg, kind)))
+
+    with qtbot.waitSignal(win._scheduler.disarmed, timeout=2000):  # type: ignore[union-attr]
+        fake.recv_exc = can.CanOperationError("adapter gone")
+    assert win._master_btn.is_on is False
+    assert win._status_label.objectName() == "TxStatusBarOff"
+    assert not win._disarm_banner.isHidden()
+    assert win._disarm_banner._label.text().startswith("Bus CAN_1 lost (")
+    assert "TX disarmed" in win._disarm_banner._label.text()
+    # The disarm banner says why; the master-off banner would only repeat it.
+    assert win._master_off_banner.isHidden()
+    ((message, kind),) = reports
+    assert kind == "warn"
+    assert message.startswith("TX disarmed: Bus CAN_1 lost (")
+
+
+def test_rearming_hides_disarm_banner(  # type: ignore[no-untyped-def]
+    qapp, qtbot, tmp_path: Path, example_dbc_path: Path
+) -> None:
+    ctx = make_app_context(tmp_path)
+    ctx.database.add_dbc(example_dbc_path, ["CAN_1"])
+    _open_virtual_bus(ctx, qtbot)
+    win = _armed_window(ctx, qtbot)
+
+    with qtbot.waitSignal(win._scheduler.disarmed, timeout=2000):  # type: ignore[union-attr]
+        ctx.bus_reader.close("CAN_1")
+    assert win._disarm_banner._label.text().startswith("Bus CAN_1 closed — TX disarmed")
+    # Reconnecting does not resume TX by itself.
+    _open_virtual_bus(ctx, qtbot)
+    assert win._setup.master_enabled is False
+    assert not win._disarm_banner.isHidden()
+
+    win._on_master_toggled(True)
+    assert win._setup.master_enabled is True
+    assert win._disarm_banner.isHidden()
+
+
+def test_bus_info_shows_closed_after_disconnect(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    ctx = make_app_context(tmp_path)
+    _open_virtual_bus(ctx, qtbot)
+    win = TransmitWindow(instance_id="tx1")
+    qtbot.addWidget(win)
+    win.bind(ctx)
+    assert win._bus_info_text("CAN_1") == "CAN_1 · 500 kbps"
+
+    with qtbot.waitSignal(ctx.bus_reader.bus_stopped, timeout=2000):
+        ctx.bus_reader.close("CAN_1")
+    assert win._bus_info_text("CAN_1") == "CAN_1 · 500 kbps (closed)"
+
+
+def test_counts_reflect_live_tasks(  # type: ignore[no-untyped-def]
+    qapp, qtbot, tmp_path: Path, example_dbc_path: Path
+) -> None:
+    """A periodic row whose task died stops counting at once, before any disarm."""
+    ctx = make_app_context(tmp_path)
+    ctx.database.add_dbc(example_dbc_path, ["CAN_1"])
+    _open_virtual_bus(ctx, qtbot)
+    win = _armed_window(ctx, qtbot)
+    tx = win._setup.transmits[0]
+    assert win._count_label.text() == "1 / 1"
+    assert win._list_delegate._is_transmitting(tx) is True
+
+    win._scheduler._tasks[("CAN_1", 0x100)].stop()  # type: ignore[union-attr]
+    win._refresh_counts()
+    assert win._setup.master_enabled is True
+    assert win._count_label.text() == "0 / 1"
+    assert win._list_delegate._is_transmitting(tx) is False
+
+
+def test_cyclic_failure_disarms_window(  # type: ignore[no-untyped-def]
+    qapp, qtbot, monkeypatch, tmp_path: Path, example_dbc_path: Path
+) -> None:
+    fake = use_fake_bus(monkeypatch)
+    ctx = make_app_context(tmp_path)
+    ctx.database.add_dbc(example_dbc_path, ["CAN_1"])
+    with qtbot.waitSignal(ctx.bus_reader.bus_started, timeout=2000):
+        ctx.bus_reader.open(BusConfig(name="CAN_1", interface="pcan", channel="X", bitrate=500000))
+    win = _armed_window(ctx, qtbot)
+    reports: list[tuple[str, str]] = []
+    ctx.events.report_requested.connect(lambda msg, kind: reports.append((msg, kind)))
+
+    with qtbot.waitSignal(win._scheduler.disarmed, timeout=2000):  # type: ignore[union-attr]
+        fake.send_exc = can.CanOperationError("transmit queue full")
+    assert win._master_btn.is_on is False
+    assert win._count_label.text() == "0 / 1"
+    assert win._disarm_banner._label.text().startswith(
+        "Periodic 0x100 on CAN_1 failed (transmit queue full) — TX disarmed"
+    )
+    assert reports == [
+        ("TX disarmed: Periodic 0x100 on CAN_1 failed (transmit queue full)", "warn")
+    ]
+
+
+def test_theme_change_after_editor_rebuild_is_safe(  # type: ignore[no-untyped-def]
+    qapp, qtbot, tmp_path: Path, example_dbc_path: Path
+) -> None:
+    """Regression: signal controls pinned themselves to ThemeManager forever."""
+    ctx = make_app_context(tmp_path)
+    ctx.database.add_dbc(example_dbc_path, ["CAN_1"])
+    win = TransmitWindow(instance_id="tx1")
+    qtbot.addWidget(win)
+    win.bind(ctx)
+    win._on_transmit_chosen("CAN_1", 0x100, "EngineCommand")
+    win._on_transmit_chosen("CAN_1", 0x200, "BodyStatus")
+    old_control = weakref.ref(win._signal_widgets["EngineSpeed"])
+
+    for idx in (1, 0, 1):
+        win._select(idx)
+    gc.collect()
+    assert old_control() is None
+    ThemeManager.instance().theme_changed.emit(ThemeManager.instance().current_tokens())

@@ -127,6 +127,22 @@ def test_main_window_database_error_reaches_report_dock(qapp, qtbot, tmp_path: P
     assert "DBC parse failure" in win._report_widget.item(0).text()
 
 
+def test_main_window_tx_failures_reach_report_dock(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    ctx = make_app_context(tmp_path)
+    win = MainWindow(bus_reader=ctx.bus_reader, database=ctx.database, prompt_on_close=False)
+    qtbot.addWidget(win)
+    win.bind_events(ctx)
+
+    ctx.bus_reader.send_failed.emit("CAN_1", 0x100, "no ACK")
+    ctx.bus_reader.cyclic_failed.emit("CAN_1", 0x200, "transmit queue full")
+    ctx.events.report_requested.emit("TX disarmed: Bus CAN_1 closed", "warn")
+    texts = [win._report_widget.item(i).text() for i in range(win._report_widget.count())]
+    assert len(texts) == 3
+    assert "TX disarmed: Bus CAN_1 closed" in texts[0]
+    assert "Periodic TX 0x200 on CAN_1 stopped: transmit queue full" in texts[1]
+    assert "TX 0x100 on CAN_1 failed: no ACK" in texts[2]
+
+
 def test_trace_window_bus_error_shows_banner(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
     ctx = make_app_context(tmp_path)
     tw = TraceWindow(instance_id="t1")

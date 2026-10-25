@@ -57,6 +57,9 @@ TX_ROW_ROLE = Qt.ItemDataRole.UserRole + 1
 type ValueFormatter = Callable[[TxMessage, str, object], str | None]
 """``(tx, signal_name, value) -> text``, or ``None`` to use the default."""
 
+type TransmittingPredicate = Callable[[TxMessage], bool]
+"""Whether a row is live right now (``TxScheduler.is_transmitting``)."""
+
 
 _ROW_HEIGHT = 46
 _BTN_SIZE = 22
@@ -70,8 +73,9 @@ class TxListDelegate(QStyledItemDelegate):
     """Two-line painted row with a tri-state run-state button + period badge.
 
     The owner widget should:
-      * call :meth:`set_master_enabled` whenever the TX-master state flips
-        so the delegate paints the correct armed / transmitting variant;
+      * call :meth:`set_transmitting_predicate` so the delegate paints the
+        correct armed / transmitting variant, and repaint the viewport when
+        that answer may have changed;
       * connect :attr:`active_toggled` to flip the row's ``active`` flag
         without triggering selection.
     """
@@ -80,7 +84,7 @@ class TxListDelegate(QStyledItemDelegate):
 
     def __init__(self, parent=None) -> None:  # type: ignore[no-untyped-def]
         super().__init__(parent)
-        self._master_enabled = False
+        self._is_transmitting: TransmittingPredicate = lambda _tx: False
         self._blink_on = True
         self._format_value: ValueFormatter | None = None
 
@@ -91,12 +95,9 @@ class TxListDelegate(QStyledItemDelegate):
         """
         self._format_value = fn
 
-    def set_master_enabled(self, enabled: bool) -> None:
-        if enabled == self._master_enabled:
-            return
-        self._master_enabled = enabled
-        # The view repaints on its own thanks to the model's data-changed
-        # nudges from the window; nothing to do here beyond storing state.
+    def set_transmitting_predicate(self, fn: TransmittingPredicate) -> None:
+        """Ask ``fn`` whether a row is live; an active row that isn't paints as armed."""
+        self._is_transmitting = fn
 
     def blink_tick(self) -> None:
         """Toggle the blink phase. View should call viewport().update()."""
@@ -129,8 +130,8 @@ class TxListDelegate(QStyledItemDelegate):
 
         rect = option.rect
         selected = bool(option.state & QStyle.StateFlag.State_Selected)
-        transmitting = self._master_enabled and tx.active
-        armed = (not self._master_enabled) and tx.active
+        transmitting = self._is_transmitting(tx)
+        armed = tx.active and not transmitting
 
         painter.save()
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)

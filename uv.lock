@@ -585,7 +585,7 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2.7" },
     { name = "pyqtgraph", specifier = ">=0.13" },
     { name = "pyside6", specifier = ">=6.7" },
-    { name = "python-can", specifier = ">=4.4" },
+    { name = "python-can", specifier = ">=4.6.1" },
     { name = "tomli-w", specifier = ">=1.0" },
     { name = "uptime", specifier = ">=3.0.1" },
     { name = "uvicorn", specifier = ">=0.30" },

@@ -16,6 +16,7 @@ from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QWidget
 
 from ithildin.core.transmit import TxMessage, encode_tx_message
 from ithildin.ui.fonts import tabular_font
+from ithildin.ui.icons import themed_callback
 from ithildin.ui.theme import ThemeManager
 
 if TYPE_CHECKING:
@@ -42,8 +43,7 @@ class TxPayloadPreview(QFrame):
         self._content.setObjectName("TxPayloadBytes")
         self._content.setFont(tabular_font())
         row.addWidget(self._content, 1)
-        self._restyle()
-        ThemeManager.instance().theme_changed.connect(lambda _t: self._restyle())
+        themed_callback(self._restyle)
 
     def set_database(self, database: Database) -> None:
         self._database = database
