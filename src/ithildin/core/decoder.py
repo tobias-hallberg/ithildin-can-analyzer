@@ -55,7 +55,8 @@ class Decoder:
         """Decode one frame's payload to ``{signal_name: value}`` or ``None``.
 
         Returns ``None`` for unknown IDs and for payloads cantools cannot
-        decode (e.g. mismatched length when ``allow_truncated=False``).
+        decode (e.g. mismatched length when ``allow_truncated=False``, or a
+        multiplexer value the DBC doesn't define).
         """
         try:
             msg = self._db.get_message_by_frame_id(arbitration_id)
@@ -67,7 +68,7 @@ class Decoder:
                 decode_choices=decode_choices,
                 allow_truncated=allow_truncated,
             )
-        except (ValueError, KeyError):
+        except (ValueError, KeyError, cantools.database.DecodeError):
             return None
         # cantools returns a Sequence for container messages; we don't enable
         # container decoding, so a plain mapping is what we expect here.

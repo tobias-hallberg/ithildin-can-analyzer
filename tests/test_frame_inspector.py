@@ -135,3 +135,17 @@ def test_error_frame_shows_no_decode(  # type: ignore[no-untyped-def]
     assert view._sender_val.text() == "—"
     assert view._table.rowCount() == 0
     assert err.decoded is None
+
+
+def test_undefined_multiplexer_value_shows_no_decode(  # type: ignore[no-untyped-def]
+    qapp, qtbot, tmp_path: Path, edge_dbc_path: Path
+) -> None:
+    ctx = make_app_context(tmp_path)
+    ctx.database.add_dbc(edge_dbc_path, ["CAN_1"])
+    view = FrameInspectorView()
+    qtbot.addWidget(view)
+    view.bind(ctx)
+    # ImdStatus defines OpCode 128 and 225 only.
+    view.set_frame(FrameRecord(bus_name="CAN_1", timestamp=0.0, arbitration_id=1601, data=bytes(8)))
+    assert view._name_val.text() == "ImdStatus"
+    assert view._table.rowCount() == 0

@@ -32,3 +32,10 @@ def test_message_name_lookup(example_dbc_path: Path) -> None:
     assert decoder.message_name(0x100) == "EngineCommand"
     assert decoder.message_name(0x200) == "BodyStatus"
     assert decoder.message_name(0x7FF) is None
+
+
+def test_decode_undefined_multiplexer_value_returns_none(edge_dbc_path: Path) -> None:
+    decoder = Decoder.from_files(edge_dbc_path)
+    # ImdStatus defines OpCode 128 and 225 only.
+    assert decoder.decode(1601, bytes([5]) + bytes(7)) is None
+    assert decoder.decode(1601, bytes([128]) + bytes(7)) is not None

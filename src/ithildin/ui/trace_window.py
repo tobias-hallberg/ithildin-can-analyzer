@@ -21,14 +21,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from PySide6.QtCore import (
-    QModelIndex,
-    QPersistentModelIndex,
-    QRegularExpression,
-    QSortFilterProxyModel,
-    Qt,
-    QTimer,
-)
+from PySide6.QtCore import QModelIndex, Qt, QTimer
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QButtonGroup,
@@ -65,49 +58,6 @@ _DEFAULT_DETAIL_HEIGHT = 240
 _BANNER_HEALTH = (BusHealth.ERRORS, BusHealth.BUS_OFF)
 
 
-class TraceFilterProxy(QSortFilterProxyModel):
-    """Filter on ID / message-name / bus columns; signal children pass through."""
-
-    def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.setFilterCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
-        self._cols = (
-            TraceTreeModel.COL_ID,
-            TraceTreeModel.COL_NAME,
-            TraceTreeModel.COL_BUS,
-        )
-
-    def set_case_sensitive(self, enabled: bool) -> None:
-        # setFilterCaseSensitivity already invalidates the filter internally;
-        # no explicit invalidate call (both invalidateFilter and
-        # invalidateRowsFilter are deprecated in this PySide6).
-        self.setFilterCaseSensitivity(
-            Qt.CaseSensitivity.CaseSensitive if enabled else Qt.CaseSensitivity.CaseInsensitive
-        )
-
-    def filterAcceptsRow(
-        self,
-        source_row: int,
-        source_parent: QModelIndex | QPersistentModelIndex,
-    ) -> bool:
-        if source_parent.isValid():
-            return True
-        regex: QRegularExpression = self.filterRegularExpression()
-        if not regex.pattern():
-            return True
-        model = self.sourceModel()
-        if model is None:
-            return True
-        for col in self._cols:
-            idx = model.index(source_row, col, source_parent)
-            value = model.data(idx, Qt.ItemDataRole.DisplayRole)
-            if value is None:
-                continue
-            if regex.match(str(value)).hasMatch():
-                return True
-        return False
-
-
 class TraceWindow(ChildView):
     KIND = "trace"
     DEFAULT_SIZE = (920, 420)
@@ -121,7 +71,6 @@ class TraceWindow(ChildView):
         super().__init__(instance_id=instance_id, params=params)
         self._ctx: AppContext | None = None
         self._model: TraceTreeModel | None = None
-        self._proxy = TraceFilterProxy(self)
         self._tracked_pane: TrackedTreePane | None = None
         self._last_left_width = _DEFAULT_LEFT_PANE_WIDTH
         # Used by restore_state when the saved state arrived before
@@ -180,12 +129,15 @@ class TraceWindow(ChildView):
         self._model.counters_changed.connect(self._refresh_pinned_inspector)
         if self._latest_btn.isChecked():
             self._model.set_mode("overwrite")
-        self._proxy.setSourceModel(self._model)
+        # Before setModel, so it runs ahead of the view's and the selection
+        # model's own handlers, which would walk the current row along the
+        # evicted edge, one row per drain.
+        self._model.rowsAboutToBeRemoved.connect(self._on_rows_about_to_be_removed)
+        # No proxy in between: see the trace_view module docstring.
+        self._tree.setModel(self._model)
+        self._tree.selectionModel().currentRowChanged.connect(self._on_row_changed)
         if not self._paused_btn.isChecked():
             self._model.start()
-        sel = self._tree.selectionModel()
-        if sel is not None:
-            sel.currentRowChanged.connect(self._on_row_changed)
 
         if self._pending_state is not None:
             self._apply_pending_state()
@@ -279,7 +231,10 @@ class TraceWindow(ChildView):
         # and the QHBoxLayout vcenters it, leaving the frame's bg
         # showing above and below the :checked fill.
         self._stream_btn.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
-        self._stream_btn.setToolTip("Show every frame chronologically; newest at top.")
+        self._stream_btn.setToolTip(
+            "Show every frame chronologically; newest at top. While running only the "
+            "newest frames stay on screen; pause to scroll the full history."
+        )
 
         self._latest_btn = QToolButton(self._mode_segment)
         self._latest_btn.setObjectName("SegmentRightBtn")
@@ -325,7 +280,10 @@ class TraceWindow(ChildView):
         self._paused_btn.setCheckable(True)
         self._paused_btn.setAutoExclusive(False)
         self._paused_btn.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
-        self._paused_btn.setToolTip("Freeze the trace; new frames are dropped.")
+        self._paused_btn.setToolTip(
+            "Freeze the trace to scroll its full history; frames arriving while paused "
+            "are not shown."
+        )
 
         self._pause_group = QButtonGroup(self)
         self._pause_group.setExclusive(True)
@@ -343,7 +301,8 @@ class TraceWindow(ChildView):
         self._counts_label.setStyleSheet("color: palette(mid);")
         self._counts_label.setToolTip(
             "RX: frames this trace admitted. ERR: error frames among them, counting "
-            "each sampled one as every error frame it stands for."
+            "each sampled one as every error frame it stands for. LOST: frames this "
+            "trace fell too far behind to show."
         )
         strip.add_widget(self._counts_label)
 
@@ -357,7 +316,6 @@ class TraceWindow(ChildView):
         right_layout.addWidget(strip)
 
         self._tree = QTreeView(right)
-        self._tree.setModel(self._proxy)
         self._tree.setFont(tabular_font())
         self._tree.setUniformRowHeights(True)
         self._tree.setRootIsDecorated(True)
@@ -557,33 +515,26 @@ class TraceWindow(ChildView):
     def _on_pause_selected(self, paused: bool) -> None:
         if self._model is None:
             return
-        if paused:
-            self._model.stop()
-        else:
-            self._model.start()
+        self._model.set_paused(paused)
 
-    def _on_counters_changed(self, rx: int, err: int) -> None:
-        self._counts_label.setText(f"RX {rx}   ERR {err}")
+    def _on_counters_changed(self, rx: int, err: int, lost: int) -> None:
+        text = f"RX {rx}   ERR {err}"
+        self._counts_label.setText(f"{text}   LOST {lost}" if lost else text)
 
     def _on_filter_text_changed(self, text: str) -> None:
-        # Clear affordance tracks the text immediately; the proxy update
+        # Clear affordance tracks the text immediately; the filter update
         # stays debounced.
         self._clear_action.setVisible(bool(text))
         self._filter_debounce.start()
 
     def _apply_filter(self) -> None:
-        # Always the str overload: the QRegularExpression overload
-        # clobbers filterCaseSensitivity from the regex's options,
-        # silently flipping the proxy case-sensitive on clear.
-        text = self._filter_input.text().strip()
-        if not text:
-            self._proxy.setFilterRegularExpression("")
+        if self._model is None:
             return
-        pattern = QRegularExpression.escape(text)
-        self._proxy.setFilterRegularExpression(pattern)
+        self._model.set_text_filter(
+            self._filter_input.text().strip(), self._case_action.isChecked()
+        )
 
-    def _on_case_toggled(self, checked: bool) -> None:
-        self._proxy.set_case_sensitive(checked)
+    def _on_case_toggled(self, _checked: bool) -> None:
         self._refresh_case_icon()
         self._apply_filter()
 
@@ -631,17 +582,27 @@ class TraceWindow(ChildView):
         )
 
     def _on_expanded(self, parent_idx: QModelIndex) -> None:
-        rows = self._proxy.rowCount(parent_idx)
-        for r in range(rows):
+        for r in range(parent_idx.model().rowCount(parent_idx)):
             self._tree.setFirstColumnSpanned(r, parent_idx, True)
 
+    def _on_rows_about_to_be_removed(self, parent: QModelIndex, first: int, last: int) -> None:
+        # A selected Stream row leaving the live window: deselect it rather
+        # than let the view move the selection on every drain. The inspector
+        # keeps the clicked frame.
+        sel = self._tree.selectionModel()
+        current = sel.currentIndex()
+        if (
+            not parent.isValid()
+            and current.isValid()
+            and not current.parent().isValid()
+            and first <= current.row() <= last
+        ):
+            sel.clear()
+
     def _on_row_changed(self, current: QModelIndex, _previous: QModelIndex) -> None:
-        if self._ctx is None or self._model is None or not current.isValid():
+        if self._ctx is None or self._model is None:
             return
-        source = self._proxy.mapToSource(current)
-        if not source.isValid() or source.parent().isValid():
-            return
-        frame = self._model.frame_at(source.row())
+        frame = self._model.frame_at(current)
         if frame is None:
             return
 

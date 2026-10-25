@@ -66,6 +66,23 @@ MCP layer (`src/ithildin/mcp/`):
   read tool checks `is_error_frame` before any decode. Only a whole-bus
   subscription admits error frames: every caller of
   `_Effective.admits(bus, aid, *, is_error=)` passes `is_error`.
+- **Never put a proxy model over `TraceTreeModel`.** QTreeView lays out
+  every top-level row on each insert at the root, and a proxy maps each
+  row through `rowCount`, which decodes. So the model filters text itself
+  (`set_text_filter`), keeps up to `max_rows` frames but shows only the
+  newest `live_rows` (1000) while running and the whole history while
+  paused, and answers `index` / `hasChildren` / `rowCount` without
+  decoding a collapsed row: `hasChildren` asks the DBC (cached per ID)
+  unless the frame is already decoded,
+  and Latest mode decodes a new frame only for an ID whose signal rows the
+  view has asked for. Each drain costs O(new frames + `live_rows`).
+  Signal rows carry an integer internal id, never a pointer
+  (`createIndex(row, col, obj)` holds no reference): the view keeps a
+  Latest row's signal-row indexes across frame replacements, and a pointer
+  to a frame the ring has freed crashes the next paint. `TraceWindow`
+  connects `rowsAboutToBeRemoved` before `setModel`, so a selected row
+  leaving the live window is deselected before the view moves the
+  selection to the next row on every drain.
 - **MCP allowlist is the only send path.** Never bypass
   `AllowlistStore.check_*()`. The audit log must record both allow and
   deny outcomes.

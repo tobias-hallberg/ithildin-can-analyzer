@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from cantools.database import DecodeError
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QFrame,
@@ -253,7 +254,7 @@ class FrameInspectorView(QWidget):
             raw = message.decode(
                 frame.data, decode_choices=False, scaling=False, allow_truncated=True
             )
-        except (ValueError, KeyError):
+        except (ValueError, KeyError, DecodeError):
             self._table.setRowCount(0)
             self._resize_table_to_rows()
             return

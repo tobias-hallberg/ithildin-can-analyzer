@@ -359,20 +359,21 @@ def test_save_restore_new_state_shape(  # type: ignore[no-untyped-def]
     assert eff.admits("CAN_1", 0x100)
 
 
-def test_case_toggle_flips_proxy_sensitivity(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+def test_case_toggle_flips_filter_sensitivity(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
     ctx = make_app_context(tmp_path)
     win = TraceWindow(instance_id="t1")
     qtbot.addWidget(win)
     win.bind(ctx)
+    assert win._model is not None
 
-    assert win._proxy.filterCaseSensitivity() == Qt.CaseSensitivity.CaseInsensitive
+    assert not win._model._case_sensitive
     assert not win._case_action.isChecked()
 
     win._case_action.setChecked(True)
-    assert win._proxy.filterCaseSensitivity() == Qt.CaseSensitivity.CaseSensitive
+    assert win._model._case_sensitive
 
     win._case_action.setChecked(False)
-    assert win._proxy.filterCaseSensitivity() == Qt.CaseSensitivity.CaseInsensitive
+    assert not win._model._case_sensitive
 
 
 def test_case_sensitive_state_round_trips(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
@@ -390,7 +391,8 @@ def test_case_sensitive_state_round_trips(qapp, qtbot, tmp_path: Path) -> None: 
     win2.bind(ctx)
     win2.restore_state(state)
     assert win2._case_action.isChecked()
-    assert win2._proxy.filterCaseSensitivity() == Qt.CaseSensitivity.CaseSensitive
+    assert win2._model is not None
+    assert win2._model._case_sensitive
 
 
 def test_toggle_left_pane_hides_and_restores(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
@@ -448,10 +450,11 @@ def test_row_selection_updates_detail_pane(  # type: ignore[no-untyped-def]
     )
 
     # Programmatic row selection → row-changed slot → detail view update.
-    proxy_idx = win._proxy.index(0, 0)
     sel = win._tree.selectionModel()
     assert sel is not None
-    sel.setCurrentIndex(proxy_idx, sel.SelectionFlag.ClearAndSelect | sel.SelectionFlag.Rows)
+    sel.setCurrentIndex(
+        win._model.index(0, 0), sel.SelectionFlag.ClearAndSelect | sel.SelectionFlag.Rows
+    )
 
     qtbot.waitUntil(
         lambda: win._detail_view._id_val.text() == "0x321 (801)",
@@ -497,10 +500,10 @@ def test_latest_mode_inspector_follows_pinned_id(  # type: ignore[no-untyped-def
         )
 
         # Click the row; pin captures (CAN_1, 0x321).
-        proxy_idx = win._proxy.index(0, 0)
+        idx = win._model.index(0, 0)
         sel = win._tree.selectionModel()
         assert sel is not None
-        sel.setCurrentIndex(proxy_idx, sel.SelectionFlag.ClearAndSelect | sel.SelectionFlag.Rows)
+        sel.setCurrentIndex(idx, sel.SelectionFlag.ClearAndSelect | sel.SelectionFlag.Rows)
         qtbot.waitUntil(
             lambda: "DE" in win._detail_view._byte_cells[0].text(),
             timeout=1000,
@@ -556,10 +559,10 @@ def test_stream_mode_inspector_freezes_on_clicked_frame(  # type: ignore[no-unty
 
         # Click the original row. Inspector should show the clicked
         # frame, and no pin should be set.
-        proxy_idx = win._proxy.index(0, 0)
+        idx = win._model.index(0, 0)
         sel = win._tree.selectionModel()
         assert sel is not None
-        sel.setCurrentIndex(proxy_idx, sel.SelectionFlag.ClearAndSelect | sel.SelectionFlag.Rows)
+        sel.setCurrentIndex(idx, sel.SelectionFlag.ClearAndSelect | sel.SelectionFlag.Rows)
         qtbot.waitUntil(
             lambda: "DE" in win._detail_view._byte_cells[0].text(),
             timeout=1000,
@@ -831,7 +834,7 @@ def test_pinned_inspector_follows_a_reconnected_bus(qapp, qtbot, tmp_path: Path)
         sel = win._tree.selectionModel()
         assert sel is not None
         sel.setCurrentIndex(
-            win._proxy.index(0, 0), sel.SelectionFlag.ClearAndSelect | sel.SelectionFlag.Rows
+            win._model.index(0, 0), sel.SelectionFlag.ClearAndSelect | sel.SelectionFlag.Rows
         )
         qtbot.waitUntil(lambda: "DE" in inspector._byte_cells[0].text(), timeout=1000)
         with qtbot.waitSignal(ctx.bus_reader.bus_failed, timeout=2000):
@@ -918,3 +921,132 @@ def test_restored_latest_mode_reaches_the_model(qapp, qtbot, tmp_path: Path) -> 
     win.restore_state({"mode": "overwrite"})
     assert win._model is not None
     assert win._model.mode() == "overwrite"
+
+
+# ---- Live window, filter and counters ----
+
+
+def _select_row(win: TraceWindow, row: int) -> None:
+    assert win._model is not None
+    sel = win._tree.selectionModel()
+    sel.setCurrentIndex(
+        win._model.index(row, 0), sel.SelectionFlag.ClearAndSelect | sel.SelectionFlag.Rows
+    )
+
+
+def test_filter_text_filters_rows_in_the_model(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    _ctx, win, _cfg = _trace_recording_bus(qtbot, tmp_path)
+    model = win._model
+    assert model is not None
+    assert win._tree.model() is model
+
+    win._filter_input.setText("101")
+    qtbot.waitUntil(lambda: model.rowCount() == 1, timeout=2000)
+    assert model.data(model.index(0, TraceTreeModel.COL_ID)) == "101"
+    win._filter_input.clear()
+    qtbot.waitUntil(lambda: model.rowCount() == 3, timeout=2000)
+
+
+def test_selection_cleared_when_row_leaves_live_window(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    ctx, win, cfg = _trace_recording_bus(qtbot, tmp_path)
+    model = win._model
+    assert model is not None
+    model._live_rows = 3
+    selected: list[object] = []
+    ctx.events.frame_selected.connect(selected.append)
+    # The oldest row, which the next frame pushes out of the window while
+    # rows stay for the view to move the selection to.
+    _select_row(win, 2)
+    clicked = model.frame_at(2)
+    assert clicked is not None and clicked.arbitration_id == 0x100
+    assert selected == [clicked]
+
+    _send_ids(str(cfg.channel), 0x200)
+    qtbot.waitUntil(lambda: model.rx_count() == 4, timeout=2000)
+    assert model.rowCount() == 3
+    assert not win._tree.selectionModel().currentIndex().isValid()
+    assert selected == [clicked]
+    assert win._detail_view is not None
+    assert win._detail_view._id_val.text() == "0x100 (256)"
+
+
+def test_pause_shows_history_and_resume_skips_paused_frames(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    ctx, win = _trace_on_open_bus(qtbot, tmp_path)
+    model = win._model
+    assert model is not None and win._tracked_pane is not None
+    model._live_rows = 2
+    win._tracked_pane.add_payload(BusPayload(bus_name="CAN_1"))
+    channel = str(ctx.bus_reader.last_config_for("CAN_1").channel)  # type: ignore[union-attr]
+    ring = ctx.bus_reader.rings["CAN_1"]
+    _send_ids(channel, 0x100, 0x101, 0x102, 0x103, 0x104)
+    qtbot.waitUntil(lambda: model.rx_count() == 5, timeout=2000)
+    assert model.rowCount() == 2
+
+    win._paused_btn.click()
+    assert model.rowCount() == 5
+    assert model.data(model.index(4, TraceTreeModel.COL_ID)) == "100"
+    _send_ids(channel, 0x300, 0x301)
+    qtbot.waitUntil(lambda: ring.total_seq == 7, timeout=2000)
+    qtbot.wait(100)
+    assert model.rowCount() == 5
+
+    win._running_btn.click()
+    assert model.rowCount() == 2
+    assert model.data(model.index(0, TraceTreeModel.COL_ID)) == "104"
+    _send_ids(channel, 0x400)
+    qtbot.waitUntil(
+        lambda: model.data(model.index(0, TraceTreeModel.COL_ID)) == "400", timeout=2000
+    )
+    assert model.rx_count() == 6
+
+
+def test_trace_does_not_decode_collapsed_rows(  # type: ignore[no-untyped-def]
+    qapp, qtbot, tmp_path: Path, example_dbc_path: Path
+) -> None:
+    ctx = make_app_context(tmp_path)
+    ctx.database.add_dbc(example_dbc_path, ["CAN_1"])
+    win = TraceWindow(instance_id="t1")
+    qtbot.addWidget(win)
+    win.bind(ctx)
+    win.resize(900, 400)
+    with qtbot.waitExposed(win):
+        win.show()
+    cfg = BusConfig(
+        name="CAN_1", interface="virtual", channel=f"tr-{uuid.uuid4().hex[:8]}", bitrate=500000
+    )
+    with qtbot.waitSignal(ctx.bus_reader.bus_started, timeout=2000):
+        ctx.bus_reader.open(cfg)
+    assert win._tracked_pane is not None
+    win._tracked_pane.add_payload(BusPayload(bus_name="CAN_1"))
+    sender = can.Bus(interface="virtual", channel=cfg.channel)
+    try:
+        for i in range(5):
+            sender.send(
+                can.Message(arbitration_id=0x100, data=bytes([i] * 8), is_extended_id=False)
+            )
+    finally:
+        sender.shutdown()
+    model = win._model
+    assert model is not None
+    qtbot.waitUntil(lambda: model.rowCount() == 5, timeout=2000)
+    win._tree.viewport().repaint()
+
+    frames, _ = ctx.bus_reader.rings["CAN_1"].read_since(-1)
+    assert len(frames) == 5
+    assert all(f.decoded is None for f in frames)
+    win._tree.expand(model.index(0, 0))
+    win._tree.viewport().repaint()
+    assert frames[-1].decoded is not None
+    assert all(f.decoded is None for f in frames[:-1])
+
+
+def test_lost_label_only_when_nonzero(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    win = TraceWindow(instance_id="t1")
+    qtbot.addWidget(win)
+    win.bind(make_app_context(tmp_path))
+    assert win._model is not None
+
+    win._model.counters_changed.emit(3, 1, 0)
+    assert win._counts_label.text() == "RX 3   ERR 1"
+    win._model.counters_changed.emit(3, 1, 5)
+    assert win._counts_label.text() == "RX 3   ERR 1   LOST 5"
