@@ -411,10 +411,10 @@ def test_register_prober_retains_until_thread_finished(qtbot) -> None:  # type: 
     with patch.object(prober_mod, "_detect_configs", _stub_per_backend({})):
         register_prober(p, t)
         assert (p, t) in prober_mod._INFLIGHT_PROBES
-        with qtbot.waitSignal(t.finished, timeout=2000):
-            t.start()
-
-    assert (p, t) not in prober_mod._INFLIGHT_PROBES
+        t.start()
+        # Not a waitSignal on t.finished: its queued delivery is lost when
+        # t.deleteLater runs first.
+        qtbot.waitUntil(lambda: (p, t) not in prober_mod._INFLIGHT_PROBES, timeout=5000)
 
 
 def test_hung_probe_helper_is_daemon(qtbot) -> None:  # type: ignore[no-untyped-def]

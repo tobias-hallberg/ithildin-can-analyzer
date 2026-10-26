@@ -357,12 +357,15 @@ class BusReader(QObject):
         """Close every bus for quit; return the names whose thread still runs.
 
         Waits ``wait_ms`` for the open buses, then up to ``wait_ms`` more
-        for those still closing. A running thread must not be destroyed
-        (Qt aborts the process), so the caller has to exit around it.
+        for every controller still owned: those closing, and those whose
+        worker failed, whose thread may still be exiting after
+        ``bus_failed``. A running thread must not be destroyed (Qt aborts
+        the process, or hangs if it is mid-exit), so the caller has to exit
+        around it.
         """
         self.close(wait_ms=wait_ms)
         deadline = QDeadlineTimer(wait_ms)
-        return [n for n, (c, _cfg) in self._retiring.items() if not c.wait(deadline)]
+        return [c.name for c in self.findChildren(BusController) if not c.wait(deadline)]
 
     def forget(self, name: str | None = None) -> None:
         """Drop what is remembered about a closed bus, or about every bus when

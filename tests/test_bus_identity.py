@@ -309,7 +309,7 @@ def test_missing_pinned_adapter_fails_the_bus_without_opening_anything(
         assert "is not attached" in reader.failures()["Engine"]
         assert detected.opened == []
     finally:
-        reader.close()
+        assert reader.shutdown() == []
 
 
 def test_kvaser_pin_resolves_inside_the_enumeration_lock(monkeypatch) -> None:  # type: ignore[no-untyped-def]

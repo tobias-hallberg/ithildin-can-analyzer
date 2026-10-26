@@ -859,6 +859,8 @@ def test_closing_glyph_for_retiring_bus(qapp, qtbot, monkeypatch, tmp_path: Path
     reader = ctx.bus_reader
     with qtbot.waitSignal(reader.bus_started, timeout=2000):
         reader.open(ctx.project.workspace.bus[0])
+    # Hung in recv: a stop requested before that lets the worker exit cleanly.
+    qtbot.waitUntil(lambda: fake.recv_calls > 0, timeout=2000)
 
     def item():  # type: ignore[no-untyped-def]
         return dock._bus_tree._tree_model.item(0)

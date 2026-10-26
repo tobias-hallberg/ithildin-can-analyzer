@@ -10,7 +10,7 @@ import uuid
 
 import can
 import pytest
-from PySide6.QtCore import QDeadlineTimer
+from PySide6.QtCore import QDeadlineTimer, Qt
 
 from ithildin.app_state.bus_reader import BusReader, BusReadOnlyError
 from ithildin.core.bus import BusController
@@ -179,6 +179,14 @@ def _hung_fake(monkeypatch) -> FakeBus:  # type: ignore[no-untyped-def]
     return use_fake_bus(monkeypatch, fake)
 
 
+def _open_hung(reader: BusReader, qtbot, cfg: BusConfig, fake: FakeBus) -> None:  # type: ignore[no-untyped-def]
+    """Open ``cfg`` and wait until its worker hangs in ``recv``: a stop
+    requested before then lets the worker exit cleanly."""
+    polls = fake.recv_calls
+    _open(reader, qtbot, cfg)
+    qtbot.waitUntil(lambda: fake.recv_calls > polls, timeout=2000)
+
+
 def _send(channel: str, arbitration_id: int, count: int = 1) -> None:
     peer = can.Bus(interface="virtual", channel=channel)
     try:
@@ -270,7 +278,7 @@ def test_failure_delivers_tail_before_bus_failed(qapp, qtbot, monkeypatch, reade
 def test_close_timeout_retires_and_refuses_reopen(qapp, qtbot, monkeypatch, reader) -> None:  # type: ignore[no-untyped-def]
     fake = _hung_fake(monkeypatch)
     cfg = _virtual()
-    _open(reader, qtbot, cfg)
+    _open_hung(reader, qtbot, cfg, fake)
     stopped: list[str] = []
     errors: list[str] = []
     reader.bus_stopped.connect(stopped.append)
@@ -299,7 +307,7 @@ def test_close_timeout_retires_and_refuses_reopen(qapp, qtbot, monkeypatch, read
 def test_retiring_channel_refused_under_new_name(qapp, qtbot, monkeypatch, reader) -> None:  # type: ignore[no-untyped-def]
     fake = _hung_fake(monkeypatch)
     cfg = _virtual()
-    _open(reader, qtbot, cfg)
+    _open_hung(reader, qtbot, cfg, fake)
     errors: list[str] = []
     reader.error.connect(errors.append)
     try:
@@ -333,7 +341,7 @@ def test_retiring_adapter_refused_on_another_channel(qapp, qtbot, monkeypatch, r
     cfg = BusConfig(
         name="CAN_1", interface="pcan", channel="PCAN_USBBUS1", bitrate=500000, hw_id="0000002a.0"
     )
-    _open(reader, qtbot, cfg)
+    _open_hung(reader, qtbot, cfg, fake)
     errors: list[str] = []
     reader.error.connect(errors.append)
     try:
@@ -348,8 +356,8 @@ def test_retiring_adapter_refused_on_another_channel(qapp, qtbot, monkeypatch, r
 
 def test_close_all_shares_one_deadline(qapp, qtbot, monkeypatch, reader) -> None:  # type: ignore[no-untyped-def]
     fake = _hung_fake(monkeypatch)
-    _open(reader, qtbot, _virtual("A"))
-    _open(reader, qtbot, _virtual("B"))
+    _open_hung(reader, qtbot, _virtual("A"), fake)
+    _open_hung(reader, qtbot, _virtual("B"), fake)
     try:
         start = time.monotonic()
         reader.close(wait_ms=500)
@@ -389,12 +397,29 @@ def test_controllers_deleted_after_close(qapp, qtbot, reader) -> None:  # type: 
 
 def test_shutdown_returns_stuck_names(qapp, qtbot, monkeypatch, reader) -> None:  # type: ignore[no-untyped-def]
     fake = _hung_fake(monkeypatch)
-    _open(reader, qtbot, _virtual())
+    _open_hung(reader, qtbot, _virtual(), fake)
     try:
         assert reader.shutdown(wait_ms=50) == ["CAN_1"]
     finally:
         with qtbot.waitSignal(reader.bus_released, timeout=2000):
             fake.block.set()
+
+
+def test_shutdown_waits_for_a_failed_bus_still_exiting(qapp, qtbot, reader) -> None:  # type: ignore[no-untyped-def]
+    """The worker's thread is still unwinding at ``bus_failed``: a reader freed
+    then destroys a running QThread."""
+    _open(reader, qtbot, _virtual())
+    release = threading.Event()
+    # Connected after the relay that drives bus_failed: holds the thread past it.
+    reader._controllers["CAN_1"].worker.stopped.connect(
+        lambda: release.wait(5), Qt.ConnectionType.DirectConnection
+    )
+    try:
+        with qtbot.waitSignal(reader.bus_failed, timeout=2000):
+            kill_capture(reader, "CAN_1")
+        assert reader.shutdown(wait_ms=50) == ["CAN_1"]
+    finally:
+        release.set()
 
 
 def test_bus_stopped_once_per_close(qapp, qtbot, reader) -> None:  # type: ignore[no-untyped-def]
@@ -525,7 +550,7 @@ def test_refused_open_keeps_the_session(qapp, qtbot, monkeypatch, reader) -> Non
     """An open refused while the bus is still closing must not wipe the views."""
     fake = _hung_fake(monkeypatch)
     cfg = _virtual()
-    _open(reader, qtbot, cfg)
+    _open_hung(reader, qtbot, cfg, fake)
     emitted: list[object] = []
     reader.session_t0_changed.connect(emitted.append)
     try:

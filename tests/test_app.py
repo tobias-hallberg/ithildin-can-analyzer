@@ -61,6 +61,8 @@ def test_quit_with_a_stuck_bus_worker_exits_without_teardown(  # type: ignore[no
     monkeypatch.setattr(reader, "shutdown", partial(reader.shutdown, wait_ms=50))
     with qtbot.waitSignal(reader.bus_started, timeout=2000):
         reader.open(_virtual())
+    # Hung in recv: a stop requested before that lets the worker exit cleanly.
+    qtbot.waitUntil(lambda: fake.recv_calls > 0, timeout=2000)
     try:
         app_mod._finish(reader, relay, 3)
 

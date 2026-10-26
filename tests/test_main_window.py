@@ -727,6 +727,8 @@ def test_connect_action_resets_after_timed_out_close(  # type: ignore[no-untyped
     win.bind_events(ctx)
     with qtbot.waitSignal(ctx.bus_reader.bus_started, timeout=2000):
         win._on_connect_toggled()
+    # Hung in recv: a stop requested before that lets the worker exit cleanly.
+    qtbot.waitUntil(lambda: fake.recv_calls > 0, timeout=2000)
 
     try:
         ctx.bus_reader.close(wait_ms=50)
@@ -761,6 +763,8 @@ def test_status_bar_keeps_forgotten_closing_bus(  # type: ignore[no-untyped-def]
     win.bind_events(ctx)
     with qtbot.waitSignal(ctx.bus_reader.bus_started, timeout=2000):
         win._on_connect_toggled()
+    # Hung in recv: a stop requested before that lets the worker exit cleanly.
+    qtbot.waitUntil(lambda: fake.recv_calls > 0, timeout=2000)
 
     try:
         ctx.bus_reader.close(wait_ms=50)

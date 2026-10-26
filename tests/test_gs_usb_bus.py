@@ -252,7 +252,7 @@ def test_unplug_fails_the_bus_as_lost(qapp, qtbot, adapters) -> None:  # type: i
         assert "gs_usb adapter lost" in blocker.args[1]
         assert reader.health("CAN_1") == (BusHealth.LOST, "")
     finally:
-        reader.close()
+        assert reader.shutdown() == []
 
 
 # ---- Timestamps ----

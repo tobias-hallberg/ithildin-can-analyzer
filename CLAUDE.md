@@ -167,6 +167,11 @@ MCP layer (`src/ithildin/mcp/`):
   a long recording, and a closed Record window may have left one writing.
   Quit then calls `app._finish`: `bus_reader.shutdown()`, and `os._exit`
   only when a worker is still stuck (a running QThread can't be destroyed).
+  `shutdown()` waits for every controller the reader still owns, not only
+  the open and retiring ones: after `bus_failed` the failed worker's thread
+  is still exiting, and destroying it then aborts, or hangs for good if it
+  is mid-`finished`. So never free a reader before `shutdown()` returns
+  `[]` — a test's bare `close()` doesn't wait for a bus that failed.
 - **One send lock per bus.** `BusWorker._send_lock` serialises every
   touch of a python-can bus other than `recv()`: `send` (from any
   thread), cyclic tasks, task creation, the TX flush and `_close_bus`.
