@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import can
-from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot
+from PySide6.QtCore import QCoreApplication, QObject, Qt, QThread, Signal, Slot
 
 from ithildin.core.ringbuf import RingBuffer
 
@@ -218,9 +218,13 @@ class TeeLogger(QObject):
         self._worker.set_rings(rings)
 
     def start(self) -> None:
+        _track(self)
         self._thread.start()
 
     def stop(self, wait_ms: int = 5000) -> bool:
+        """Ask the recording to stop and wait up to ``wait_ms`` for its file to
+        be written out; whether it was. One still writing stays alive and
+        emits ``stopped`` when done."""
         self._worker.request_stop()
         return self._thread.wait(wait_ms)
 
@@ -229,4 +233,34 @@ class TeeLogger(QObject):
         # Relaying the worker's own ``stopped`` let the consumer delete the
         # QThread while it was still unwinding (see ReplayController).
         self._thread.wait()
+        _RUNNING.discard(self)
         self.stopped.emit()
+
+
+_RUNNING: set[TeeLogger] = set()
+"""Every started logger until its thread is joined, so neither a closed
+Record window nor quitting frees one whose thread is still writing."""
+_quit_guard_installed = False
+
+
+def _track(logger: TeeLogger) -> None:
+    global _quit_guard_installed
+    _RUNNING.add(logger)
+    app = QCoreApplication.instance()
+    if app is not None and not _quit_guard_installed:
+        app.aboutToQuit.connect(_finish_all)
+        _quit_guard_installed = True
+
+
+def _finish_all() -> None:
+    """Stop every recording and wait, uncapped, until each file is written out.
+
+    An .mf4 is written out only as its writer stops (``MDF.save``), which takes
+    well over any cap for a long recording, and leaving before then kills the
+    save and leaves the file corrupt. Child views get no closeEvent on quit,
+    so this is also what stops a recording still running.
+    """
+    for logger in list(_RUNNING):
+        logger._worker.request_stop()
+    for logger in list(_RUNNING):
+        logger._thread.wait()

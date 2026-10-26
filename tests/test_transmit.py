@@ -602,7 +602,7 @@ def test_signal_change_modifies_live_payload(qapp, qtbot, example_dbc_path: Path
 def tx_reader():  # type: ignore[no-untyped-def]
     reader = BusReader()
     yield reader
-    reader.close()
+    assert reader.shutdown() == []
 
 
 def _db(dbc_path: Path, buses: list[str] | None = None) -> Database:
@@ -681,6 +681,25 @@ def test_closing_a_bus_without_active_rows_keeps_master_on(  # type: ignore[no-u
         tx_reader.close("CAN_1")
     assert sched.setup.master_enabled is True
     assert disarms == []
+
+
+def test_a_targeted_bus_opening_listen_only_disarms(  # type: ignore[no-untyped-def]
+    qapp, qtbot, example_dbc_path: Path, tx_reader
+) -> None:
+    _open_virtual_bus(tx_reader, qtbot)
+    sched = TxScheduler(tx_reader, _db(example_dbc_path, ["CAN_1", "RO"]))
+    try:
+        # A one-shot row may target a closed bus while armed.
+        ro_row = TxMessage(bus_name="RO", message_id=0x200, message_name="BodyStatus", active=True)
+        sched.apply(TxSetup(master_enabled=True, transmits=[_periodic(), ro_row]))
+        assert sched.setup.master_enabled is True
+
+        with qtbot.waitSignal(sched.disarmed, timeout=2000) as blocker:
+            _open_virtual_bus(tx_reader, qtbot, name="RO", listen_only=True)
+        assert blocker.args == ["Bus RO is listen-only"]
+        assert sched._tasks == {}
+    finally:
+        sched.shutdown()
 
 
 def test_bus_failure_disarms_with_reason(  # type: ignore[no-untyped-def]

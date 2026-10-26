@@ -27,8 +27,10 @@ Process-level singletons live in `app_state/`:
   exposes `bus_opening / bus_started / bus_stopped / bus_failed /
   frames_received(list) / error`, plus `cyclic_failed / send_failed` for
   TX and `bus_health_changed(name, state, detail)` with `health(name)` for
-  bus health. `failures()` holds every bus that failed and wasn't opened
-  again or forgotten since (the dock's "failed" rows, the Trace banner).
+  bus health. Several buses can be open at once (the toolbar's Connect
+  opens every declared one). `failures()` holds every bus that failed and
+  wasn't opened again or forgotten since (the dock's "failed" rows, the
+  Trace banner).
   `send_message` is synchronous and callable from any thread
   (Replay, MCP); `send_message_async` is the TX window's one-shot path.
 - `Database` (`database.py`) — wraps `core/decoder.py`'s `Decoder`,
@@ -56,13 +58,15 @@ MCP layer (`src/ithildin/mcp/`):
   never a DENY. SENT means the driver accepted the frame, not that the bus
   ACKed it.
 - Before the allowlist, the write tools resolve the target (the `bus`
-  named, else the single open bus) and refuse an unresolved one (`NO_BUS`),
-  a listen-only one (`BUS_READ_ONLY`) and a degraded one (`BUS_UNHEALTHY`,
-  any `BusReader.health()` but OK), so a refusal spends no rate-limit
-  token. The send always gets a concrete name: given `None`,
-  `send_message` would pick whichever single bus is open by then, unchecked.
-  `list_buses` reports `opening` (no health yet), `live`, or the degraded
-  `BusHealth` value with `status_detail`.
+  named, else the single open bus) and refuse an unresolved or closed one
+  (`NO_BUS`), a listen-only one (`BUS_READ_ONLY`) and a degraded or still
+  opening one (`BUS_UNHEALTHY`: any `BusReader.health()` but OK, `None`
+  included), so a refusal spends no rate-limit token. The send always gets
+  a concrete name: given `None`, `send_message` would pick whichever single
+  bus is open by then, unchecked. `list_buses` reports `opening` (no health
+  yet), `live`, or `errors` / `bus_off` with `status_detail`. A lost bus
+  has already failed and isn't listed; its LOST health outlives the
+  failure, so sends naming it get `BUS_UNHEALTHY`.
 - `bridge.py` runs FastMCP on a worker-thread asyncio loop. Qt and
   asyncio loops stay independent — **do not** introduce `qasync`. A
   misbehaving tool handler must not stall paint events. Write tools are
@@ -90,7 +94,10 @@ MCP layer (`src/ithildin/mcp/`):
   one stands for `FrameRecord.coalesced` error frames. Every view and MCP
   read tool checks `is_error_frame` before any decode. Only a whole-bus
   subscription admits error frames: every caller of
-  `_Effective.admits(bus, aid, *, is_error=)` passes `is_error`.
+  `_Effective.admits(bus, aid, *, is_error=)` passes `is_error`. Per-ID
+  bookkeeping keys them apart too: the Trace keeps every error frame of a
+  bus under `(bus, ERROR_ROW_ID)` (`trace_view.row_key`), so a message
+  sharing the error class's ID keeps its own Latest row, period and pin.
 - **Never put a proxy model over `TraceTreeModel`.** QTreeView lays out
   every top-level row on each insert at the root, and a proxy maps each
   row through `rowCount`, which decodes. So the model filters text itself
@@ -138,7 +145,8 @@ MCP layer (`src/ithildin/mcp/`):
   reopened bus's seq restarts at 0); Plot breaks the lines of a stopped or
   degraded bus with a NaN; `TeeLogger.set_rings` keeps one recording
   across bus loss and reconnects; Monitor and Data view dim stale values.
-  Replay stops when its target bus stops, fails or degrades.
+  Replay starts only on a bus whose health is OK, and stops when its
+  target bus stops, fails or degrades.
 - **Controller signals are routed by identity.** `BusReader` tells
   controllers apart by `sender()`, never by bus name, and ignores any
   that is no longer registered, so a late signal can't act on a bus
@@ -152,9 +160,13 @@ MCP layer (`src/ithildin/mcp/`):
   `BusController.finished`, `TeeLogger.stopped` and
   `ReplayController.finished` fire after `QThread.finished` + `wait()`;
   `BusReader` `deleteLater`s a controller only from `finished`. Child
-  views get no `closeEvent` on quit, so Record and Replay stop from
-  `aboutToQuit`. Quit calls `bus_reader.shutdown()` and `os._exit`s only
-  when a worker is still stuck (a running QThread can't be destroyed).
+  views get no `closeEvent` on quit, so Replay stops from `aboutToQuit`,
+  and `core/logger.py` holds every started `TeeLogger` until its thread is
+  joined and, on `aboutToQuit`, stops and joins them all without a cap: an
+  .mf4 is written out only as its writer stops, which outlasts any cap for
+  a long recording, and a closed Record window may have left one writing.
+  Quit then calls `app._finish`: `bus_reader.shutdown()`, and `os._exit`
+  only when a worker is still stuck (a running QThread can't be destroyed).
 - **One send lock per bus.** `BusWorker._send_lock` serialises every
   touch of a python-can bus other than `recv()`: `send` (from any
   thread), cyclic tasks, task creation, the TX flush and `_close_bus`.
@@ -179,9 +191,11 @@ MCP layer (`src/ithildin/mcp/`):
   is the single path: master OFF, stop every task, flush, emit
   `disarmed` (the TX window shows an amber banner and a Report entry). It
   runs when a bus an *active* row targets closes or fails or its health
-  worsens into bus errors / bus-off, when a cyclic task fails, and when a
-  wanted task can't start while armed. Re-arming while the bus is still
-  degraded is allowed and holds until the next worsening. Arming is
+  worsens into bus errors / bus-off, when an active row targets a
+  listen-only bus (the TX window's gate only disables the master pill),
+  when a cyclic task fails, and when a wanted task can't start while
+  armed. Re-arming while the bus is still degraded is allowed and holds
+  until the next worsening. Arming is
   refused while an active row's bus is closed, still opening or
   listen-only. Nothing starts while master is OFF, so a reopened bus or a
   later edit never restarts TX — the user re-arms. The TX window and its
@@ -207,7 +221,13 @@ MCP layer (`src/ithildin/mcp/`):
   BusHealth.OK`**, one rule everywhere. Known gaps: Kvaser bus-off shows
   only through the error-frame rate (python-can doesn't wrap
   `canReadStatus`); an IXXAT bus in error keeps up to 16 stale queued
-  frames (its flush waits INFINITE).
+  frames (its flush waits INFINITE). Upstream python-can 4.6.1 bugs, noted
+  and not patched: `PcanBus` leaks one Windows event handle per open
+  (`CreateEvent`, never closed); `KvaserBus.shutdown` stops at the first
+  failing CANlib call, so a failing read handle leaves the write handle
+  open; IXXAT's epoch offset has an operator-precedence slip
+  (`start_end - start_begin / 2`), so its frames' absolute timestamps are
+  wrong while their differences hold.
 - **Error frames are coalesced in `BusWorker`.** The ring gets at most ~10
   per second per bus, each with `FrameRecord.coalesced` = how many it
   stands for; data frames are never dropped. Bus state comes from
@@ -236,13 +256,20 @@ MCP layer (`src/ithildin/mcp/`):
   from `LeftDockWidget.rescan_adapters()` (below). The
   supported set is deliberately narrow (`pcan`, `kvaser`, `gs_usb`,
   `socketcan`, `ixxat`) — every name in `_SUPPORTED_BACKENDS` is a
-  vendor module the probe imports (python-can's
-  `detect_available_configs(interfaces=[name])`, or `_detect_gs_usb`), so
-  adding one is paying real startup cost. Each per-backend probe runs
-  in a sub-thread with a hard `BACKEND_TIMEOUT_S` ceiling; a vendor
-  module that hangs on import is reported via `backend_failed` and the
-  prober moves on rather than wedging the dock. The hung helper thread
-  stays, so the dock keeps the backend in `_hung_backends` and every later
+  vendor module the probe imports (`core/bus.py::detect_configs`, or
+  `_detect_gs_usb`), so adding one is paying real startup cost. Detect
+  through `detect_configs`, which calls the backend's
+  `_detect_available_configs()` on the calling thread, never
+  `can.detect_available_configs`: that runs detection in a pool the
+  interpreter joins at exit, and gives up on a slow driver after 5 s while
+  the driver carries on outside `KVASER_ENUM_LOCK`. A hung detection then
+  holds only the daemon probe thread, or the bus worker (retired, and
+  `os._exit` at quit). Each per-backend probe runs in a daemon sub-thread
+  with a hard `BACKEND_TIMEOUT_S` ceiling (below the 5 s a probe gets at
+  quit); a vendor module that hangs on import or detection is reported
+  via `backend_failed` and the prober moves on rather than wedging the
+  dock. The hung helper thread stays, so the dock keeps the backend in
+  `_hung_backends` and every later
   probe, the Create dialog's included, skips it (`skip_backends=`) until a
   restart. `register_prober` before `thread.start()`. The `virtual` loopback
   is a dev-only surface: it's emitted by the prober and seeded in the
@@ -321,7 +348,7 @@ MCP layer (`src/ithildin/mcp/`):
   didn't find) — never silently. The worker resolves it in
   `core/bus.py::_pin_adapter`, on the worker thread: ixxat
   `unique_hardware_id`, gs_usb `GsUsbBus(serial=)`, pcan / kvaser by
-  `detect_available_configs` (keep the channel, follow the adapter to a
+  `detect_configs` (keep the channel, follow the adapter to a
   single other one, refuse with `ADAPTER_NOT_ATTACHED` or "N adapters
   report …"); never open a pinned bus by channel alone, never
   `PcanBus(device_id=)` (first match). Two buses clash when their
@@ -481,9 +508,13 @@ widget (drops on the inner GraphicsView don't propagate reliably).
   writing another fake. `GsUsbBus` itself runs against a fake `GsUsb`
   adapter in `tests/test_gs_usb_bus.py`, and `_open_pcan` runs
   python-can's own `PcanBus` against a fake PCAN-Basic driver
-  (`tests/test_bus.py::_PcanBasic`).
+  (`tests/test_bus.py::_PcanBasic`). `fake_bus.LiveReader` makes named
+  buses read as open and live where only their names matter (MCP sends).
 - The conftest fails a test whose `make_app_context` reader still has a
-  worker running after `shutdown()`.
+  worker running after `shutdown()`; a reader a test builds itself ends
+  with `assert reader.shutdown() == []`. It also points the user-scoped
+  `QSettings` (dock layout, theme) at a test-only org, emptied after each
+  test.
 - For Qt signals fired during a method call, use
   `with qtbot.waitSignal(sig, timeout=…):` not `QSignalSpy().wait()` —
   the spy can miss signals fired before `wait()` returns.
@@ -508,10 +539,10 @@ widget (drops on the inner GraphicsView don't propagate reliably).
 | Add an MCP read tool | implement in `mcp/tools.py`, register in `mcp/server.py::register_read_tools` |
 | Add an MCP write tool | same split; the body runs inside `tools._audited` and goes through `AllowlistStore.check_*`; register an `async` wrapper in `mcp/server.py::register_write_tools` that calls it via `to_thread.run_sync` with the server's `sends` limiter |
 | Wire a `BusReader` error display | `MainWindow.report()` and per-view banners |
-| Add or re-enable a CAN backend | `ui/adapter_prober.py::_SUPPORTED_BACKENDS` + `workspace/schema.py::SupportedInterface` (must update both); for listen-only also `LISTEN_ONLY_INTERFACES` + `core/bus.py::_apply_listen_only_kwargs`; for pinning `schema.hw_id_of` + `core/bus.py::_pin_adapter` |
+| Add or re-enable a CAN backend | `ui/adapter_prober.py::_SUPPORTED_BACKENDS` + `workspace/schema.py::SupportedInterface` (must update both) + `hiddenimports` in `packaging/ithildin.spec` (and `collect_dynamic_libs` for a native library it bundles) + an enricher in `ui/adapter_enrich.py::_ENRICHERS` unless the default one labels it well; for listen-only also `LISTEN_ONLY_INTERFACES` + `core/bus.py::_apply_listen_only_kwargs`; for pinning `schema.hw_id_of` + `core/bus.py::_pin_adapter`, or its own branch in `BusWorker._open_bus` |
 | Change what identifies an adapter | `workspace/schema.py::hw_id_of` / `channel_key(s)` |
 | React to a device change | `ui/main_window.py::nativeEvent` (Windows) → `LeftDockWidget.rescan_adapters` |
-| Add a vendor dep that limits the Python range | `[project.optional-dependencies]` in `pyproject.toml` + the `--extra` in `.github/workflows/release.yml` |
+| Add a vendor dep that limits the Python range | none today; make it an extra under `[project.optional-dependencies]` in `pyproject.toml` with a matching `--extra` in `.github/workflows/release.yml` |
 | Persist user-private state | `~/.ithildin/<project>/` (allowlist, audit, layout, adapter pins) |
 | Log a diagnostic | `logging.getLogger(__name__)`; levels and dock mirroring in `app_state/diagnostics.py` |
 | Read the diagnostic logs | `~/.ithildin/logs/` (app-global, one file per launch) |
@@ -519,7 +550,6 @@ widget (drops on the inner GraphicsView don't propagate reliably).
 
 ## What this project is *not*
 
-- Not multi-bus in v0.1 (`BusController` supports it; UI exposes one).
 - Not CAN FD in v0.1.
 - Not a DBC editor — read-only DBC tree only.
 - Not macOS in v1.
@@ -530,10 +560,11 @@ widget (drops on the inner GraphicsView don't propagate reliably).
 These are intentionally not built yet. Don't reference them in code or
 docs as if they exist.
 
-- **Cyclic / periodic MCP transmit.** `python-can`'s `CyclicSendTask`
-  isn't wired up; the MCP layer has only one-shot `send_signal` and
-  `send_frame`. When this lands, agent disconnect must tear down that
-  agent's running tasks.
+- **Cyclic / periodic MCP transmit.** The MCP layer has only one-shot
+  `send_signal` and `send_frame`. When it lands, start and stop tasks
+  through `BusReader.start_periodic` / `stop_periodic`, so they get the
+  send lock and `cyclic_failed`, stop them on the same events TX disarms
+  on, and tear down an agent's tasks when it disconnects.
 - **Replay pause / scrub.** `core/replay.py` plays linearly from start
   to end. The Replay window discloses this in its hint.
 - **Settings dialog content.** `ui/settings_window.py` exposes only the

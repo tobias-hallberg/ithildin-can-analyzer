@@ -24,7 +24,7 @@ _MSG = can.Message(arbitration_id=0x100, data=b"\x01\x02", is_extended_id=False)
 def reader():  # type: ignore[no-untyped-def]
     r = BusReader()
     yield r
-    r.close()
+    assert r.shutdown() == []
 
 
 def _open(reader: BusReader, qtbot, interface: str = "pcan", *, listen_only: bool = False) -> None:  # type: ignore[no-untyped-def]

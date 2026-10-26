@@ -2,9 +2,9 @@
 # Copyright (C) 2026 Tobias Hallberg
 """Turn raw ``detect_available_configs`` dicts into rich device metadata.
 
-``can.detect_available_configs(interfaces=[backend])`` returns one dict
-per *channel*. Several backends already fold useful fields into those
-dicts (kvaser ships ``device_name`` / ``serial`` / ``dongle_channel``;
+``core.bus.detect_configs(backend)`` returns one dict per *channel*.
+Several backends already fold useful fields into those dicts (kvaser
+ships ``device_name`` / ``serial`` / ``dongle_channel``;
 pcan ships ``device_name`` / ``device_id`` / ``supports_fd`` /
 ``channel_condition``). The enrichers here parse those into a two-level
 model — a :class:`DeviceInfo` owning one or more :class:`ChannelInfo` —

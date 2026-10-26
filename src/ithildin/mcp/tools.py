@@ -105,8 +105,9 @@ def list_buses(ctx: McpReadContext) -> list[dict[str, Any]]:
     """Return every open bus with its status and how it was configured.
 
     ``status`` is ``opening`` until the adapter is up, then ``live`` or a
-    degraded health (``errors``, ``bus_off``, ``lost``) with its
-    ``status_detail``.
+    degraded health (``errors``, ``bus_off``) with its ``status_detail``.
+    A bus whose adapter is lost fails at once and drops out of the list;
+    sends naming it are refused with ``BUS_UNHEALTHY``.
     """
     reader = ctx.bus_reader
     out: list[dict[str, Any]] = []
@@ -684,8 +685,9 @@ def _audited(
 def _bus_refusal(
     ctx: McpWriteContext, event: AuditEvent, bus_name: str | None
 ) -> dict[str, Any] | None:
-    """Refuse an unresolved, listen-only or degraded target before the
-    allowlist is asked, so a refused attempt spends no rate-limit token.
+    """Refuse an unresolved, closed, listen-only, degraded or still opening
+    target before the allowlist is asked, so a refused attempt spends no
+    rate-limit token.
 
     Past this point the target is a concrete name: ``send_message`` given
     ``None`` would pick whichever single bus is open by then, unchecked.
@@ -696,12 +698,17 @@ def _bus_refusal(
     if reader.is_listen_only(bus_name):
         return _result(event, "BUS_READ_ONLY", detail=f"bus {bus_name!r} is listen-only")
     health = reader.health(bus_name)
+    # Before the open check: a lost bus keeps LOST after it closed.
     if health is not None and health[0] is not BusHealth.OK:
         return _result(
             event,
             "BUS_UNHEALTHY",
             detail=f"bus {bus_name!r} is unhealthy: {health[0].describe(health[1])}",
         )
+    if bus_name not in reader.bus_names():
+        return _result(event, "NO_BUS", detail=f"bus {bus_name!r} is not open")
+    if health is None:
+        return _result(event, "BUS_UNHEALTHY", detail=f"bus {bus_name!r} is still opening")
     return None
 
 

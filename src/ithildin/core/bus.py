@@ -36,6 +36,7 @@ from typing import Any, cast
 
 import can
 from can.broadcastmanager import ThreadBasedCyclicSendTask
+from can.interface import _get_class_for_interface
 from PySide6.QtCore import QDeadlineTimer, QObject, Qt, QThread, Signal, Slot
 
 from ithildin.core.ringbuf import RingBuffer
@@ -685,12 +686,9 @@ def _pin_adapter(config: BusConfig, kwargs: dict[str, Any]) -> None:
     hw_id = config.hw_id
     if hw_id is None:
         return
-    # python-can's default 5 s timeout, not a shorter one: once it runs out
-    # it returns what it found so far, and a slow driver reads as a missing
-    # adapter.
     found = [
         detected["channel"]
-        for detected in can.detect_available_configs(interfaces=[config.interface])
+        for detected in detect_configs(config.interface)
         if hw_id_of(config.interface, detected) == hw_id
     ]
     if any(str(channel) == str(config.channel) for channel in found):
@@ -709,6 +707,27 @@ def _pin_adapter(config: BusConfig, kwargs: dict[str, Any]) -> None:
     raise can.CanInitializationError(
         f"{len(found)} adapters report the identity this bus is pinned to{advice}"
     )
+
+
+def detect_configs(interface: str) -> list[dict[str, Any]]:
+    """The channels one python-can backend detects, as ``detect_available_configs``
+    dicts, detected on the calling thread. Vendor work: never the GUI thread.
+
+    Never ``can.detect_available_configs``: it runs the detection in a pool it
+    abandons after 5 s, and the interpreter joins that pool's worker at exit.
+    A hung driver call would hang the exit, and a slow one would read as no
+    adapters while it carried on outside the caller's ``KVASER_ENUM_LOCK``.
+    A backend whose module doesn't import, or that can't detect, has none.
+    """
+    try:
+        bus_class = _get_class_for_interface(interface)
+    except can.CanInterfaceNotImplementedError:
+        return []
+    try:
+        detected = bus_class._detect_available_configs()
+    except NotImplementedError:
+        return []
+    return [{"interface": interface, **config} for config in detected]
 
 
 KVASER_ENUM_LOCK = threading.Lock()

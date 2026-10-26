@@ -272,8 +272,6 @@ def test_add_kvaser_channel_data_reads_card_type_and_firmware(monkeypatch) -> No
 def test_kvaser_probe_reenumerates_and_detects_under_the_lock(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     """Re-enumerating renumbers the channels, so a bus opening in between
     must not see a half-done probe: the whole probe holds the lock."""
-    import can
-
     from ithildin.core import bus as bus_mod
 
     calls: list[tuple[str, bool]] = []
@@ -286,7 +284,7 @@ def test_kvaser_probe_reenumerates_and_detects_under_the_lock(monkeypatch) -> No
         return call
 
     monkeypatch.setattr(bus_mod, "kvaser_enum_hardware", record("enum"))
-    monkeypatch.setattr(can, "detect_available_configs", record("detect"))
+    monkeypatch.setattr(bus_mod, "detect_configs", record("detect"))
     monkeypatch.setattr(prober_mod, "_add_kvaser_channel_data", record("channel data"))
 
     assert prober_mod._detect_configs("kvaser") == [{"interface": "kvaser", "channel": 0}]

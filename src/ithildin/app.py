@@ -198,13 +198,18 @@ def main(argv: list[str] | None = None) -> int:
     # Armed once the loop runs: synchronous startup (layout restore,
     # open_all) is not a stall.
     QTimer.singleShot(0, watchdog.start)
-    rc = app.exec()
+    return _finish(bus_reader, relay, app.exec())
+
+
+def _finish(bus_reader: BusReader, relay: diagnostics.ReportRelay, rc: int) -> int:
+    """Tear down after the event loop has ended; returns ``rc`` unless a bus
+    worker is stuck, in which case the process exits here."""
     logging.getLogger().removeHandler(relay.handler)
     stuck = bus_reader.shutdown()
     if stuck:
         # Destroying a running QThread aborts the process and joining a hung
         # vendor call never returns, so leave without tearing anything down.
-        # Layout, audit and settings are already flushed by aboutToQuit.
+        # Layout, audit, settings and recordings are already done by aboutToQuit.
         logging.getLogger(__name__).error(
             "Bus worker(s) %s still running at exit; forcing exit", stuck
         )

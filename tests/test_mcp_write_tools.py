@@ -11,6 +11,7 @@ existing BusReader tests.
 from __future__ import annotations
 
 import json
+import threading
 import uuid
 from dataclasses import replace
 from pathlib import Path
@@ -30,6 +31,7 @@ from ithildin.mcp.tools import (
     send_signal,
 )
 from ithildin.workspace.schema import BusConfig
+from tests.fake_bus import FakeBus, LiveReader, use_fake_bus
 
 
 def _make_ctx(
@@ -45,7 +47,7 @@ def _make_ctx(
         db.add_dbc(example_dbc_path, ["CAN_1"])
 
     read = McpReadContext(
-        bus_reader=BusReader(),
+        bus_reader=LiveReader("CAN_1"),
         database=db,
         allowlist=AllowlistStore(tmp_path / "allowlist.toml"),
     )
@@ -138,11 +140,11 @@ def test_send_signal_dry_run_audits_but_does_not_send(
 
 
 def test_send_signal_bus_error_is_audited(qapp, tmp_path: Path, example_dbc_path: Path) -> None:  # type: ignore[no-untyped-def]
-    """Bus-side failure (e.g. write to a closed bus) yields BUS_ERROR."""
+    """Bus-side failure (e.g. the bus closing during the send) yields BUS_ERROR."""
     db = Database()
     db.add_dbc(example_dbc_path, ["CAN_1"])
     read = McpReadContext(
-        bus_reader=BusReader(),
+        bus_reader=LiveReader("CAN_1"),
         database=db,
         allowlist=AllowlistStore(tmp_path / "allowlist.toml"),
     )
@@ -368,6 +370,47 @@ def test_unnamed_send_with_two_buses_open_is_refused_before_allowlist(  # type: 
         reader.close()
 
 
+def test_send_to_a_bus_that_is_not_open_is_refused_before_allowlist(  # type: ignore[no-untyped-def]
+    qapp, tmp_path: Path
+) -> None:
+    ctx, sent = _make_ctx(tmp_path)
+    ctx.read.allowlist.add_rule(AllowRule(id=0, message_id=0x100, signal="*", rate_hz=1.0))
+
+    assert send_frame(ctx, 0x100, "01", bus="CAN_9") == {
+        "ok": False,
+        "reason": "NO_BUS",
+        "detail": "bus 'CAN_9' is not open",
+    }
+    assert sent == []
+    # The refusal spent none of the 1 Hz rule's tokens.
+    assert send_frame(ctx, 0x100, "01", bus="CAN_1")["ok"] is True
+
+
+def test_send_to_a_bus_still_opening_is_refused_before_allowlist(  # type: ignore[no-untyped-def]
+    qapp, qtbot, tmp_path: Path, monkeypatch
+) -> None:
+    fake = FakeBus()
+    fake.open_gate = threading.Event()
+    use_fake_bus(monkeypatch, fake)
+    ctx, sent = _make_ctx(tmp_path)
+    ctx.read.allowlist.add_rule(AllowRule(id=0, message_id=0x100, signal="*", rate_hz=1.0))
+    reader = ctx.read.bus_reader
+    reader.open(BusConfig(name="CAN_2", interface="pcan", channel="X", bitrate=500000))
+    try:
+        assert send_frame(ctx, 0x100, "01", bus="CAN_2") == {
+            "ok": False,
+            "reason": "BUS_UNHEALTHY",
+            "detail": "bus 'CAN_2' is still opening",
+        }
+        assert sent == []
+        with qtbot.waitSignal(reader.bus_started, timeout=2000):
+            fake.open_gate.set()
+        assert send_frame(ctx, 0x100, "01", bus="CAN_2")["ok"] is True
+    finally:
+        fake.open_gate.set()
+        assert reader.shutdown() == []
+
+
 # ---------- send_frame ----------
 
 
@@ -500,7 +543,7 @@ def test_send_signal_routes_to_named_bus(tmp_path: Path, example_dbc_path: Path)
     db = Database()
     db.add_dbc(example_dbc_path, ["CAN_2"])
     read = McpReadContext(
-        bus_reader=BusReader(),
+        bus_reader=LiveReader("CAN_2"),
         database=db,
         allowlist=AllowlistStore(tmp_path / "allowlist.toml"),
     )
@@ -522,7 +565,7 @@ def test_send_frame_routes_to_named_bus(tmp_path: Path) -> None:
     sent: list[tuple[can.Message, str | None]] = []
 
     read = McpReadContext(
-        bus_reader=BusReader(),
+        bus_reader=LiveReader("CAN_B"),
         database=Database(),
         allowlist=AllowlistStore(tmp_path / "allowlist.toml"),
     )

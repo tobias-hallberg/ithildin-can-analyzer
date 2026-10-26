@@ -9,6 +9,7 @@ import uuid
 from pathlib import Path
 
 import can
+from can.interfaces.pcan import basic
 
 from ithildin.app_state.bus_reader import BusReader
 from ithildin.app_state.database import Database
@@ -70,26 +71,29 @@ def test_list_buses_reports_open_bus(qapp, qtbot, tmp_path: Path) -> None:  # ty
 
 
 def test_list_buses_reports_degraded_health(qapp, qtbot, tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    fake = use_fake_bus(monkeypatch)
     ctx = _make_ctx(tmp_path)
-    cfg = BusConfig(
-        name="CAN_1",
-        interface="virtual",
-        channel=f"t-{uuid.uuid4().hex[:6]}",
-        bitrate=500000,
-    )
-    with qtbot.waitSignal(ctx.bus_reader.bus_started, timeout=2000):
-        ctx.bus_reader.open(cfg)
+    reader = ctx.bus_reader
+    with qtbot.waitSignal(reader.bus_started, timeout=2000):
+        reader.open(BusConfig(name="CAN_1", interface="pcan", channel="X", bitrate=500000))
     try:
-        health = {"CAN_1": (BusHealth.ERRORS, "error passive")}
-        monkeypatch.setattr(ctx.bus_reader, "health", health.get)
+        with qtbot.waitSignal(reader.bus_health_changed, timeout=2000):
+            fake.status_code = basic.PCAN_ERROR_BUSPASSIVE
         (bus,) = list_buses(ctx)
         assert (bus["status"], bus["status_detail"]) == ("errors", "error passive")
 
-        health["CAN_1"] = (BusHealth.BUS_OFF, "")
+        with qtbot.waitSignal(reader.bus_health_changed, timeout=2000):
+            fake.status_code = basic.PCAN_ERROR_BUSOFF
         (bus,) = list_buses(ctx)
         assert (bus["status"], bus["status_detail"]) == ("bus_off", None)
+
+        # A lost adapter fails the bus at once: it leaves the list, LOST stays.
+        with qtbot.waitSignal(reader.bus_failed, timeout=2000):
+            fake.status_code = basic.PCAN_ERROR_ILLHW
+        assert list_buses(ctx) == []
+        assert reader.health("CAN_1") == (BusHealth.LOST, "")
     finally:
-        ctx.bus_reader.close()
+        assert reader.shutdown() == []
 
 
 def test_list_buses_reports_opening(qapp, qtbot, tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]

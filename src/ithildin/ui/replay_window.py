@@ -191,6 +191,17 @@ class ReplayWindow(ChildView):
         if bus_reader.is_listen_only(target):
             self._status_lbl.setText(f"Bus {target!r} is listen-only — replay disabled")
             return
+        # As for MCP sends. Starting only on OK also makes the first health
+        # change that stops a running replay a worsening.
+        health = bus_reader.health(target)
+        if health is None:
+            self._status_lbl.setText(f"Bus {target!r} is still connecting — try again")
+            return
+        if health[0] is not BusHealth.OK:
+            self._status_lbl.setText(
+                f"Bus {target!r}: {health[0].describe(health[1])} — replay disabled"
+            )
+            return
         send = lambda msg: bus_reader.send_message(msg, target)  # noqa: E731
         try:
             self._controller = ReplayController(Path(path_str), send, speed=speed)

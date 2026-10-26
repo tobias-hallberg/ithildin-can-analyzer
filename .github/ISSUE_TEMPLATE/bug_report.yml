@@ -42,5 +42,5 @@ body:
     id: logs
     attributes:
       label: Logs / DBC
-      description: Relevant log output, the Report dock message, and a minimal DBC excerpt if decode is involved.
+      description: The log of the failing run (each launch writes one to ~/.ithildin/logs/ithildin-<date>-<time>-<pid>.log), the Report dock message, and a minimal DBC excerpt if decode is involved.
       render: text

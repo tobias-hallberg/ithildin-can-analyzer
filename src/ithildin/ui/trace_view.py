@@ -18,7 +18,8 @@ Two display modes:
   rows, newest at row 0. Pausing shows the whole history; resuming jumps
   back to live and skips the frames that arrived while paused. Time column
   is the absolute timestamp.
-- ``overwrite``: one row per ``(bus, arbitration_id)`` pair, sorted by
+- ``overwrite``: one row per ``(bus, arbitration_id)`` pair, and one for
+  each bus's error frames (``row_key``), sorted by
   ``(arbitration_id, bus_name)``. New arrivals update in place. Time
   column is the delta to the previous arrival of the same key
   (``—`` for the first sighting).
@@ -97,6 +98,17 @@ _STALE_SWEEP_MS = 1000
 
 def _id_text(f: FrameRecord) -> str:
     return f"{f.arbitration_id:08X}" if f.is_extended_id else f"{f.arbitration_id:03X}"
+
+
+ERROR_ROW_ID = -1
+"""The ID in the key every error frame of a bus is kept under."""
+
+
+def row_key(f: FrameRecord) -> tuple[str, int]:
+    """``(bus, ID)`` a frame's Latest row, period and inspector pin are kept
+    under. An error frame's ID is an error class, which a data message on the
+    same bus may share, so error frames get ``(bus, ERROR_ROW_ID)``."""
+    return (f.bus_name, ERROR_ROW_ID if f.is_error_frame else f.arbitration_id)
 
 
 class TraceTreeModel(QAbstractItemModel):
@@ -343,7 +355,7 @@ class TraceTreeModel(QAbstractItemModel):
         stale = [
             key
             for key, f in self._rows_by_key.items()
-            if not admit(key[0], key[1], is_error=f.is_error_frame)
+            if not admit(f.bus_name, f.arbitration_id, is_error=f.is_error_frame)
         ]
         if stale:
             self.beginResetModel()
@@ -399,7 +411,8 @@ class TraceTreeModel(QAbstractItemModel):
         Returns ``None`` until at least two frames with this key have
         been admitted. Tracked in both append and overwrite modes, so
         the frame inspector can show a measured period regardless of
-        which trace mode is active.
+        which trace mode is active. ``ERROR_ROW_ID`` names the bus's
+        error frames.
         """
         return self._delta_for_key.get((bus_name, arbitration_id))
 
@@ -409,7 +422,8 @@ class TraceTreeModel(QAbstractItemModel):
         Tracked in both append and overwrite modes so the frame
         inspector can pin to a message ID and follow its latest
         payload as new arrivals drain in. Returns ``None`` if no
-        frame for this key has been admitted yet.
+        frame for this key has been admitted yet. ``ERROR_ROW_ID``
+        names the bus's error frames.
         """
         return self._rows_by_key.get((bus_name, arbitration_id))
 
@@ -451,7 +465,7 @@ class TraceTreeModel(QAbstractItemModel):
         # switching the trace to overwrite mode. Cardinality is bounded
         # by the number of distinct message IDs on the bus.
         for f in new_frames:
-            key = (f.bus_name, f.arbitration_id)
+            key = row_key(f)
             prev_ts = self._last_ts.get(key)
             self._delta_for_key[key] = None if prev_ts is None else f.timestamp - prev_ts
             self._last_ts[key] = f.timestamp
@@ -495,7 +509,7 @@ class TraceTreeModel(QAbstractItemModel):
         now = time.monotonic()
         latest: dict[tuple[str, int], FrameRecord] = {}
         for f in new_frames:
-            key = (f.bus_name, f.arbitration_id)
+            key = row_key(f)
             prev_ts = self._last_ts.get(key)
             self._delta_for_key[key] = None if prev_ts is None else f.timestamp - prev_ts
             self._last_ts[key] = f.timestamp
@@ -505,7 +519,7 @@ class TraceTreeModel(QAbstractItemModel):
         root = QModelIndex()
         for key, f in latest.items():
             old = self._rows_by_key.get(key)
-            sort_key = (f.arbitration_id, f.bus_name)
+            sort_key = (key[1], key[0])
             pos = bisect.bisect_left(self._sorted_keys, sort_key)
             shown = pos < len(self._sorted_keys) and self._sorted_keys[pos] == sort_key
             matches = self._matches(f)
@@ -532,8 +546,7 @@ class TraceTreeModel(QAbstractItemModel):
         old_n = new_n = 0
         if key in self._decoded_keys:
             # The view has seen this row's signal rows: decode the new frame
-            # and announce a changed count (an error frame has none, a
-            # multiplexed message varies).
+            # and announce a changed count (a multiplexed message varies).
             old_n = len(self._ensure_decoded(self._rows_by_key[key]) or ())
             new_n = len(self._ensure_decoded(f) or ())
         if new_n < old_n:
@@ -647,7 +660,7 @@ class TraceTreeModel(QAbstractItemModel):
     def _child_id(self, frame: FrameRecord) -> int:
         if self._mode == "append":
             return id(frame)
-        key = (frame.bus_name, frame.arbitration_id)
+        key = row_key(frame)
         child_id = self._key_ids.get(key)
         if child_id is None:
             child_id = next(self._next_key_id)
@@ -792,10 +805,7 @@ class TraceTreeModel(QAbstractItemModel):
             frame = self._frame_at_visible_row(index.row())
             if frame is None:
                 return None
-            if (
-                frame.bus_name not in self._rings
-                or (frame.bus_name, frame.arbitration_id) in self._stale_keys
-            ):
+            if frame.bus_name not in self._rings or row_key(frame) in self._stale_keys:
                 return self._dim_color
             if col == self.COL_NAME and frame.is_error_frame:
                 return self._err_color
@@ -861,7 +871,7 @@ class TraceTreeModel(QAbstractItemModel):
     def _frame_cell(self, f: FrameRecord, col: int) -> Any:
         if col == self.COL_TIME:
             if self._mode == "overwrite":
-                delta = self._delta_for_key.get((f.bus_name, f.arbitration_id))
+                delta = self._delta_for_key.get(row_key(f))
                 return "—" if delta is None else f"{delta:.6f}"
             t0 = self._bus_reader.session_t0 if self._bus_reader else None
             rel = f.timestamp if t0 is None else f.timestamp - t0

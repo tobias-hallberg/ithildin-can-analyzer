@@ -4,14 +4,17 @@
 
 from __future__ import annotations
 
+import threading
 import uuid
 from pathlib import Path
 
 import can
+from can.interfaces.pcan import basic
 
 from ithildin.ui.replay_window import ReplayWindow
 from ithildin.workspace.schema import BusConfig
 from tests.conftest import kill_capture, make_app_context
+from tests.fake_bus import FakeBus, use_fake_bus
 
 
 def _write_log(path: Path, n: int = 3) -> None:
@@ -41,6 +44,39 @@ def test_start_without_bus_shows_error(qapp, qtbot, tmp_path: Path) -> None:  # 
     win._path_edit.setText(str(log))
     win._on_action_clicked()
     assert "No bus open" in win._status_lbl.text()
+
+
+def test_replay_refuses_a_bus_still_connecting_or_degraded(  # type: ignore[no-untyped-def]
+    qapp, qtbot, tmp_path: Path, monkeypatch
+) -> None:
+    fake = FakeBus()
+    fake.open_gate = threading.Event()
+    use_fake_bus(monkeypatch, fake)
+    ctx = make_app_context(tmp_path)
+    win = ReplayWindow(instance_id="rp1")
+    qtbot.addWidget(win)
+    win.bind(ctx)
+    log = tmp_path / "in.asc"
+    _write_log(log)
+    win._path_edit.setText(str(log))
+    ctx.bus_reader.open(BusConfig(name="CAN_1", interface="pcan", channel="X", bitrate=500000))
+    try:
+        win._on_action_clicked()
+        assert win._controller is None
+        assert win._status_lbl.text() == "Bus 'CAN_1' is still connecting — try again"
+
+        with qtbot.waitSignal(ctx.bus_reader.bus_started, timeout=2000):
+            fake.open_gate.set()
+        with qtbot.waitSignal(ctx.bus_reader.bus_health_changed, timeout=2000):
+            fake.status_code = basic.PCAN_ERROR_BUSPASSIVE
+        win._on_action_clicked()
+        assert win._controller is None
+        assert win._status_lbl.text() == (
+            "Bus 'CAN_1': bus errors (error passive) — replay disabled"
+        )
+        assert fake.sent == []
+    finally:
+        fake.open_gate.set()
 
 
 def test_replay_routes_through_bus_reader(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]

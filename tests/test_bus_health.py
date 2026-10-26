@@ -33,7 +33,7 @@ def _fast_ticks(monkeypatch):  # type: ignore[no-untyped-def]
 def reader():  # type: ignore[no-untyped-def]
     r = BusReader()
     yield r
-    r.close()
+    assert r.shutdown() == []
 
 
 def _open(reader: BusReader, qtbot, interface: str, *, listen_only: bool = False) -> None:  # type: ignore[no-untyped-def]

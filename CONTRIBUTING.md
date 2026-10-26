@@ -44,8 +44,8 @@ The architecture and the invariants that keep the GUI responsive live in
 - **Decode lazily.** Plot / Monitor / Trace get full frame batches at
   60 Hz — filter to the IDs of interest first, then decode.
 - **The MCP allowlist is the only send path.** Never bypass
-  `AllowlistStore.check_*()`; every send decision is audited. See
-  [SECURITY.md](SECURITY.md).
+  `AllowlistStore.check_*()`; every send attempt is audited, allowed or
+  denied, sent or failed. See [SECURITY.md](SECURITY.md).
 - **Qt thread shutdown** uses `DirectConnection` for `worker.stopped →
   thread.quit`, joined via `thread.wait()`.
 - **DBC test fixtures** are hand-written DBC source strings (see
@@ -59,7 +59,7 @@ Where to make common changes:
 |---|---|
 | Add a view kind | `ui/_child_base.py` + `ui/factory.py` |
 | Add an MCP read tool | implement in `mcp/tools.py`, register in `mcp/server.py::register_read_tools` |
-| Add an MCP write tool | same split, registered in `mcp/server.py::register_write_tools` — must route through `AllowlistStore` |
+| Add an MCP write tool | same split; the body runs inside `tools._audited` and goes through `AllowlistStore.check_*`; register an `async` wrapper in `mcp/server.py::register_write_tools` that calls it via `to_thread.run_sync` with the server's `sends` limiter |
 | Tune theme colours / QSS | `ui/theme.py` |
 | Add an icon | drop the SVG in `resources/icons/`, append to `ui/icons.py` |
 
@@ -76,5 +76,7 @@ Where to make common changes:
 
 Open an issue with the bug-report template. Include your OS, the adapter
 and vendor driver version, the DBC (or a minimal excerpt), and steps to
-reproduce. For **security** issues, do not open a public issue — follow
+reproduce. Attach the log of the run where it happened: each launch writes
+one to `~/.ithildin/logs/ithildin-<date>-<time>-<pid>.log`. For
+**security** issues, do not open a public issue — follow
 [SECURITY.md](SECURITY.md).

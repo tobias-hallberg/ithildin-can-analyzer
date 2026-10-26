@@ -407,9 +407,6 @@ class TransmitWindow(ChildView):
     # ---- State mutators ----
 
     def _apply(self) -> None:
-        # Gate first: an activation that targets a listen-only bus forces
-        # master OFF, so reconciling afterwards won't try (and fail) to
-        # start a periodic task on a bus that can't transmit.
         self._refresh_listen_only_gate()
         if self._scheduler is not None:
             self._scheduler.apply(self._setup)
@@ -874,6 +871,8 @@ class TransmitWindow(ChildView):
             self._master_off_banner.hide()
 
     def _refresh_listen_only_gate(self) -> None:
+        # Only the pill: the scheduler disarms when an active row targets a
+        # listen-only bus while armed.
         if self._ctx is None:
             return
         bus_reader = self._ctx.bus_reader
@@ -885,9 +884,6 @@ class TransmitWindow(ChildView):
         if listen_only_buses:
             self._master_btn.setEnabled(False)
             self._master_btn.setToolTip("Active bus is listen-only — cannot transmit.")
-            if self._setup.master_enabled and self._scheduler is not None:
-                self._scheduler.set_master(False)
-                self._sync_master_button()
         else:
             self._master_btn.setEnabled(True)
             self._master_btn.setToolTip("")

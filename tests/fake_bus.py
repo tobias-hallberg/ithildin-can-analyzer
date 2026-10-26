@@ -5,6 +5,7 @@
 ``use_fake_bus`` makes every ``BusWorker`` open the fake instead of a real
 backend, so a ``BusConfig(interface="pcan" | "kvaser" | "ixxat", ...)``
 exercises that backend's branches without importing a vendor module.
+``LiveReader`` stands in for open buses where only their names matter.
 """
 
 from __future__ import annotations
@@ -16,7 +17,9 @@ from typing import Any
 import can
 import pytest
 
+from ithildin.app_state.bus_reader import BusReader
 from ithildin.core.bus import BusWorker
+from ithildin.core.types import BusHealth
 
 
 class FakeBus(can.BusABC):
@@ -122,3 +125,18 @@ def use_fake_bus(monkeypatch: pytest.MonkeyPatch, fake: FakeBus | None = None) -
 
     monkeypatch.setattr(BusWorker, "_open_bus", _open)
     return bus
+
+
+class LiveReader(BusReader):
+    """A ``BusReader`` on which ``names`` read as open and live, with no worker
+    behind them, so an MCP send naming one gets past the bus checks."""
+
+    def __init__(self, *names: str) -> None:
+        super().__init__()
+        self._live = names
+
+    def bus_names(self) -> list[str]:
+        return [*super().bus_names(), *self._live]
+
+    def health(self, name: str) -> tuple[BusHealth, str] | None:
+        return (BusHealth.OK, "") if name in self._live else super().health(name)

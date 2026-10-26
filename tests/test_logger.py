@@ -4,9 +4,11 @@
 
 from __future__ import annotations
 
+import gc
 import logging
 import threading
 import time
+import weakref
 from pathlib import Path
 
 import can
@@ -197,3 +199,47 @@ def test_tee_worker_reports_no_loss_for_the_start_backlog(qapp, qtbot, tmp_path:
         assert logger.stop(wait_ms=5000)
     assert lost == [0]
     assert _ids_in(log_path) == list(range(12, 20))
+
+
+def test_quit_waits_for_a_recording_to_be_written_out(
+    qapp, qtbot, tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    """An .mf4 is written out as its writer stops, which can outlast any cap:
+    quitting waits for it, also once nothing else holds the logger."""
+    release = threading.Event()
+    written: list[bool] = []
+    real_logger = can.Logger
+
+    class SlowToWriteOut:
+        def __init__(self, path: str) -> None:
+            self._inner = real_logger(path)
+
+        def on_message_received(self, msg: can.Message) -> None:
+            self._inner.on_message_received(msg)
+
+        def stop(self) -> None:
+            release.wait(10)
+            self._inner.stop()
+            written.append(True)
+
+    monkeypatch.setattr(can, "Logger", SlowToWriteOut)
+    ring = RingBuffer(8)
+    _append(ring, 1, 2)
+    log_path = tmp_path / "out.asc"
+    logger = TeeLogger(log_path, {"A": ring})
+    with qtbot.waitSignal(logger.started, timeout=2000):
+        logger.start()
+    try:
+        assert not logger.stop(wait_ms=50)
+        ref = weakref.ref(logger)
+        del logger
+        gc.collect()
+        assert ref() is not None
+        threading.Timer(0.3, release.set).start()
+
+        qapp.aboutToQuit.emit()
+
+        assert written == [True]
+        assert _ids_in(log_path) == [1, 2]
+    finally:
+        release.set()

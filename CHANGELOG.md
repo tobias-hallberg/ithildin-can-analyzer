@@ -9,6 +9,24 @@ once it reaches 1.0.
 
 ### Added
 
+- Every launch writes a diagnostic log to `~/.ithildin/logs` (the newest
+  ten are kept): unhandled errors from any thread with their tracebacks,
+  Qt's own messages, a hard crash's stack, and every thread's stack when
+  the window stops responding for 5 s. Errors with no other surface also
+  appear in the Report panel. Attach the log of the failing run to a bug
+  report.
+- Bus health. The status bar and the Buses panel show each bus as
+  connecting, live, bus errors (with the reason), bus-off or adapter lost,
+  and the Report panel notes the changes. The Trace window shows a banner
+  for bus errors and bus-off, with **Reconnect** on bus-off. A pulled
+  PCAN-USB is noticed within about a second instead of showing as a live
+  bus with nothing arriving.
+- The Trace counts frames the capture buffer overwrote before it read them
+  as LOST. A recording counts the frames it lost the same way, and says so
+  in the Report panel when it stops.
+- After the window stalls, plots, monitors and data views skip the
+  backlog instead of catching up on it, and the Report panel says how many
+  frames they skipped on which bus.
 - Buses follow their adapter. A bus created from the Create CAN bus dialog
   is pinned to the adapter picked there (a PCAN adapter by the device ID
   set in PCAN-View, Kvaser and IXXAT by serial, `gs_usb` by USB serial),
@@ -30,6 +48,32 @@ once it reaches 1.0.
 
 ### Changed
 
+- TX Master turns itself off, with an amber banner in the Transmit window
+  and a Report entry, when a bus an active row targets closes, is lost,
+  gets bus errors or goes bus-off, when an active row targets a
+  listen-only bus, or when a periodic send fails. It never turns back on
+  by itself: switch it on again. Switching it on is refused while an
+  active row's bus is closed, still connecting or listen-only. Frames
+  still queued in the adapter are discarded when it turns off, so they
+  don't burst out after a replug.
+- Error frames are sampled: at most about ten per second per bus reach the
+  Trace and recordings, each standing for the N it replaces. The Trace
+  names one "Error frame ×N", sums the N in ERR and, in Latest mode, gives
+  each bus's error frames a row of their own. Recordings hold only the
+  sampled error frames, without the count. Error frames are never decoded
+  as DBC messages, and only a whole-bus subscription shows them.
+- A running Trace in Stream mode shows the newest 1000 rows; pausing shows
+  the whole history. Resuming skips the frames that arrived while paused.
+- Losing a bus no longer ends the capture session; only closing the last
+  open bus does. The Trace, plots and recordings keep their data through
+  a bus loss and reconnect, a recording keeps one file across a
+  Disconnect and Connect, a plot shows the outage as a gap, and the Signal
+  Monitor and Data view dim values that went stale.
+- Replay starts only on a live bus, and stops when its bus disconnects, is
+  lost or degrades. Stop acts at once.
+- Open Project and New Project close the running buses, and removing a bus
+  from the Buses panel closes it.
+- python-can 4.6.1 or later and anyio 4.2 or later are required.
 - CANable / CANtact / candleLight adapters run on python-can's `gs_usb`
   backend instead of `cantact`, as a regular dependency (with libusb
   bundled), so the project is no longer capped at Python 3.12. A project
@@ -45,15 +89,40 @@ once it reaches 1.0.
   `decision`. A send the driver refused is now ALLOW + SEND_FAILED (shown
   in the warning colour) rather than a DENY; look for failures by
   `outcome`.
-- An MCP send that names no `bus` while none or several buses are open is
-  refused with `NO_BUS` before the allowlist is asked, instead of matching
-  a rule scoped to any one bus or failing as `BUS_ERROR`.
-- MCP sends to a bus with bus errors, bus-off or a lost adapter are refused
-  with `BUS_UNHEALTHY`. `list_buses` reports `opening`, `live`, `errors`,
-  `bus_off` or `lost`, with a `status_detail`, instead of always `live`.
+- An MCP send that names no `bus` while none or several buses are open,
+  or names a bus that isn't open, is refused with `NO_BUS` before the
+  allowlist is asked, instead of matching a rule scoped to any one bus or
+  failing as `BUS_ERROR`.
+- MCP sends to a bus still connecting, with bus errors, bus-off or a lost
+  adapter are refused with `BUS_UNHEALTHY`. `list_buses` reports
+  `opening`, `live`, `errors` or `bus_off`, with a `status_detail`,
+  instead of always `live`; a bus whose adapter is lost fails and drops
+  out of it.
 
 ### Fixed
 
+- The Trace window no longer slows down as its history grows, or freezes
+  under an error-frame flood such as a PCAN adapter's on a bus with no
+  other node. An expanded Latest row no longer crashes the app once its
+  first frame has scrolled out of the capture buffer.
+- A periodic TX frame no longer stops silently while the Transmit window
+  still shows it transmitting, and no longer goes on after TX Master is
+  switched off. A changed period takes effect, the same ID can be sent on
+  two buses, and stopping an IXXAT periodic send no longer raises. One-shot
+  sends no longer hold up the window.
+- A PCAN or IXXAT bus that goes error passive or bus-off keeps capturing
+  instead of being torn down.
+- Disconnecting and quitting no longer freeze or crash on an adapter that
+  hangs. A bus whose adapter hasn't let go of the channel shows as closing
+  until it does, and can't be reopened meanwhile.
+- Quitting while recording writes the file out in full, however long an
+  `.mf4` takes to save, also for a recording whose window was closed
+  first; a running replay stops.
+- The MCP server starts in the windowed build, which has no console.
+- The Trace's bus-off banner, with its Reconnect, comes back once a
+  failure or error banner that covered it goes away.
+- A slow adapter scan no longer reads as a pinned adapter missing, and a
+  hung one no longer keeps the app from exiting.
 - A CANtact-family bus created from the UI opens (the `cantact` backend
   was handed its `ch:N` channel name as the device index).
 - Receiving or transmitting on a CANtact-family adapter no longer freezes

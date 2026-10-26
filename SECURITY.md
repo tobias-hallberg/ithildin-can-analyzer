@@ -31,8 +31,8 @@ What the layer **guarantees**:
   single-signal rule does not authorise raw frames. A rule scoped to a bus
   matches only sends to that bus.
 - **Explicit target bus.** A send must name its bus unless exactly one bus
-  is open; otherwise it is rejected (`NO_BUS`) before the allowlist is
-  asked.
+  is open, and the bus must be open; otherwise it is rejected (`NO_BUS`)
+  before the allowlist is asked.
 - **DBC range enforcement.** For `send_signal`, when the rule has
   `enforce_signal_ranges` set, the value must lie within the signal's
   DBC-declared min/max, or it is rejected (`OUT_OF_RANGE`). Non-finite
@@ -44,9 +44,9 @@ What the layer **guarantees**:
   caps the send rate (`RATE_LIMITED`).
 - **Listen-only override.** If the bus was opened listen-only, every send
   is rejected (`BUS_READ_ONLY`) regardless of the allowlist.
-- **Degraded-bus override.** While the bus reports bus errors, is bus-off
-  or has lost its adapter, every send is rejected (`BUS_UNHEALTHY`)
-  regardless of the allowlist.
+- **Degraded-bus override.** While the bus is still connecting, reports
+  bus errors, is bus-off or has lost its adapter, every send is rejected
+  (`BUS_UNHEALTHY`) regardless of the allowlist.
 - **Full audit trail.** Every attempt — allowed *and* denied — is appended
   to `~/.ithildin/<project>/audit.jsonl` (0o600) with a timestamp, the
   agent name, the arguments, the target bus, the decision, what happened

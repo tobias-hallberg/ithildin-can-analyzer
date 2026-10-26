@@ -21,12 +21,12 @@ from typing import Any
 import can
 import pytest
 
-from ithildin.app_state.bus_reader import BusReader
 from ithildin.app_state.database import Database
 from ithildin.mcp.audit import AuditWriter
 from ithildin.mcp.permissions import AllowlistStore, AllowRule
 from ithildin.mcp.server import build_server
 from ithildin.mcp.tools import McpReadContext, McpWriteContext, SendCallable
+from tests.fake_bus import LiveReader
 
 
 def _run[T](coro: Awaitable[T]) -> T:
@@ -34,9 +34,9 @@ def _run[T](coro: Awaitable[T]) -> T:
     return asyncio.run(coro)  # type: ignore[arg-type]
 
 
-def _make_ctx(tmp_path: Path) -> McpReadContext:
+def _make_ctx(tmp_path: Path, *live_buses: str) -> McpReadContext:
     return McpReadContext(
-        bus_reader=BusReader(),
+        bus_reader=LiveReader(*live_buses),
         database=Database(),
         allowlist=AllowlistStore(tmp_path / "allowlist.toml"),
     )
@@ -104,7 +104,7 @@ def test_send_signal_dispatches_and_is_denied_without_rule(
     tmp_path: Path, example_dbc_path: Path
 ) -> None:
     """Through FastMCP, a send with no allowlist rule is denied and audited."""
-    read = _make_ctx(tmp_path)
+    read = _make_ctx(tmp_path, "CAN_1")
     read.database.add_dbc(example_dbc_path, ["CAN_1"])
     write = McpWriteContext(
         read=read,
@@ -124,7 +124,7 @@ def test_send_signal_dispatches_and_is_denied_without_rule(
 
 def test_send_signal_keeps_json_integers_exact(tmp_path: Path, edge_dbc_path: Path) -> None:
     """FastMCP must not coerce an integer value to float: 64-bit signals need every bit."""
-    read = _make_ctx(tmp_path)
+    read = _make_ctx(tmp_path, "CAN_1")
     read.database.add_dbc(edge_dbc_path, ["CAN_1"])
     read.allowlist.add_rule(AllowRule(id=0, message_id=123, signal="LogData"))
     sent: list[can.Message] = []
@@ -154,7 +154,7 @@ def test_send_signal_keeps_json_integers_exact(tmp_path: Path, edge_dbc_path: Pa
 
 
 def _frame_ctx(tmp_path: Path, send: SendCallable) -> McpWriteContext:
-    read = _make_ctx(tmp_path)
+    read = _make_ctx(tmp_path, "CAN_1")
     read.allowlist.add_rule(AllowRule(id=0, message_id=0x100, signal="*"))
     read.allowlist.add_rule(AllowRule(id=0, message_id=0x101, signal="*"))
     return McpWriteContext(read=read, audit=AuditWriter(tmp_path / "audit.jsonl"), send=send)

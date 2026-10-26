@@ -352,10 +352,10 @@ def test_close_all_shares_one_deadline(qapp, qtbot, monkeypatch, reader) -> None
     _open(reader, qtbot, _virtual("B"))
     try:
         start = time.monotonic()
-        reader.close(wait_ms=200)
+        reader.close(wait_ms=500)
         elapsed = time.monotonic() - start
-        # One deadline for both; waiting per bus would take 0.4 s.
-        assert elapsed < 0.38
+        # One deadline for both; waiting per bus would take 1 s.
+        assert elapsed < 0.9
         assert reader.is_closing("A") and reader.is_closing("B")
     finally:
         fake.block.set()

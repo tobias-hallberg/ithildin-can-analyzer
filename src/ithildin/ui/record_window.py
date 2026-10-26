@@ -24,7 +24,7 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from PySide6.QtCore import QCoreApplication, Qt
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QButtonGroup,
     QFileDialog,
@@ -107,11 +107,6 @@ class RecordWindow(ChildView):
         ctx.bus_reader.bus_started.connect(self._on_bus_started)
         ctx.bus_reader.bus_stopped.connect(self._on_bus_topology_changed)
         ctx.bus_reader.bus_failed.connect(self._on_bus_failed)
-        # Child views get no closeEvent when the main window closes; stop
-        # here so the file is finalised and the thread joined before exit.
-        app = QCoreApplication.instance()
-        assert app is not None
-        app.aboutToQuit.connect(self._stop)
 
         if self._pending_state is not None:
             self._apply_pending_state()

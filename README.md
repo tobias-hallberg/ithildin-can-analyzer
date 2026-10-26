@@ -36,12 +36,12 @@ What works today:
 
 - **Live capture** from the supported `python-can` backends — PEAK
   (`pcan`), Kvaser, CANable / CANtact / candleLight (`gs_usb`), IXXAT,
-  SocketCAN on real hardware, plus `virtual` for tests and demos. Single
-  bus in v0.1. Listen-only is available on PEAK, Kvaser, `gs_usb` (when
-  the adapter's firmware supports it), and `virtual`; SocketCAN (silent
-  mode is an OS-level `ip link` property) and IXXAT (the VCI wrapper
-  hardcodes its opmode) expose no python-can kwarg for it, so that
-  combination is rejected rather than left ACKing on the wire.
+  SocketCAN on real hardware, plus `virtual` for tests and demos. Several
+  buses can be open at once. Listen-only is available on PEAK, Kvaser,
+  `gs_usb` (when the adapter's firmware supports it), and `virtual`;
+  SocketCAN (silent mode is an OS-level `ip link` property) and IXXAT (the
+  VCI wrapper hardcodes its opmode) expose no python-can kwarg for it, so
+  that combination is rejected rather than left ACKing on the wire.
 - **Hot-plug** — a bus is pinned to the adapter it was created on (PCAN
   device ID, Kvaser or IXXAT serial, `gs_usb` USB serial) and finds it
   again in whichever port it is plugged into. The Buses panel rescans when
@@ -49,11 +49,17 @@ What works today:
   its reason, and connects or disconnects a bus from a click on its status
   dot. A replugged adapter is announced but never reconnected by itself.
   Pins are yours: they live in `~/.ithildin/<project>/`, not in the `.itp`.
+- **Bus health** — the status bar, the Buses panel and a Trace banner
+  show each bus as connecting, live, bus errors (with the reason), bus-off
+  (with **Reconnect**) or adapter lost. A pulled PCAN-USB or `gs_usb`
+  adapter is noticed within about a second.
 - **DBC decode** via `cantools`. Add a `.dbc` to a bus with **+ DBC** in
   the Buses panel (or pick it while creating the bus) and its signals +
   messages appear in the left dock, draggable onto views.
 - **Trace view** — live frame log per channel, multi-instance, with
-  filter strip and pause / RX / ERR counts.
+  filter strip and pause / RX / ERR / LOST counts. While running it shows
+  the newest 1000 rows, the whole history while paused. An error flood
+  shows as sampled "Error frame ×N" rows, about ten per second per bus.
 - **Signal Plot** — `pyqtgraph` rolling-window curves; drop a signal
   from the left dock to add a curve.
 - **Signal Monitor** — table of decoded signal values with min / max
@@ -63,15 +69,20 @@ What works today:
 - **Frame Inspector** — auto-spawns from Trace selection; shows raw
   bytes + decoded signals (raw int + scaled value + DBC unit), plus
   message sender and cycle period when the DBC declares them.
-- **Record / Replay** — write to BLF (default) or ASC; replay drives
-  the bus from a file via `ReplayController` (linear playback only —
-  pause and scrub land in v0.2).
+- **Record / Replay** — write to MF4, BLF, ASC or CSV; a recording
+  carries on in one file across a bus loss and reconnect, and keeps only
+  the sampled error frames, without their count. Replay drives the bus
+  from a file via `ReplayController` (linear playback only — pause and
+  scrub land in v0.2); it starts only on a live bus and stops when that
+  bus is lost or degrades.
 - **Transmit** — one-shot and periodic sends behind a master switch,
-  with per-signal controls matched to the signal type. Multiplexed
-  messages get a dropdown of their selector IDs and show only the
-  selected branch. Integer signals wider than 53 bits are edited as hex
-  bytes and sent exactly; with a fractional factor they are still
-  limited to float precision.
+  with per-signal controls matched to the signal type. The master turns
+  itself off when a target bus is lost or gets bus errors, an active row
+  targets a listen-only bus, or a periodic send fails, and stays off
+  until you switch it on again. Multiplexed messages get a dropdown of
+  their selector IDs and show only the selected branch. Integer signals
+  wider than 53 bits are edited as hex bytes and sent exactly; with a
+  fractional factor they are still limited to float precision.
 - **MCP server** — bearer-token-gated, loopback-only streamable-HTTP
   transport with ten read tools (bus, DBC, and traffic introspection) and
   two write tools (`send_signal`, `send_frame`) routed through a
@@ -83,8 +94,8 @@ What works today:
   icons, comprehensive QSS covering toolbar / docks / tables / lists /
   MDI subwindows.
 
-What's not here yet (v0.1 non-goals): macOS, multi-bus simultaneous
-capture, CAN FD, UDS / ISO-TP transport, J1939, DBC editor.
+What's not here yet (v0.1 non-goals): macOS, CAN FD, UDS / ISO-TP
+transport, J1939, DBC editor.
 
 Deferred to v0.2: cyclic / periodic MCP transmit, replay pause and
 scrub, the Capture and MCP sections of the Settings dialog (only Plot
@@ -155,6 +166,14 @@ uv sync
 uv run ithildin                       # opens with no project loaded
 uv run ithildin path/to/project.itp   # opens that project
 ```
+
+## Logs
+
+Each launch writes a log to
+`~/.ithildin/logs/ithildin-<date>-<time>-<pid>.log`, keeping the newest
+ten: warnings and errors with their tracebacks, crashes, and stack dumps
+when the window stops responding. When you report a bug, attach the log
+of the run where it happened.
 
 ## Using the MCP server
 

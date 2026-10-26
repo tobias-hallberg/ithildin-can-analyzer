@@ -547,7 +547,7 @@ def test_a_refused_pinned_bus_waits_for_its_adapter(
     qapp, qtbot, monkeypatch, attached, make_dock
 ) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.setattr(
-        can, "detect_available_configs", lambda interfaces: attached.configs.get(interfaces[0], [])
+        bus_mod, "detect_configs", lambda interface: attached.configs.get(interface, [])
     )
     dock = make_dock(_engine(hw_id="0000002a.0"))
     reports: list[tuple[str, str]] = []
@@ -637,6 +637,26 @@ def test_pin_a_legacy_bus_to_the_adapter_on_its_channel(qapp, qtbot, attached, m
     assert project.workspace.bus[0].hw_id == "0000002a.0"
     assert json.loads(project.adapter_pins_path.read_text(encoding="utf-8")) == {
         "Engine": "0000002a.0"
+    }
+    assert _row(dock, "Engine").pin_label is None
+
+
+def test_repin_a_bus_whose_adapter_another_took_the_place_of(
+    qapp, qtbot, attached, make_dock
+) -> None:  # type: ignore[no-untyped-def]
+    dock = make_dock(_engine(hw_id="0000002a.0"), saved=True)
+    project = dock._ctx.project
+    attached.configs["pcan"] = [_pcan("PCAN_USBBUS1", 0x2B)]
+    _rescan(dock, qtbot)
+    assert _row(dock, "Engine").pin_label == (
+        "Pin to PEAK-System · PCAN-USB  (device ID 0x2B) PCAN_USBBUS1"
+    )
+
+    dock._bus_tree.pin_requested.emit("Engine")
+
+    assert project.workspace.bus[0].hw_id == "0000002b.0"
+    assert json.loads(project.adapter_pins_path.read_text(encoding="utf-8")) == {
+        "Engine": "0000002b.0"
     }
     assert _row(dock, "Engine").pin_label is None
 

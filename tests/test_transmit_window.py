@@ -526,6 +526,30 @@ def test_rearming_hides_disarm_banner(  # type: ignore[no-untyped-def]
     assert win._disarm_banner.isHidden()
 
 
+def test_activating_a_row_on_a_listen_only_bus_disarms(  # type: ignore[no-untyped-def]
+    qapp, qtbot, tmp_path: Path, example_dbc_path: Path
+) -> None:
+    """Through the one disarm path, with its banner and Report entry, not a
+    silent master OFF."""
+    ctx = make_app_context(tmp_path)
+    ctx.database.add_dbc(example_dbc_path, ["CAN_1", "RO"])
+    _open_virtual_bus(ctx, qtbot)
+    _open_virtual_bus(ctx, qtbot, name="RO", listen_only=True)
+    win = _armed_window(ctx, qtbot)
+    reports: list[tuple[str, str]] = []
+    ctx.events.report_requested.connect(lambda msg, kind: reports.append((msg, kind)))
+
+    win._on_transmit_chosen("RO", 0x200, "BodyStatus")
+    win._setup.transmits[-1].active = True
+    with qtbot.waitSignal(win._scheduler.disarmed, timeout=2000):  # type: ignore[union-attr]
+        win._apply()
+    assert win._setup.master_enabled is False
+    assert win._master_btn.is_on is False
+    assert win._master_btn.isEnabled() is False
+    assert win._disarm_banner._label.text().startswith("Bus RO is listen-only — TX disarmed")
+    assert reports == [("TX disarmed: Bus RO is listen-only", "warn")]
+
+
 def test_bus_info_shows_closed_after_disconnect(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
     ctx = make_app_context(tmp_path)
     _open_virtual_bus(ctx, qtbot)

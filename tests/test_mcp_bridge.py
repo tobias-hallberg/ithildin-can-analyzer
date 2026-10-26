@@ -25,12 +25,12 @@ from pathlib import Path
 import can
 import pytest
 
-from ithildin.app_state.bus_reader import BusReader
 from ithildin.app_state.database import Database
 from ithildin.mcp.audit import AuditWriter
 from ithildin.mcp.bridge import McpServerBridge
 from ithildin.mcp.permissions import AllowlistStore, AllowRule
 from ithildin.mcp.tools import McpReadContext, McpWriteContext
+from tests.fake_bus import LiveReader
 
 
 def _free_port() -> int:
@@ -40,9 +40,9 @@ def _free_port() -> int:
         return int(s.getsockname()[1])
 
 
-def _make_read_ctx(tmp_path: Path) -> McpReadContext:
+def _make_read_ctx(tmp_path: Path, *live_buses: str) -> McpReadContext:
     return McpReadContext(
-        bus_reader=BusReader(),
+        bus_reader=LiveReader(*live_buses),
         database=Database(),
         allowlist=AllowlistStore(tmp_path / "allowlist.toml"),
     )
@@ -271,7 +271,7 @@ def test_stop_during_stalled_send_returns(qtbot, tmp_path: Path) -> None:  # typ
         entered.set()
         release.wait(10)
 
-    read = _make_read_ctx(tmp_path)
+    read = _make_read_ctx(tmp_path, "CAN_1")
     read.allowlist.add_rule(AllowRule(id=0, message_id=0x100, signal="*"))
     audit_path = tmp_path / "audit.jsonl"
     write = McpWriteContext(read=read, audit=AuditWriter(audit_path), send=stalled)

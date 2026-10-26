@@ -729,6 +729,31 @@ def test_banner_taken_by_another_message_frees_the_health_banner(  # type: ignor
     assert win._banner._label.text().startswith("Bus CAN_1: bus-off.")
 
 
+def test_bus_off_banner_returns_once_a_covering_banner_goes(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    """Bus-off doesn't change by itself, so the banner is CAN_1's only Reconnect."""
+    ctx = make_app_context(tmp_path)
+    win = TraceWindow(instance_id="t1")
+    qtbot.addWidget(win)
+    win.bind(ctx)
+    reader = ctx.bus_reader
+
+    reader._failures["CAN_2"] = "adapter disconnected"
+    reader.bus_failed.emit("CAN_2", "adapter disconnected")
+    reader.bus_health_changed.emit("CAN_1", "bus_off", "")
+    assert win._banner._label.text() == "Bus CAN_2 disconnected: adapter disconnected"
+
+    # CAN_2 reconnected.
+    del reader._failures["CAN_2"]
+    reader.bus_started.emit("CAN_2")
+    assert win._banner._label.text().startswith("Bus CAN_1: bus-off.")
+    assert win._banner._action_btn.text() == "Reconnect"
+
+    reader.error.emit("Bus 'CAN_3' failed to open")
+    win._banner._close_btn.click()
+    assert not win._banner.isHidden()
+    assert win._banner._label.text().startswith("Bus CAN_1: bus-off.")
+
+
 def test_bus_off_banner_reconnects_the_bus(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
     ctx, win = _trace_on_open_bus(qtbot, tmp_path)
 

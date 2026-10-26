@@ -340,8 +340,9 @@ class TxScheduler(QObject):
         TX window calls this on close.
 
     Invariant: while master is ON, every active periodic row has a live
-    task. When that can't hold (a task fails or won't start, or a bus an
-    active row targets closes or fails) the scheduler disarms: master
+    task. When that can't hold (a task fails or won't start, a bus an
+    active row targets closes or fails, or an active row targets a
+    listen-only bus) the scheduler disarms: master
     OFF, every task stopped, queued frames flushed, ``disarmed`` emitted.
     It also disarms when such a bus gets worse into bus errors or bus-off.
     Arming again while the bus is still degraded is the user's call and
@@ -450,9 +451,18 @@ class TxScheduler(QObject):
 
     def _reconcile(self) -> None:
         """Bring live cyclic tasks into agreement with the setup."""
-        failure = self._sync_tasks()
+        failure = self._listen_only_target() or self._sync_tasks()
         if failure is not None:
             self._disarm(failure)
+
+    def _listen_only_target(self) -> str | None:
+        """Why TX can't stay armed: an active row targets a listen-only bus."""
+        if not self._setup.master_enabled:
+            return None
+        for tx in self._setup.transmits:
+            if tx.active and self._bus_reader.is_listen_only(tx.bus_name):
+                return f"Bus {tx.bus_name} is listen-only"
+        return None
 
     def _sync_tasks(self) -> str | None:
         """Start, stop and modify tasks to match the setup; the failure reason, if any."""
@@ -552,6 +562,8 @@ class TxScheduler(QObject):
 
     def _on_bus_started(self, bus_name: str) -> None:
         self._health_seen.pop(bus_name, None)
+        if self._targets_actively(bus_name) and self._bus_reader.is_listen_only(bus_name):
+            self._disarm(f"Bus {bus_name} is listen-only")
 
     def _on_bus_failed(self, bus_name: str, error: str) -> None:
         # Fires just before bus_stopped, so this more specific reason wins.

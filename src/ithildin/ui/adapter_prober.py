@@ -2,10 +2,9 @@
 # Copyright (C) 2026 Tobias Hallberg
 """Background-thread CAN adapter probe.
 
-python-can's ``can.detect_available_configs()`` imports each backend
-module at probe time. Without an ``interfaces=`` filter it imports
-every backend it ships with — which is wasted work on the GUI thread
-at startup, since Ithildin only supports a small subset.
+Detecting a python-can backend's adapters imports its vendor module, and
+python-can ships many more backends than Ithildin supports — work that
+must stay off the GUI thread.
 
 This module probes the supported backends one at a time on a worker
 ``QThread``, streaming each enriched device (``device_found``) and its
@@ -18,13 +17,13 @@ The no-hardware virtual loopback is emitted last, but only in dev mode
 (``ITHILDIN_DEV`` / ``--dev``) — normal users never see it. See
 :func:`dev_mode`.
 
-Per-backend probing (one ``detect_available_configs(interfaces=[name])``
-call per backend) lets adapters appear in the dock progressively rather
-than as a single batch at the end. python-can can't enumerate ``gs_usb``
-adapters, so :func:`_detect_gs_usb` scans for them itself. Each
-per-backend call is wrapped in its own thread with a hard timeout: a
-misbehaving vendor module (PCAN without the driver, Kvaser with stale
-CANlib) must not be able to wedge the dock indefinitely.
+Per-backend probing (one ``core.bus.detect_configs`` call per backend)
+lets adapters appear in the dock progressively rather than as a single
+batch at the end. python-can can't enumerate ``gs_usb`` adapters, so
+:func:`_detect_gs_usb` scans for them itself. Each per-backend call is
+wrapped in its own thread with a hard timeout: a misbehaving vendor module
+(PCAN without the driver, Kvaser with stale CANlib) must not be able to
+wedge the dock indefinitely.
 """
 
 from __future__ import annotations
@@ -55,9 +54,11 @@ _SUPPORTED_BACKENDS: tuple[str, ...] = (
 vendor modules we don't intend to support."""
 
 BACKEND_TIMEOUT_S = 3.0
-"""Hard ceiling per backend probe. A hung vendor import past this is
-reported via ``backend_failed`` and the worker thread carries on; the
-hung helper thread is a daemon, left to die when the process exits."""
+"""Hard ceiling per backend probe. A vendor import or detection hung past
+this is reported via ``backend_failed`` and the worker thread carries on;
+the hung helper thread is a daemon, left to die when the process exits.
+Below the 5 s ``_stop_all_probes`` gives a probe at quit, which can't
+cancel one mid-backend."""
 
 _PROBE_LOCK_WAIT_S = 2.0
 """Below :data:`BACKEND_TIMEOUT_S`: a Kvaser or gs_usb probe queued behind a
@@ -291,7 +292,7 @@ def _detect_and_enrich(backend: str) -> list[DeviceInfo]:
 
 
 def _detect_configs(backend: str) -> list[dict[str, object]]:
-    """Raw ``detect_available_configs`` call for one backend.
+    """Raw detection dicts for one backend.
 
     Module-level so tests can patch it, and so the eager ``import can``
     happens off whoever's calling — the first import of python-can
@@ -303,21 +304,16 @@ def _detect_configs(backend: str) -> list[dict[str, object]]:
         # up as SocketCAN; pyusb would detach it.
         return _detect_gs_usb() if sys.platform == "win32" else []
 
-    import can
+    from ithildin.core.bus import KVASER_ENUM_LOCK, detect_configs, kvaser_enum_hardware
 
-    # python-can types this as ``Sequence[AutoDetectedConfig]`` (a
-    # TypedDict). For our purposes — passing dicts up to the UI to
-    # render — they're indistinguishable from plain mappings.
     if backend != "kvaser":
-        return [dict(cfg) for cfg in can.detect_available_configs(interfaces=[backend])]
-
-    from ithildin.core.bus import KVASER_ENUM_LOCK, kvaser_enum_hardware
+        return detect_configs(backend)
 
     if not KVASER_ENUM_LOCK.acquire(timeout=_PROBE_LOCK_WAIT_S):
         raise RuntimeError("Kvaser driver busy: a Kvaser bus or earlier scan is still in it")
     try:
         kvaser_enum_hardware()
-        configs = [dict(cfg) for cfg in can.detect_available_configs(interfaces=[backend])]
+        configs = detect_configs(backend)
         _add_kvaser_channel_data(configs)
     finally:
         KVASER_ENUM_LOCK.release()

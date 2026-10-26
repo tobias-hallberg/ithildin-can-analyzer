@@ -45,7 +45,7 @@ from ithildin.ui.banner import Banner
 from ithildin.ui.fonts import tabular_font
 from ithildin.ui.frame_inspector_view import FrameInspectorView
 from ithildin.ui.icons import icon, themed_callback, themed_icon
-from ithildin.ui.trace_view import TraceTreeModel
+from ithildin.ui.trace_view import TraceTreeModel, row_key
 from ithildin.ui.view_header import ViewHeaderBar
 
 if TYPE_CHECKING:
@@ -408,7 +408,7 @@ class TraceWindow(ChildView):
         failures = list(self._ctx.bus_reader.failures().items())
         if not failures:
             self._failure_banner_shown = False
-            self._banner.hide()
+            self._show_worst_health()
             return
         bus_name, message = failures[-1]
         more = f" (+{len(failures) - 1} more)" if len(failures) > 1 else ""
@@ -479,7 +479,11 @@ class TraceWindow(ChildView):
 
     def _on_banner_dismissed(self) -> None:
         self._failure_banner_shown = False
-        self._health_bus = None
+        if self._health_bus is not None:
+            self._health_bus = None
+            return
+        # A failure, error or info banner covered any bus errors or bus-off.
+        self._show_worst_health()
 
     def _on_banner_action(self) -> None:
         if self._ctx is None:
@@ -635,14 +639,14 @@ class TraceWindow(ChildView):
         #   clicked record statically and clear any prior pin so the
         #   drain-driven refresh leaves the inspector alone.
         if self._model.mode() == "overwrite":
-            self._pinned_key = (frame.bus_name, frame.arbitration_id)
+            self._pinned_key = row_key(frame)
             self._last_pushed = None
             self._refresh_pinned_inspector()
         else:
             self._pinned_key = None
             self._last_pushed = None
             if self._detail_view is not None:
-                period = self._model.period_for(frame.bus_name, frame.arbitration_id)
+                period = self._model.period_for(*row_key(frame))
                 self._detail_view.set_frame(frame, observed_period_s=period)
 
         # Broadcast the user's click on the events bus so any future

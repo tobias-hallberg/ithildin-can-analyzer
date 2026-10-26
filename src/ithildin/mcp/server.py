@@ -70,8 +70,9 @@ def register_read_tools(mcp: FastMCP, ctx: McpReadContext) -> None:
         """List the open CAN buses with their status.
 
         ``status`` is ``opening`` until the adapter is up, then ``live``, or
-        ``errors`` / ``bus_off`` / ``lost`` while the bus is degraded (see
-        ``status_detail``). Sends to a degraded bus are refused.
+        ``errors`` / ``bus_off`` while the bus is degraded (see
+        ``status_detail``). A bus whose adapter is lost drops out of the
+        list. Sends to a bus that is opening, degraded or lost are refused.
         """
         return tools.list_buses(ctx)
 
@@ -162,12 +163,12 @@ def register_write_tools(mcp: FastMCP, ctx: McpWriteContext) -> None:
     ) -> dict[str, Any]:
         """Encode + send one signal value (DBC-validated, allowlist-gated).
 
-        ``bus`` may be omitted only while exactly one bus is open; otherwise
-        the send is refused with reason NO_BUS. Pass integers as JSON
-        integers so 64-bit signals keep every bit. Sending a multiplexed
-        signal sets its selector to that signal's branch. ``ok`` is false
-        with reason BUS_UNHEALTHY while the bus is degraded; retry once
-        list_buses shows it live.
+        ``bus`` may be omitted only while exactly one bus is open; otherwise,
+        or when the bus named isn't open, the send is refused with reason
+        NO_BUS. Pass integers as JSON integers so 64-bit signals keep every
+        bit. Sending a multiplexed signal sets its selector to that signal's
+        branch. ``ok`` is false with reason BUS_UNHEALTHY while the bus is
+        still opening or degraded; retry once list_buses shows it live.
         """
         return await to_thread.run_sync(
             partial(tools.send_signal, ctx, message, signal, value, agent=agent, bus=bus),
@@ -185,10 +186,10 @@ def register_write_tools(mcp: FastMCP, ctx: McpWriteContext) -> None:
     ) -> dict[str, Any]:
         """Send a raw frame by CAN ID + hex payload. Needs a wildcard rule.
 
-        ``bus`` may be omitted only while exactly one bus is open; otherwise
-        the send is refused with reason NO_BUS. ``ok`` is false with reason
-        BUS_UNHEALTHY while the bus is degraded; retry once list_buses shows
-        it live.
+        ``bus`` may be omitted only while exactly one bus is open; otherwise,
+        or when the bus named isn't open, the send is refused with reason
+        NO_BUS. ``ok`` is false with reason BUS_UNHEALTHY while the bus is
+        still opening or degraded; retry once list_buses shows it live.
         """
         return await to_thread.run_sync(
             partial(

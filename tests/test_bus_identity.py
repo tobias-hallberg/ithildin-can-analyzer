@@ -158,18 +158,18 @@ def test_unreadable_pins_pin_nothing(tmp_path: Path, caplog: pytest.LogCaptureFi
 
 
 class _Detected:
-    """Stands in for ``can.detect_available_configs`` and ``can.Bus``."""
+    """Stands in for ``bus.detect_configs`` and ``can.Bus``."""
 
     def __init__(self, monkeypatch: pytest.MonkeyPatch, configs: list[dict[str, object]]) -> None:
         self.configs = configs
-        self.detect_calls: list[tuple[list[str], dict[str, object]]] = []
+        self.detect_calls: list[str] = []
         self.opened: list[dict[str, object]] = []
-        monkeypatch.setattr(can, "detect_available_configs", self._detect)
+        monkeypatch.setattr(bus_mod, "detect_configs", self._detect)
         monkeypatch.setattr(can, "Bus", self._bus)
 
-    def _detect(self, interfaces: list[str], **kwargs: object) -> list[dict[str, object]]:
-        self.detect_calls.append((interfaces, kwargs))
-        return [c for c in self.configs if c["interface"] in interfaces]
+    def _detect(self, interface: str) -> list[dict[str, object]]:
+        self.detect_calls.append(interface)
+        return [c for c in self.configs if c["interface"] == interface]
 
     def _bus(self, **kwargs: object) -> object:
         self.opened.append(kwargs)
@@ -193,8 +193,7 @@ def test_pin_keeps_the_configured_channel_while_it_has_the_adapter(monkeypatch) 
     _pin_adapter(_pinned("pcan", "PCAN_USBBUS1", "0000002a.0"), kwargs)
 
     assert kwargs["channel"] == "PCAN_USBBUS1"
-    # No timeout=: python-can would return a partial list, a false "not attached".
-    assert detected.detect_calls == [(["pcan"], {})]
+    assert detected.detect_calls == ["pcan"]
 
 
 def test_pin_follows_the_adapter_to_its_new_channel(monkeypatch, caplog) -> None:  # type: ignore[no-untyped-def]
@@ -230,6 +229,44 @@ def test_unpinned_bus_detects_nothing(monkeypatch) -> None:  # type: ignore[no-u
     _pin_adapter(_pinned("pcan", "PCAN_USBBUS1", None), kwargs)
     assert detected.detect_calls == []
     assert kwargs == {"channel": "PCAN_USBBUS1"}
+
+
+def test_detection_runs_on_the_calling_thread(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """python-can's own runs in a pool the interpreter joins at exit, and gives
+    up on a slow driver while the driver goes on, outside any lock held here."""
+    threads: list[threading.Thread] = []
+
+    class Backend:
+        @staticmethod
+        def _detect_available_configs() -> list[dict[str, object]]:
+            threads.append(threading.current_thread())
+            return [{"channel": "PCAN_USBBUS1"}, {"interface": "pcan", "channel": "PCAN_USBBUS2"}]
+
+    monkeypatch.setattr(bus_mod, "_get_class_for_interface", lambda _interface: Backend)
+
+    assert bus_mod.detect_configs("pcan") == [
+        {"interface": "pcan", "channel": "PCAN_USBBUS1"},
+        {"interface": "pcan", "channel": "PCAN_USBBUS2"},
+    ]
+    assert threads == [threading.current_thread()]
+
+
+@pytest.mark.parametrize(
+    "error", [can.CanInterfaceNotImplementedError("no vendor module"), NotImplementedError()]
+)
+def test_a_backend_that_cannot_detect_has_no_channels(monkeypatch, error) -> None:  # type: ignore[no-untyped-def]
+    class Backend:
+        @staticmethod
+        def _detect_available_configs() -> list[dict[str, object]]:
+            raise NotImplementedError
+
+    def resolve(_interface: str) -> type[Backend]:
+        if isinstance(error, can.CanInterfaceNotImplementedError):
+            raise error
+        return Backend
+
+    monkeypatch.setattr(bus_mod, "_get_class_for_interface", resolve)
+    assert bus_mod.detect_configs("kvaser") == []
 
 
 def test_ixxat_open_asks_for_the_pinned_device(monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -275,7 +312,7 @@ def test_kvaser_pin_resolves_inside_the_enumeration_lock(monkeypatch) -> None:  
         bus_mod, "kvaser_enum_hardware", lambda: calls.append(("enum", KVASER_ENUM_LOCK.locked()))
     )
 
-    def detect(interfaces: list[str]) -> list[dict[str, object]]:
+    def detect(interface: str) -> list[dict[str, object]]:
         calls.append(("detect", KVASER_ENUM_LOCK.locked()))
         return [_kvaser(0, 11111), _kvaser(1, 84621)]
 
@@ -283,7 +320,7 @@ def test_kvaser_pin_resolves_inside_the_enumeration_lock(monkeypatch) -> None:  
         calls.append((f"bus {kwargs['channel']}", KVASER_ENUM_LOCK.locked()))
         return object()
 
-    monkeypatch.setattr(can, "detect_available_configs", detect)
+    monkeypatch.setattr(bus_mod, "detect_configs", detect)
     monkeypatch.setattr(can, "Bus", open_bus)
     cfg = _pinned("kvaser", 0, "84621.1")
 
@@ -304,12 +341,12 @@ def test_kvaser_pin_waits_for_a_probe_holding_the_lock(monkeypatch) -> None:  # 
             release.wait(5)
         order.append(f"enum {threading.current_thread().name}")
 
-    def detect(interfaces: list[str]) -> list[dict[str, object]]:
+    def detect(interface: str) -> list[dict[str, object]]:
         order.append(f"detect {threading.current_thread().name}")
         return [_kvaser(0, 84621)]
 
     monkeypatch.setattr(bus_mod, "kvaser_enum_hardware", enum)
-    monkeypatch.setattr(can, "detect_available_configs", detect)
+    monkeypatch.setattr(bus_mod, "detect_configs", detect)
     monkeypatch.setattr(can, "Bus", lambda **_kwargs: object())
     monkeypatch.setattr(prober_mod, "_add_kvaser_channel_data", lambda _configs: None)
     cfg = _pinned("kvaser", 0, "84621.1")

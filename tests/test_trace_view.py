@@ -15,7 +15,7 @@ from PySide6.QtWidgets import QTreeView
 from ithildin.core.decoder import Decoder
 from ithildin.core.ringbuf import RingBuffer
 from ithildin.core.types import FrameRecord
-from ithildin.ui.trace_view import Mode, TraceTreeModel
+from ithildin.ui.trace_view import ERROR_ROW_ID, Mode, TraceTreeModel
 
 
 def _frame(bus: str, aid: int, ts: float = 0.0, data: bytes = b"") -> FrameRecord:
@@ -310,27 +310,53 @@ def test_latest_set_admit_drops_error_rows_by_their_own_admission(qapp) -> None:
     assert model.rowCount() == 1
 
 
-def test_latest_row_children_follow_the_replacing_frame(qtbot, example_dbc_path: Path) -> None:  # type: ignore[no-untyped-def]
+@pytest.mark.parametrize("mode", ["append", "overwrite"])
+def test_error_frames_never_share_a_messages_key(qapp, mode: Mode) -> None:  # type: ignore[no-untyped-def]
+    """An error class can equal a message ID on the same bus (PCAN's 0x1-0x8,
+    SocketCAN's 0x100): the message keeps its own row, period and pin."""
+    ring = RingBuffer(16)
+    first, second = _frame("A", 0x100, ts=0.0), _frame("A", 0x100, ts=0.1)
+    ring.append(first)
+    ring.append(_error_frame("A", 0x100, ts=0.05))
+    ring.append(second)
+    ring.append(_error_frame("A", 0x100, ts=0.12))
+    model = TraceTreeModel({"A": ring}, admit=_admit_all)
+    model.set_mode(mode)
+    model.drain_now()
+
+    assert model.latest_frame_for("A", 0x100) is second
+    assert model.period_for("A", 0x100) == pytest.approx(0.1)
+    latest_error = model.latest_frame_for("A", ERROR_ROW_ID)
+    assert latest_error is not None and latest_error.timestamp == 0.12
+    assert model.period_for("A", ERROR_ROW_ID) == pytest.approx(0.07)
+    if mode == "overwrite":
+        assert model.rowCount() == 2
+        assert model.data(model.index(0, TraceTreeModel.COL_NAME)) == "Error frame"
+        assert model.frame_at(1) is second
+
+
+def test_latest_row_children_follow_the_replacing_frame(qtbot, edge_dbc_path: Path) -> None:  # type: ignore[no-untyped-def]
+    """A multiplexed message's next frame may carry another branch's signals."""
     ring = RingBuffer(8)
-    ring.append(_frame("A", 0x100, data=bytes(8)))
+    ring.append(_frame("A", 1601, data=bytes([225]) + bytes(7)))
     model = TraceTreeModel(
-        {"A": ring}, decoders={"A": Decoder.from_files(example_dbc_path)}, admit=_admit_all
+        {"A": ring}, decoders={"A": Decoder.from_files(edge_dbc_path)}, admit=_admit_all
     )
     model.set_mode("overwrite")
     model.drain_now()
-    assert model.rowCount(model.index(0, 0)) == 2
+    assert model.rowCount(model.index(0, 0)) == 5
 
-    ring.append(_error_frame("A", 0x100))
+    ring.append(_frame("A", 1601, data=bytes([128]) + bytes(7)))
     with qtbot.waitSignal(model.rowsRemoved, timeout=1000) as removed:
         model.drain_now()
-    assert removed.args[1:] == [0, 1]
-    assert model.rowCount(model.index(0, 0)) == 0
+    assert removed.args[1:] == [2, 4]
+    assert model.rowCount(model.index(0, 0)) == 2
 
-    ring.append(_frame("A", 0x100, data=bytes(8)))
+    ring.append(_frame("A", 1601, data=bytes([225]) + bytes(7)))
     with qtbot.waitSignal(model.rowsInserted, timeout=1000) as inserted:
         model.drain_now()
-    assert inserted.args[1:] == [0, 1]
-    assert model.rowCount(model.index(0, 0)) == 2
+    assert inserted.args[1:] == [2, 4]
+    assert model.rowCount(model.index(0, 0)) == 5
 
 
 # ---- Live window, history and decode cost ----
