@@ -7,12 +7,12 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
 import threading
 from pathlib import Path
 
 import can
 import pytest
-from can.interfaces.ixxat.exceptions import VCIDeviceNotFoundError
 
 from ithildin.app_state.bus_reader import BusReader
 from ithildin.app_state.project import open_or_migrate
@@ -269,6 +269,9 @@ def test_a_backend_that_cannot_detect_has_no_channels(monkeypatch, error) -> Non
     assert bus_mod.detect_configs("kvaser") == []
 
 
+@pytest.mark.skipif(
+    sys.platform != "win32", reason="python-can's IXXAT module imports on Windows only"
+)
 def test_ixxat_open_asks_for_the_pinned_device(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     detected = _Detected(monkeypatch, [])
     cfg = _pinned("ixxat", 0, "HW123456")
@@ -279,7 +282,12 @@ def test_ixxat_open_asks_for_the_pinned_device(monkeypatch) -> None:  # type: ig
     assert detected.detect_calls == []
 
 
+@pytest.mark.skipif(
+    sys.platform != "win32", reason="python-can's IXXAT module imports on Windows only"
+)
 def test_ixxat_pinned_device_missing_reads_not_attached(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    from can.interfaces.ixxat.exceptions import VCIDeviceNotFoundError
+
     def refuse(**_kwargs: object) -> object:
         raise VCIDeviceNotFoundError("Unique HW ID HW123456 not connected or not available.")
 
