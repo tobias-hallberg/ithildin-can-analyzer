@@ -7,6 +7,8 @@ once it reaches 1.0.
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-10-26
+
 ### Added
 
 - Every launch writes a diagnostic log to `~/.ithildin/logs` (the newest
@@ -213,6 +215,7 @@ First public beta. Feature set at this point:
   validates CAN ID range, payload length, and signal finiteness on every
   send.
 
-[Unreleased]: https://github.com/tobias-hallberg/ithildin-can-analyzer/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/tobias-hallberg/ithildin-can-analyzer/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/tobias-hallberg/ithildin-can-analyzer/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/tobias-hallberg/ithildin-can-analyzer/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/tobias-hallberg/ithildin-can-analyzer/releases/tag/v0.1.0

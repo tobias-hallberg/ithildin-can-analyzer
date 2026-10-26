@@ -1,6 +1,6 @@
 [project]
 name = "ithildin"
-version = "0.1.1"
+version = "0.1.2"
 description = "Open-source CAN bus analyser with a built-in MCP server"
 readme = "README.md"
 license = "GPL-3.0-or-later"
