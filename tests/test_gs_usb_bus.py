@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import queue
+import threading
 import time
 from collections.abc import Callable, Iterator
 from types import SimpleNamespace
@@ -44,12 +45,16 @@ class FakeAdapter:
       ``usb.util.dispose_resources`` of its pyusb device (``gs_usb``, the
       fake itself), in order.
     * ``sent``: the CAN ID of every frame written to the adapter.
+    * ``serial``: its USB serial; ``held`` makes reading it fail as WinUSB
+      does while another handle has the adapter open.
     """
 
-    def __init__(self, address: int, feature: int = _LISTEN_ONLY) -> None:
+    def __init__(self, address: int, feature: int = _LISTEN_ONLY, serial: str = "") -> None:
         self.bus = 1
         self.address = address
         self.feature = feature
+        self.serial = serial or f"SN{address}"
+        self.held = False
         self.no_driver = False
         self.gone = False
         self.read_fails = False
@@ -66,6 +71,12 @@ class FakeAdapter:
         if self.no_driver:
             raise NotImplementedError("Operation not supported or unimplemented on this platform")
         return SimpleNamespace(feature=self.feature, fclk_can=48_000_000)
+
+    @property
+    def serial_number(self) -> str:
+        if self.gone or self.held:
+            raise usb.core.USBError("Access denied (insufficient permissions)", -3, 13)
+        return self.serial
 
     @property
     def device_info(self) -> SimpleNamespace:
@@ -323,3 +334,132 @@ def test_shutdown_after_unplug_leaves_other_adapters_alone(adapters, make_bus) -
 
     bus.shutdown()
     assert adapters[1].calls == []
+
+
+# ---- Opening by serial ----
+
+
+def test_pinned_bus_opens_its_adapter_at_any_scan_index(adapters) -> None:  # type: ignore[no-untyped-def]
+    """The index follows plug order; the serial stays with the adapter."""
+    adapters.insert(0, FakeAdapter(address=6))
+    bus = GsUsbBus(channel=0, bitrate=500_000, serial="SN5")
+    try:
+        assert bus.gs_usb is adapters[1]
+        assert adapters[1].starts() == [GS_CAN_MODE_HW_TIMESTAMP]
+        # The serial read opened the other adapter too; it is let go.
+        assert adapters[0].calls == [("dispose", None)]
+    finally:
+        bus.shutdown()
+
+
+def test_pinned_bus_skips_an_adapter_another_bus_holds(adapters) -> None:  # type: ignore[no-untyped-def]
+    adapters[0].held = True
+    adapters.append(FakeAdapter(address=6))
+    bus = GsUsbBus(channel=0, bitrate=500_000, serial="SN6")
+    try:
+        assert bus.gs_usb is adapters[1]
+        assert adapters[0].starts() == []
+    finally:
+        bus.shutdown()
+
+
+def test_pinned_bus_refuses_when_its_adapter_is_missing(adapters) -> None:  # type: ignore[no-untyped-def]
+    with pytest.raises(can.CanInitializationError, match="is not attached"):
+        GsUsbBus(channel=0, bitrate=500_000, serial="SN9")
+    assert adapters[0].starts() == []
+
+
+def test_pinned_bus_refuses_a_serial_two_adapters_report(adapters) -> None:  # type: ignore[no-untyped-def]
+    """Clones can share a serial: opening the first would bind whichever
+    enumerated first."""
+    adapters.append(FakeAdapter(address=6, serial="SN5"))
+    with pytest.raises(can.CanInitializationError, match="2 adapters report"):
+        GsUsbBus(channel=0, bitrate=500_000, serial="SN5")
+    assert [a.starts() for a in adapters] == [[], []]
+    assert [a.calls for a in adapters] == [[("dispose", None)], [("dispose", None)]]
+
+
+class _ExclusiveAdapter(FakeAdapter):
+    """WinUSB's one handle at a time: a thread's first USB request opens the
+    adapter for that thread until it disposes of it, and a request from
+    another thread meanwhile is refused."""
+
+    def __init__(self, address: int) -> None:
+        super().__init__(address)
+        self.owner: threading.Thread | None = None
+
+    def claim(self) -> None:
+        if self.owner not in (None, threading.current_thread()):
+            raise usb.core.USBError("Access denied (insufficient permissions)", -3, 13)
+        self.owner = threading.current_thread()
+
+    @property
+    def serial_number(self) -> str:
+        self.claim()
+        # A descriptor read is a few control transfers: long enough for an
+        # open on another thread to run into it.
+        time.sleep(0.05)
+        return self.serial
+
+    @property
+    def device_capability(self) -> SimpleNamespace:
+        self.claim()
+        return super().device_capability
+
+
+def test_pinned_opens_in_parallel_never_collide_on_a_serial_read(monkeypatch, adapters) -> None:  # type: ignore[no-untyped-def]
+    """Each pinned open reads the other adapter's serial too; one open's read
+    must not make the other open fail (both buses connecting at startup)."""
+    adapters[:] = [_ExclusiveAdapter(address=5), _ExclusiveAdapter(address=6)]
+
+    def dispose(dev: _ExclusiveAdapter) -> None:
+        if dev.owner is threading.current_thread():
+            dev.owner = None
+
+    monkeypatch.setattr(usb.util, "dispose_resources", dispose)
+    opened: dict[str, object] = {}
+
+    def open_bus(worker: BusWorker) -> None:
+        try:
+            opened[worker.name] = worker._open_bus()
+        except can.CanError as exc:
+            opened[worker.name] = exc
+
+    threads = [
+        threading.Thread(
+            target=open_bus,
+            args=(
+                BusWorker(
+                    serial,
+                    BusConfig(
+                        name=serial, interface="gs_usb", channel=0, bitrate=500_000, hw_id=serial
+                    ),
+                    RingBuffer(8),
+                ),
+            ),
+        )
+        for serial in ("SN6", "SN5")
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(5)
+    try:
+        assert {name: getattr(bus, "gs_usb", bus) for name, bus in opened.items()} == {
+            "SN5": adapters[0],
+            "SN6": adapters[1],
+        }
+    finally:
+        for bus in opened.values():
+            if isinstance(bus, GsUsbBus):
+                bus.shutdown()
+
+
+def test_worker_opens_a_pinned_adapter_by_serial(adapters) -> None:  # type: ignore[no-untyped-def]
+    adapters.insert(0, FakeAdapter(address=6))
+    cfg = BusConfig(name="CAN_1", interface="gs_usb", channel=0, bitrate=500_000, hw_id="SN5")
+    bus = BusWorker("CAN_1", cfg, RingBuffer(8))._open_bus()
+    try:
+        assert bus.gs_usb is adapters[1]  # type: ignore[attr-defined]
+    finally:
+        bus.shutdown()

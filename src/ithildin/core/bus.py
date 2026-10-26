@@ -40,7 +40,7 @@ from PySide6.QtCore import QDeadlineTimer, QObject, Qt, QThread, Signal, Slot
 
 from ithildin.core.ringbuf import RingBuffer
 from ithildin.core.types import HEALTH_RANK, BusHealth, FrameRecord
-from ithildin.workspace.schema import BusConfig
+from ithildin.workspace.schema import BusConfig, hw_id_of
 
 _log = logging.getLogger(__name__)
 
@@ -419,13 +419,18 @@ class BusWorker(QObject):
 
     def _open_bus(self) -> can.BusABC:
         if self._config.interface == "gs_usb":
-            from ithildin.core.gs_usb_bus import GsUsbBus
+            from ithildin.core.gs_usb_bus import GS_USB_LOCK, GsUsbBus
 
-            return GsUsbBus(
-                channel=int(self._config.channel),
-                bitrate=self._config.bitrate,
-                listen_only=self._config.listen_only,
-            )
+            self._take_driver_lock(GS_USB_LOCK, "gs_usb")
+            try:
+                return GsUsbBus(
+                    channel=int(self._config.channel),
+                    bitrate=self._config.bitrate,
+                    listen_only=self._config.listen_only,
+                    serial=self._config.hw_id,
+                )
+            finally:
+                GS_USB_LOCK.release()
         kwargs: dict[str, Any] = {
             "interface": self._config.interface,
             "channel": self._config.channel,
@@ -443,7 +448,21 @@ class BusWorker(QObject):
             return self._open_kvaser(kwargs)
         if self._config.interface == "pcan":
             return self._open_pcan(kwargs)
+        if self._config.interface == "ixxat" and self._config.hw_id is not None:
+            return self._open_ixxat(kwargs, self._config.hw_id)
         return can.Bus(**kwargs)
+
+    def _open_ixxat(self, kwargs: dict[str, Any], hw_id: str) -> can.BusABC:
+        from can.interfaces.ixxat.exceptions import VCIDeviceNotFoundError
+
+        # python-can then opens only that device, wherever it enumerates.
+        kwargs["unique_hardware_id"] = hw_id
+        try:
+            return can.Bus(**kwargs)
+        except VCIDeviceNotFoundError as exc:
+            raise can.CanInitializationError(
+                f"its pinned IXXAT adapter {ADAPTER_NOT_ATTACHED}, or another program holds it"
+            ) from exc
 
     def _open_pcan(self, kwargs: dict[str, Any]) -> can.BusABC:
         from can.interfaces.pcan import basic
@@ -456,6 +475,7 @@ class BusWorker(QObject):
             raise can.CanInitializationError(
                 f"PCAN has no preset for {bitrate} bit/s (presets: {rates} bit/s)"
             )
+        _pin_adapter(self._config, kwargs)
         driver = cast(Any, basic.PCANBasic)()
         channel = kwargs["channel"]
         handle = channel if isinstance(channel, int) else basic.PCAN_CHANNEL_NAMES[channel]
@@ -497,20 +517,26 @@ class BusWorker(QObject):
         # A channel number shifted by an unplugged adapter must fail to open,
         # not open a Kvaser Virtual channel that looks like a live bus.
         kwargs["accept_virtual"] = False
-        deadline = time.monotonic() + _KVASER_OPEN_WAIT_S
-        while not KVASER_ENUM_LOCK.acquire(timeout=_RECV_TIMEOUT_S):
+        self._take_driver_lock(KVASER_ENUM_LOCK, "Kvaser")
+        try:
+            kvaser_enum_hardware()
+            _pin_adapter(self._config, kwargs)
+            return can.Bus(**kwargs)
+        finally:
+            KVASER_ENUM_LOCK.release()
+
+    def _take_driver_lock(self, lock: threading.Lock, driver: str) -> None:
+        """Queue for a driver-wide lock, giving up once the bus is stopped or
+        after :data:`_OPEN_LOCK_WAIT_S`: a vendor call that hangs keeps it."""
+        deadline = time.monotonic() + _OPEN_LOCK_WAIT_S
+        while not lock.acquire(timeout=_RECV_TIMEOUT_S):
             if self._stop:
                 raise _OpenCancelledError
             if time.monotonic() >= deadline:
                 raise can.CanInitializationError(
-                    f"Kvaser driver busy: another Kvaser bus or adapter scan has been "
-                    f"in the driver for over {_KVASER_OPEN_WAIT_S:.0f} s"
+                    f"{driver} driver busy: another {driver} bus or adapter scan has been "
+                    f"in the driver for over {_OPEN_LOCK_WAIT_S:.0f} s"
                 )
-        try:
-            kvaser_enum_hardware()
-            return can.Bus(**kwargs)
-        finally:
-            KVASER_ENUM_LOCK.release()
 
 
 def _worst(*levels: _Level) -> _Level:
@@ -641,6 +667,50 @@ def _apply_listen_only_kwargs(kwargs: dict[str, Any], interface: str) -> None:
         kwargs.update(driver_mode=False, single_handle=True, receive_own_messages=False)
 
 
+ADAPTER_NOT_ATTACHED = "is not attached"
+"""In the open error of a pinned bus whose adapter is missing; the dock
+waits for that adapter to come back."""
+
+
+def _pin_adapter(config: BusConfig, kwargs: dict[str, Any]) -> None:
+    """Point a pcan or kvaser open at the adapter ``config.hw_id`` names.
+
+    Worker thread only: detection is vendor work. Keeps the configured
+    channel while it has the adapter, follows the adapter to the one other
+    channel it moved to, and refuses with ``CanInitializationError`` when no
+    channel or several report it. Never ``PcanBus(device_id=)``: it takes
+    the first match. A Kvaser caller holds :data:`KVASER_ENUM_LOCK`, so the
+    channel numbers can't change before ``can.Bus`` uses them.
+    """
+    hw_id = config.hw_id
+    if hw_id is None:
+        return
+    # python-can's default 5 s timeout, not a shorter one: once it runs out
+    # it returns what it found so far, and a slow driver reads as a missing
+    # adapter.
+    found = [
+        detected["channel"]
+        for detected in can.detect_available_configs(interfaces=[config.interface])
+        if hw_id_of(config.interface, detected) == hw_id
+    ]
+    if any(str(channel) == str(config.channel) for channel in found):
+        return
+    if len(found) == 1:
+        _log.info(
+            "Bus %r: adapter %s moved from %s to %s", config.name, hw_id, config.channel, found[0]
+        )
+        kwargs["channel"] = found[0]
+        return
+    if not found:
+        raise can.CanInitializationError(f"its pinned adapter {ADAPTER_NOT_ATTACHED}")
+    advice = (
+        "; give each adapter its own device ID in PCAN-View" if config.interface == "pcan" else ""
+    )
+    raise can.CanInitializationError(
+        f"{len(found)} adapters report the identity this bus is pinned to{advice}"
+    )
+
+
 KVASER_ENUM_LOCK = threading.Lock()
 """Held across :func:`kvaser_enum_hardware` and every use of the channel
 numbers it produces: a probe's detection, an open. Re-enumerating renumbers
@@ -648,9 +718,10 @@ the channels, so one between a detection and a ``canOpenChannel`` would
 open a different adapter. Wait for it with a timeout: a vendor call that
 hangs keeps holding it."""
 
-_KVASER_OPEN_WAIT_S = 10.0
-"""Longest a Kvaser open queues for :data:`KVASER_ENUM_LOCK` behind other
-opens and probes before it fails as driver busy."""
+_OPEN_LOCK_WAIT_S = 10.0
+"""Longest an open queues for a driver-wide lock (:data:`KVASER_ENUM_LOCK`,
+``gs_usb_bus.GS_USB_LOCK``) behind other opens and probes before it fails as
+driver busy."""
 
 
 def kvaser_enum_hardware() -> None:

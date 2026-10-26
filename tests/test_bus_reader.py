@@ -305,7 +305,41 @@ def test_retiring_channel_refused_under_new_name(qapp, qtbot, monkeypatch, reade
     try:
         reader.close(wait_ms=50)
         reader.open(cfg.model_copy(update={"name": "CAN_2"}))
-        assert "bus 'CAN_1' on the same channel is still closing" in errors[-1]
+        assert "bus 'CAN_1' on the same channel or adapter is still closing" in errors[-1]
+        assert not reader.is_open
+    finally:
+        with qtbot.waitSignal(reader.bus_released, timeout=2000):
+            fake.block.set()
+
+
+def test_failures_last_until_reopened_or_forgotten(qapp, qtbot, reader) -> None:  # type: ignore[no-untyped-def]
+    a, b = _virtual("A"), _virtual("B")
+    for cfg in (a, b):
+        _open(reader, qtbot, cfg)
+    for name in ("A", "B"):
+        with qtbot.waitSignal(reader.bus_failed, timeout=2000):
+            kill_capture(reader, name)
+    assert list(reader.failures()) == ["A", "B"]
+
+    _open(reader, qtbot, a)
+    assert list(reader.failures()) == ["B"]
+    reader.forget("B")
+    assert reader.failures() == {}
+
+
+def test_retiring_adapter_refused_on_another_channel(qapp, qtbot, monkeypatch, reader) -> None:  # type: ignore[no-untyped-def]
+    """A pinned adapter that moved channels is still the one the closing bus holds."""
+    fake = _hung_fake(monkeypatch)
+    cfg = BusConfig(
+        name="CAN_1", interface="pcan", channel="PCAN_USBBUS1", bitrate=500000, hw_id="0000002a.0"
+    )
+    _open(reader, qtbot, cfg)
+    errors: list[str] = []
+    reader.error.connect(errors.append)
+    try:
+        reader.close(wait_ms=50)
+        reader.open(cfg.model_copy(update={"name": "CAN_2", "channel": "PCAN_USBBUS2"}))
+        assert "bus 'CAN_1' on the same channel or adapter is still closing" in errors[-1]
         assert not reader.is_open
     finally:
         with qtbot.waitSignal(reader.bus_released, timeout=2000):

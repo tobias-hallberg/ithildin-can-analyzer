@@ -157,9 +157,8 @@ class TraceWindow(ChildView):
         self._banner = Banner(kind="error", parent=self)
         self._banner.action_clicked.connect(self._on_banner_action)
         self._banner.dismissed.connect(self._on_banner_dismissed)
-        # Bus name shown by the most recent bus_failed banner. ``None``
-        # when the banner is dismissed or showing a non-failure message.
-        self._failed_bus_name: str | None = None
+        # The banner shows BusReader.failures(), with a Reconnect for them.
+        self._failure_banner_shown = False
         # Bus whose bus-errors or bus-off state the banner shows, if any.
         self._health_bus: str | None = None
         # Last health per running bus; absent means OK.
@@ -391,23 +390,35 @@ class TraceWindow(ChildView):
 
     def _on_bus_error(self, message: str) -> None:
         # Comes before a bus_failed, which takes the banner back.
-        self._failed_bus_name = None
+        self._failure_banner_shown = False
         self._health_bus = None
         self._banner.show_message(message, kind="error")
 
-    def _on_bus_failed(self, bus_name: str, message: str) -> None:
-        self._failed_bus_name = bus_name
+    def _on_bus_failed(self, _bus_name: str, _message: str) -> None:
+        self._show_failures()
+
+    def _on_bus_started_clear_banner(self, _bus_name: str) -> None:
+        # Only while shown: a dismissed banner stays dismissed.
+        if self._failure_banner_shown:
+            self._show_failures()
+
+    def _show_failures(self) -> None:
+        """Show the newest failure, how many more there are, and a Reconnect for all."""
+        assert self._ctx is not None
+        failures = list(self._ctx.bus_reader.failures().items())
+        if not failures:
+            self._failure_banner_shown = False
+            self._banner.hide()
+            return
+        bus_name, message = failures[-1]
+        more = f" (+{len(failures) - 1} more)" if len(failures) > 1 else ""
+        self._failure_banner_shown = True
         self._health_bus = None
         self._banner.show_message(
-            f"Bus {bus_name} disconnected: {message}",
+            f"Bus {bus_name} disconnected: {message}{more}",
             kind="error",
-            action_label="Reconnect",
+            action_label="Reconnect all" if more else "Reconnect",
         )
-
-    def _on_bus_started_clear_banner(self, bus_name: str) -> None:
-        if self._failed_bus_name == bus_name:
-            self._failed_bus_name = None
-            self._banner.hide()
 
     def _on_bus_stopped_clear_health_banner(self, bus_name: str) -> None:
         self._health_seen.pop(bus_name, None)
@@ -419,7 +430,7 @@ class TraceWindow(ChildView):
         previous = self._health_seen.get(bus_name, (BusHealth.OK, ""))[0]
         self._health_seen[bus_name] = (health, detail)
         # A failure banner carries a Reconnect for a dead bus; keep it.
-        if self._failed_bus_name is not None:
+        if self._failure_banner_shown:
             return
         # LOST: bus_failed follows with its own banner.
         if bus_name == self._health_bus and health is not BusHealth.LOST:
@@ -467,27 +478,34 @@ class TraceWindow(ChildView):
             )
 
     def _on_banner_dismissed(self) -> None:
-        self._failed_bus_name = None
+        self._failure_banner_shown = False
         self._health_bus = None
 
     def _on_banner_action(self) -> None:
         if self._ctx is None:
             return
-        bus_name = self._failed_bus_name or self._health_bus
-        if bus_name is None:
-            return
         reader = self._ctx.bus_reader
-        if self._failed_bus_name is not None and bus_name in reader.bus_names():
-            # Already opening, from an earlier click or the toolbar's Connect.
+        if self._failure_banner_shown:
+            # Opened again since, from an earlier click or elsewhere, a bus
+            # has left failures(), so a second click leaves it alone.
+            names = list(reader.failures())
+            if not names:
+                # All reopened or removed from the project meanwhile.
+                self._show_failures()
+                return
+        elif self._health_bus is not None:
+            names = [self._health_bus]
+        else:
             return
-        cfg = next(
-            (c for c in self._ctx.project.workspace.bus if c.name == bus_name),
-            reader.last_config_for(bus_name),
-        )
-        if cfg is None:
-            return
-        # Reopening also resets a bus-off controller, and keeps the session.
-        reader.reopen(cfg)
+        for bus_name in names:
+            # The workspace config carries the bus's adapter pin.
+            cfg = next(
+                (c for c in self._ctx.project.workspace.bus if c.name == bus_name),
+                reader.last_config_for(bus_name),
+            )
+            if cfg is not None:
+                # Reopening also resets a bus-off controller, and keeps the session.
+                reader.reopen(cfg)
 
     def _on_effective_changed(self) -> None:
         if self._model is None or self._tracked_pane is None:
@@ -495,7 +513,7 @@ class TraceWindow(ChildView):
         self._model.set_admit(self._tracked_pane.effective().admits)
 
     def _on_superseded(self, message: str) -> None:
-        self._failed_bus_name = None
+        self._failure_banner_shown = False
         self._health_bus = None
         self._banner.show_message(message, kind="info")
 

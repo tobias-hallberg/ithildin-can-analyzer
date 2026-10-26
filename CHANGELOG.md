@@ -7,6 +7,27 @@ once it reaches 1.0.
 
 ## [Unreleased]
 
+### Added
+
+- Buses follow their adapter. A bus created from the Create CAN bus dialog
+  is pinned to the adapter picked there (a PCAN adapter by the device ID
+  set in PCAN-View, Kvaser and IXXAT by serial, `gs_usb` by USB serial),
+  and opens it in whichever port or channel it shows up on; if it is
+  missing the bus says so instead of opening another adapter. An existing
+  bus is pinned from its right-click menu (**Pin to …**). Pins are stored
+  per user in `~/.ithildin/<project>/adapter_pins.json`, never in the
+  project file.
+- The Buses panel rescans the adapters when a device is plugged in or
+  removed (Windows), or on its new **↻** button, without the rows
+  flashing. When the adapter of a lost bus comes back, the Report panel
+  says so; the bus reconnects only when you click it.
+- A bus's status dot in the Buses panel connects or disconnects it, and
+  the right-click menu offers Connect, Reconnect and Disconnect. A bus
+  that failed shows ⊗ with the reason in its tooltip, apart from one you
+  disconnected.
+- The Trace banner keeps every failed bus, not only the latest: it names
+  the newest with "(+N more)", and **Reconnect all** reopens them all.
+
 ### Changed
 
 - CANable / CANtact / candleLight adapters run on python-can's `gs_usb`
@@ -62,6 +83,14 @@ once it reaches 1.0.
   one that fails with an unexpected error.
 - The MCP dialog opens quickly on a large audit log: it reads only the last
   2 MB.
+- A second IXXAT adapter is listed: its channel 0 no longer hides behind
+  the first adapter's. Two buses still can't share a channel number, even
+  pinned to different adapters, so that channel 0 can't get a bus while
+  another bus has channel 0.
+- A backend whose detection hangs is probed once per session, not again on
+  every rescan or Create dialog ↻, each of which left another thread hung.
+- The Create CAN bus dialog labels a PCAN adapter by its device ID instead
+  of calling it a serial number, and leaves out the factory-default ID.
 
 ## [0.1.1] - 2026-10-24
 

@@ -299,28 +299,71 @@ def test_kvaser_probe_reports_the_driver_busy_while_the_lock_stays_held(monkeypa
     the backend timeout, so its thread ends instead of staying parked."""
     from ithildin.core import bus as bus_mod
 
-    assert prober_mod._KVASER_LOCK_WAIT_S < prober_mod.BACKEND_TIMEOUT_S
+    assert prober_mod._PROBE_LOCK_WAIT_S < prober_mod.BACKEND_TIMEOUT_S
     enumerated: list[bool] = []
     monkeypatch.setattr(bus_mod, "kvaser_enum_hardware", lambda: enumerated.append(True))
-    monkeypatch.setattr(prober_mod, "_KVASER_LOCK_WAIT_S", 0.05)
+    monkeypatch.setattr(prober_mod, "_PROBE_LOCK_WAIT_S", 0.05)
 
     with bus_mod.KVASER_ENUM_LOCK, pytest.raises(RuntimeError, match="Kvaser driver busy"):
         prober_mod._detect_configs("kvaser")
     assert enumerated == []
 
 
-def test_detect_gs_usb_lists_scanned_adapters_without_opening_them(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    """One config per scanned adapter, by index. The fakes have no attributes,
-    so reading a descriptor (which opens the device) would raise."""
+def test_gs_usb_probe_reports_the_driver_busy_while_a_bus_opens(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """Its serial reads would make that open fail, so it waits, but gives up
+    before the backend timeout."""
     import libusb_package
     from gs_usb.gs_usb import GsUsb
 
+    from ithildin.core.gs_usb_bus import GS_USB_LOCK
+
+    scanned: list[bool] = []
     monkeypatch.setattr(libusb_package, "get_libusb1_backend", lambda: None)
-    monkeypatch.setattr(GsUsb, "scan", staticmethod(lambda: [object(), object()]))
+    monkeypatch.setattr(GsUsb, "scan", staticmethod(lambda: scanned.append(True) or []))
+    monkeypatch.setattr(prober_mod, "_PROBE_LOCK_WAIT_S", 0.05)
+
+    with GS_USB_LOCK, pytest.raises(RuntimeError, match="gs_usb driver busy"):
+        prober_mod._detect_gs_usb()
+    assert scanned == []
+
+
+class _ScannedGsUsb:
+    """A scanned gs_usb adapter whose serial read opens the device, as
+    pyusb's does; ``held`` makes it fail like WinUSB with the adapter open
+    elsewhere."""
+
+    def __init__(self, serial: str, *, held: bool = False) -> None:
+        self._serial = serial
+        self.held = held
+        self.gs_usb = self
+        self.open = False
+
+    @property
+    def serial_number(self) -> str:
+        import usb.core
+
+        if self.held:
+            raise usb.core.USBError("Access denied (insufficient permissions)", -3, 13)
+        self.open = True
+        return self._serial
+
+
+def test_detect_gs_usb_reads_each_serial_and_lets_go_of_the_adapter(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """One config per scanned adapter, by index, with its serial; an adapter a
+    bus holds open has none. Every handle the reads opened is released."""
+    import libusb_package
+    import usb.util
+    from gs_usb.gs_usb import GsUsb
+
+    adapters = [_ScannedGsUsb("206C3EA1"), _ScannedGsUsb("0045003C", held=True)]
+    monkeypatch.setattr(libusb_package, "get_libusb1_backend", lambda: None)
+    monkeypatch.setattr(GsUsb, "scan", staticmethod(lambda: adapters))
+    monkeypatch.setattr(usb.util, "dispose_resources", lambda dev: setattr(dev, "open", False))
     assert prober_mod._detect_gs_usb() == [
-        {"interface": "gs_usb", "channel": 0},
-        {"interface": "gs_usb", "channel": 1},
+        {"interface": "gs_usb", "channel": 0, "serial": "206C3EA1"},
+        {"interface": "gs_usb", "channel": 1, "serial": None},
     ]
+    assert [a.open for a in adapters] == [False, False]
 
 
 def test_gs_usb_is_scanned_on_windows_only(monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -396,3 +439,44 @@ def test_hung_probe_helper_is_daemon(qtbot) -> None:  # type: ignore[no-untyped-
         assert helper.daemon
     finally:
         release.set()
+
+
+def test_skipped_backend_is_not_probed(qtbot) -> None:  # type: ignore[no-untyped-def]
+    """A backend an earlier probe timed out on still has a hung thread:
+    probing it again would hang another."""
+    probed: list[str] = []
+    done: list[str] = []
+
+    def record(backend: str) -> list[dict[str, object]]:
+        probed.append(backend)
+        return []
+
+    p = AdapterProber(skip_backends=frozenset({"pcan"}))
+    p.backend_done.connect(done.append)
+    with patch.object(prober_mod, "_detect_configs", record):
+        with qtbot.waitSignal(p.finished, timeout=2000):
+            p.run()
+
+    assert "pcan" not in probed and "pcan" not in done
+    assert "kvaser" in probed and "kvaser" in done
+
+
+def test_two_ixxat_devices_each_get_their_channel_0(qtbot) -> None:  # type: ignore[no-untyped-def]
+    found: list[AdapterChoice] = []
+    p = AdapterProber()
+    p.adapter_found.connect(found.append)
+
+    behaviours = {
+        "ixxat": [
+            {"interface": "ixxat", "channel": 0, "unique_hardware_id": "HW100001"},
+            {"interface": "ixxat", "channel": 0, "unique_hardware_id": "HW200002"},
+        ],
+    }
+    with patch.object(prober_mod, "_detect_configs", _stub_per_backend(behaviours)):
+        with qtbot.waitSignal(p.finished, timeout=2000):
+            p.run()
+
+    assert [(a.channel, a.hw_id) for a in found if a.interface == "ixxat"] == [
+        (0, "HW100001"),
+        (0, "HW200002"),
+    ]

@@ -5,7 +5,7 @@
 python-can's ``GsUsbBus`` has no listen-only mode, never notices an
 unplugged adapter and stamps frames with the adapter's own microsecond
 counter instead of epoch time. :class:`GsUsbBus` fixes those and adds a TX
-flush.
+flush and opening an adapter by its USB serial.
 
 ``core.bus`` imports this module on the capture thread only: pyusb and the
 bundled libusb are vendor work the GUI thread must not do.
@@ -14,6 +14,7 @@ bundled libusb are vendor work the GUI thread must not do.
 from __future__ import annotations
 
 import contextlib
+import threading
 import time
 
 import can
@@ -24,6 +25,8 @@ import usb.util
 from gs_usb.constants import GS_CAN_MODE_HW_TIMESTAMP, GS_CAN_MODE_LISTEN_ONLY, GS_CAN_MODE_NORMAL
 from gs_usb.gs_usb import GsUsb
 
+from ithildin.core.bus import ADAPTER_NOT_ATTACHED
+
 _PROBE_INTERVAL_S = 1.0
 """How often a silent bus asks the adapter whether it is still there."""
 
@@ -33,26 +36,40 @@ _WRAP_S = 2**32 / 1e6
 _MIN_READ_S = 0.001
 
 
-class GsUsbBus(can.interfaces.gs_usb.GsUsbBus):
-    """A gs_usb adapter, by its index in ``GsUsb.scan()``.
+GS_USB_LOCK = threading.Lock()
+"""Held while opening a bus and while the prober reads serials. Both open
+adapters other than their own (a pinned open reads every serial), and WinUSB
+grants an adapter to one handle at a time: an open that collides with
+another thread's read fails. Wait for it with a timeout."""
 
-    Adds over python-can's bus: listen-only (refused when the firmware
-    lacks it), ``recv`` raising ``CanOperationError("gs_usb adapter lost:
-    …")`` from the ``USBError`` within about a second of an unplug, epoch
-    timestamps, and ``flush_tx_buffer`` as a controller restart.
+
+class GsUsbBus(can.interfaces.gs_usb.GsUsbBus):
+    """A gs_usb adapter, by its USB ``serial`` or else its index in ``GsUsb.scan()``.
+
+    Adds over python-can's bus: opening by serial (the index follows plug
+    order), listen-only (refused when the firmware lacks it), ``recv``
+    raising ``CanOperationError("gs_usb adapter lost: …")`` from the
+    ``USBError`` within about a second of an unplug, epoch timestamps, and
+    ``flush_tx_buffer`` as a controller restart. Construct it holding
+    :data:`GS_USB_LOCK`.
     """
 
-    def __init__(self, channel: int, bitrate: int, listen_only: bool = False) -> None:
+    def __init__(
+        self, channel: int, bitrate: int, listen_only: bool = False, serial: str | None = None
+    ) -> None:
         # Replicates python-can's constructor, whose start() takes no mode:
         # starting there and restarting listen-only would ACK in between.
         # First load the bundled libusb into pyusb; gs_usb's lookups reuse it.
         libusb_package.get_libusb1_backend()
         devs = GsUsb.scan()
-        if channel >= len(devs):
+        if serial is not None:
+            dev = _with_serial(devs, serial)
+        elif channel >= len(devs):
             raise can.CanInitializationError(
                 f"gs_usb adapter {channel} not found ({len(devs)} connected)"
             )
-        dev = devs[channel]
+        else:
+            dev = devs[channel]
         try:
             capability = dev.device_capability
         except NotImplementedError as exc:
@@ -80,7 +97,7 @@ class GsUsbBus(can.interfaces.gs_usb.GsUsbBus):
         dev.set_timing(**self._timing)
         dev.start(self._flags)
         self.gs_usb = dev
-        self.channel_info = f"gs_usb {channel}"
+        self.channel_info = f"gs_usb {serial if serial is not None else channel}"
         self._can_protocol = can.CanProtocol.CAN_20
         self._hw_timestamps = bool(dev.device_flags & GS_CAN_MODE_HW_TIMESTAMP)
         self._ts_offset: float | None = None
@@ -158,3 +175,34 @@ class GsUsbBus(can.interfaces.gs_usb.GsUsbBus):
                 dev.set_timing(**self._timing)
                 dev.start(self._flags)
                 dev.stop()
+
+
+SERIAL_READ_ERRORS = (usb.core.USBError, ValueError, NotImplementedError)
+"""What reading a gs_usb adapter's serial raises when it can't be read: the
+adapter is open elsewhere (WinUSB grants one handle at a time), unplugged,
+or has no WinUSB driver."""
+
+
+def _with_serial(devs: list[GsUsb], serial: str) -> GsUsb:
+    """The one scanned adapter with this USB serial, or ``CanInitializationError``.
+
+    Reads every adapter's serial: clones can share one, and opening the
+    first would bind whichever enumerated first.
+    """
+    found: list[GsUsb] = []
+    for dev in devs:
+        with contextlib.suppress(*SERIAL_READ_ERRORS):
+            if dev.serial_number == serial:
+                found.append(dev)
+                continue
+        # Reading the serial opened the device; another bus may want it.
+        usb.util.dispose_resources(dev.gs_usb)
+    if len(found) == 1:
+        return found[0]
+    for dev in found:
+        usb.util.dispose_resources(dev.gs_usb)
+    if not found:
+        raise can.CanInitializationError(f"its pinned gs_usb adapter {ADAPTER_NOT_ATTACHED}")
+    raise can.CanInitializationError(
+        f"{len(found)} adapters report the identity this bus is pinned to"
+    )

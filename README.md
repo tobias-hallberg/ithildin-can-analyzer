@@ -42,6 +42,13 @@ What works today:
   mode is an OS-level `ip link` property) and IXXAT (the VCI wrapper
   hardcodes its opmode) expose no python-can kwarg for it, so that
   combination is rejected rather than left ACKing on the wire.
+- **Hot-plug** — a bus is pinned to the adapter it was created on (PCAN
+  device ID, Kvaser or IXXAT serial, `gs_usb` USB serial) and finds it
+  again in whichever port it is plugged into. The Buses panel rescans when
+  a device comes or goes on Windows (or on **↻**), shows a failed bus with
+  its reason, and connects or disconnects a bus from a click on its status
+  dot. A replugged adapter is announced but never reconnected by itself.
+  Pins are yours: they live in `~/.ithildin/<project>/`, not in the `.itp`.
 - **DBC decode** via `cantools`. Add a `.dbc` to a bus with **+ DBC** in
   the Buses panel (or pick it while creating the bus) and its signals +
   messages appear in the left dock, draggable onto views.
@@ -126,6 +133,9 @@ the one matching your adapter:
 
 - **PEAK** (PCAN-USB, PCAN-PCI, …) — driver setup from
   [peak-system.com](https://www.peak-system.com/Drivers.523.0.html).
+  Give each PCAN adapter its own device ID in PCAN-View so a bus can be
+  pinned to it: adapters left at the factory ID can't be told apart once
+  they are replugged in another order.
 - **Kvaser** (Leaf, USBcan, …) —
   [kvaser.com/download](https://www.kvaser.com/download/).
 - **CANable / CANtact / candleLight** (`gs_usb` firmware) — on Windows

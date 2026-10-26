@@ -32,7 +32,7 @@ from PySide6.QtCore import QDeadlineTimer, QMetaMethod, QObject, QTimer, Signal,
 from ithildin.core.bus import BusController, BusWorker
 from ithildin.core.ringbuf import RingBuffer
 from ithildin.core.types import BusHealth, FrameRecord
-from ithildin.workspace.schema import BusConfig
+from ithildin.workspace.schema import BusConfig, channel_keys
 
 _log = logging.getLogger(__name__)
 
@@ -68,7 +68,7 @@ class BusReader(QObject):
     bus_stopped = Signal(str)
     # Fires only when the worker died on its own (hardware unplug,
     # backend error), just before bus_stopped. Carries the last error
-    # message. Explicit close() never triggers this.
+    # message, which failures() keeps. Explicit close() never triggers this.
     bus_failed = Signal(str, str)  # bus_name, error_message
     # A bus whose close timed out has finally let go of its adapter; the
     # name and channel can be opened again.
@@ -97,6 +97,9 @@ class BusReader(QObject):
         # Most recent error per bus, captured between open() and the
         # worker's stopped signal. Drives the bus_failed dispatch.
         self._last_errors: dict[str, str] = {}
+        # Buses whose worker died on its own, in failure order, with the
+        # error; until they are opened again or forgotten.
+        self._failures: dict[str, str] = {}
         # Health per bus: set to OK on bus_started, absent while opening.
         # LOST outlives the failure that follows it, so the UI can say why
         # the bus went away; open(), close(name) and forget() clear it.
@@ -204,6 +207,11 @@ class BusReader(QObject):
         """
         return self._health.get(name)
 
+    def failures(self) -> dict[str, str]:
+        """``{bus_name: error}`` for every bus that failed and wasn't opened
+        again or forgotten since, oldest failure first."""
+        return dict(self._failures)
+
     @property
     def session_t0(self) -> float | None:
         """Epoch second of the first frame in the current capture session.
@@ -226,17 +234,19 @@ class BusReader(QObject):
         name, ``open`` is a no-op (it does not reconfigure on the fly).
         Caller must ``close(name)`` first if they want to reopen with a
         different ``BusConfig``. Refused, with ``error``, while a bus of
-        that name or on that channel is still closing. Starts a new capture
+        that name or on that channel or adapter (``schema.channel_keys``) is
+        still closing. Starts a new capture
         session (``session_t0_changed(None)``) when the last one ended.
         """
         name = config.name
         if name in self._controllers:
             return
+        keys = channel_keys(config.interface, config.channel, config.hw_id)
         holder = next(
             (
                 n
                 for n, (_controller, c) in self._retiring.items()
-                if n == name or (c.interface, c.channel) == (config.interface, config.channel)
+                if n == name or not keys.isdisjoint(channel_keys(c.interface, c.channel, c.hw_id))
             ),
             None,
         )
@@ -245,8 +255,8 @@ class BusReader(QObject):
                 reason = f"Bus {name!r} is still closing: its adapter has not released the channel"
             else:
                 reason = (
-                    f"Bus {name!r} can't open: bus {holder!r} on the same channel is still "
-                    "closing and its adapter has not released the channel"
+                    f"Bus {name!r} can't open: bus {holder!r} on the same channel or adapter "
+                    "is still closing and its adapter has not released the channel"
                 )
             self.error.emit(f"{reason} yet. Try again once it has, or unplug the adapter.")
             return
@@ -272,6 +282,7 @@ class BusReader(QObject):
         self._cursors[name] = -1
         self._last_configs[name] = config
         self._last_errors.pop(name, None)
+        self._failures.pop(name, None)
         self._health.pop(name, None)
         controller.start()
         if not self._timer.isActive():
@@ -356,13 +367,14 @@ class BusReader(QObject):
     def forget(self, name: str | None = None) -> None:
         """Drop what is remembered about a closed bus, or about every bus when
         ``name`` is ``None``: the config that Reconnect and the project
-        snapshot reuse, and a held LOST health. For buses that left the
-        project; call after :meth:`close`.
+        snapshot reuse, a held LOST health and a failure. For buses that
+        left the project; call after :meth:`close`.
         """
         names = list(self._last_configs) if name is None else [name]
         for n in names:
             self._last_configs.pop(n, None)
             self._health.pop(n, None)
+            self._failures.pop(n, None)
 
     def _drop(self, name: str) -> str | None:
         """Unregister a running bus; returns its last error, if any."""
@@ -421,6 +433,7 @@ class BusReader(QObject):
             del self._health[name]
         last_error = self._drop(name)
         if last_error is not None:
+            self._failures[name] = last_error
             self.bus_failed.emit(name, last_error)
         self.bus_stopped.emit(name)
 

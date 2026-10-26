@@ -143,16 +143,16 @@ def test_pcan_available_channel_is_free() -> None:
 
 
 def test_unknown_backend_degrades_to_default() -> None:
-    devices = enrich("ixxat", [{"interface": "ixxat", "channel": "0"}])
+    devices = enrich("socketcan", [{"interface": "socketcan", "channel": "can0"}])
     assert len(devices) == 1
     dev = devices[0]
-    assert dev.vendor == "IXXAT"
+    assert dev.vendor == "Linux SocketCAN"
     assert dev.serial is None
     assert dev.firmware is None
     # Default enricher probes nothing beyond interface + channel.
     assert dev.status is None
     assert dev.capabilities is None
-    assert [c.channel for c in dev.channels] == ["0"]
+    assert [(c.channel, c.hw_id) for c in dev.channels] == [("can0", None)]
 
 
 def test_missing_optional_keys_do_not_raise() -> None:
@@ -169,11 +169,14 @@ def test_config_with_bad_channel_type_is_skipped() -> None:
 
 
 def test_gs_usb_one_device_per_adapter() -> None:
-    """The scan reads no descriptors, so the index keeps two identical
-    adapters apart (the dialog de-duplicates devices by ``key``)."""
+    """Without serials the index keeps two identical adapters apart (the
+    dialog de-duplicates devices by ``key``)."""
     devices = enrich(
         "gs_usb",
-        [{"interface": "gs_usb", "channel": 0}, {"interface": "gs_usb", "channel": 1}],
+        [
+            {"interface": "gs_usb", "channel": 0, "serial": None},
+            {"interface": "gs_usb", "channel": 1, "serial": None},
+        ],
     )
     assert len({d.key for d in devices}) == 2
     assert [d.vendor for d in devices] == ["candleLight", "candleLight"]
@@ -183,3 +186,100 @@ def test_gs_usb_one_device_per_adapter() -> None:
     ]
     assert all(d.transport == "USB" for d in devices)
     assert all(d.status is None and d.capabilities is None for d in devices)
+
+
+# ---- Adapter identity ----
+
+
+def test_two_ixxat_devices_with_a_channel_0_each_stay_apart() -> None:
+    """Each device numbers its channels from 0: the hardware id tells them apart."""
+    devices = enrich(
+        "ixxat",
+        [
+            {"interface": "ixxat", "channel": 0, "unique_hardware_id": "HW100001"},
+            {"interface": "ixxat", "channel": 1, "unique_hardware_id": "HW100001"},
+            {"interface": "ixxat", "channel": 0, "unique_hardware_id": "HW200002"},
+        ],
+    )
+    assert [(d.serial, [(c.channel, c.label, c.hw_id) for c in d.channels]) for d in devices] == [
+        ("HW100001", [(0, "ch0", "HW100001"), (1, "ch1", "HW100001")]),
+        ("HW200002", [(0, "ch0", "HW200002")]),
+    ]
+    assert len({d.key for d in devices}) == 2
+
+
+def test_pcan_channels_carry_device_id_and_controller() -> None:
+    devices = enrich(
+        "pcan",
+        [
+            {
+                "interface": "pcan",
+                "channel": "PCAN_USBBUS1",
+                "device_id": 0x2A,
+                "controller_number": 0,
+                "device_name": "PCAN-USB",
+            },
+        ],
+    )
+    assert devices[0].channels[0].hw_id == "0000002a.0"
+    assert devices[0].display_label == "PEAK-System · PCAN-USB  (device ID 0x2A)"
+
+
+def test_pcan_factory_default_device_id_identifies_nothing() -> None:
+    devices = enrich(
+        "pcan",
+        [
+            {
+                "interface": "pcan",
+                "channel": "PCAN_USBBUS1",
+                "device_id": 0xFF,
+                "controller_number": 0,
+                "device_name": "PCAN-USB",
+            },
+        ],
+    )
+    assert devices[0].channels[0].hw_id is None
+    assert devices[0].serial is None
+    assert devices[0].display_label == "PEAK-System · PCAN-USB"
+
+
+def test_an_id_two_channels_share_is_dropped() -> None:
+    """Two PCAN-USBs given the same device ID: neither can be pinned."""
+    devices = enrich(
+        "pcan",
+        [
+            {
+                "interface": "pcan",
+                "channel": "PCAN_USBBUS1",
+                "device_id": 5,
+                "controller_number": 0,
+            },
+            {
+                "interface": "pcan",
+                "channel": "PCAN_USBBUS2",
+                "device_id": 5,
+                "controller_number": 0,
+            },
+            {
+                "interface": "pcan",
+                "channel": "PCAN_USBBUS3",
+                "device_id": 6,
+                "controller_number": 0,
+            },
+        ],
+    )
+    ids = {c.channel: c.hw_id for d in devices for c in d.channels}
+    assert ids == {"PCAN_USBBUS1": None, "PCAN_USBBUS2": None, "PCAN_USBBUS3": "00000006.0"}
+
+
+def test_gs_usb_serial_identifies_the_adapter_unless_a_clone_shares_it() -> None:
+    devices = enrich(
+        "gs_usb",
+        [
+            {"interface": "gs_usb", "channel": 0, "serial": "CLONE"},
+            {"interface": "gs_usb", "channel": 1, "serial": "CLONE"},
+            {"interface": "gs_usb", "channel": 2, "serial": "206C3EA1"},
+        ],
+    )
+    assert [d.channels[0].hw_id for d in devices] == [None, None, "206C3EA1"]
+    assert len({d.key for d in devices}) == 3

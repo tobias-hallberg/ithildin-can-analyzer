@@ -321,7 +321,7 @@ def test_kvaser_open_fails_as_busy_while_the_lock_stays_held(qapp, monkeypatch) 
     """A probe or open hung in the driver keeps the lock: a later open fails
     instead of queueing behind it for good."""
     spy = _KvaserOpenSpy(monkeypatch)
-    monkeypatch.setattr(bus_mod, "_KVASER_OPEN_WAIT_S", 0.3)
+    monkeypatch.setattr(bus_mod, "_OPEN_LOCK_WAIT_S", 0.3)
 
     with KVASER_ENUM_LOCK, pytest.raises(can.CanInitializationError, match="Kvaser driver busy"):
         _kvaser_worker(bitrate=500_000)._open_bus()

@@ -23,7 +23,6 @@ list shows a "connect a device and rescan" hint instead.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
 from itertools import pairwise
 
 from pydantic import ValidationError
@@ -55,7 +54,12 @@ from ithildin.ui.fonts import tabular_font
 from ithildin.ui.icons import themed_icon
 from ithildin.ui.pill_toggle import IthildinPillToggle
 from ithildin.ui.theme import ThemeManager
-from ithildin.workspace.schema import LISTEN_ONLY_INTERFACES, BusConfig
+from ithildin.workspace.schema import (
+    LISTEN_ONLY_INTERFACES,
+    BusConfig,
+    ChannelKey,
+    channel_keys,
+)
 
 __all__ = ["CreateCanBusDialog"]
 
@@ -202,7 +206,8 @@ class CreateCanBusDialog(QDialog):
         self,
         *,
         existing_names: set[str],
-        existing_channels: Iterable[tuple[str, str | int]] = (),
+        existing_keys: frozenset[ChannelKey] = frozenset(),
+        hung_backends: set[str] | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -210,7 +215,11 @@ class CreateCanBusDialog(QDialog):
         w, h = self.DEFAULT_SIZE
         self.resize(w, h)
         self._existing = set(existing_names)
-        self._existing_channels = {(i, str(c)) for i, c in existing_channels}
+        # ``schema.channel_keys`` of every declared bus.
+        self._existing_keys = existing_keys
+        # The dock's set, shared: a backend either prober timed out on is
+        # skipped by both from then on.
+        self._hung_backends = hung_backends if hung_backends is not None else set()
         self._devices: list[DeviceInfo] = []
         self._channel: ChannelInfo | None = None
         self._name_edited = False
@@ -373,19 +382,20 @@ class CreateCanBusDialog(QDialog):
         self._device_combo.clear()
         self._seed_devices()
         self._refresh_empty_state()
-        self._prober = AdapterProber()
+        self._prober = AdapterProber(skip_backends=frozenset(self._hung_backends))
         self._prober_thread = QThread()
         self._prober.moveToThread(self._prober_thread)
         self._prober_thread.started.connect(self._prober.run)
         self._prober.device_found.connect(self._on_device_found)
+        self._prober.backend_failed.connect(self._on_backend_failed)
         self._prober.finished.connect(self._on_probe_finished)
         self._prober.finished.connect(self._prober_thread.quit, Qt.ConnectionType.DirectConnection)
         self._prober.finished.connect(self._prober.deleteLater)
         self._prober_thread.finished.connect(self._prober_thread.deleteLater)
-        self._prober_thread.start()
         # Retain across our own lifetime + arm the app-quit join, so a
         # probe still running when this dialog closes can't crash teardown.
         register_prober(self._prober, self._prober_thread)
+        self._prober_thread.start()
 
     def _stop_probe(self) -> None:
         """Detach + cancel our probe when the dialog closes.
@@ -399,6 +409,7 @@ class CreateCanBusDialog(QDialog):
             return
         for signal, slot in (
             (prober.device_found, self._on_device_found),
+            (prober.backend_failed, self._on_backend_failed),
             (prober.finished, self._on_probe_finished),
         ):
             try:
@@ -418,6 +429,10 @@ class CreateCanBusDialog(QDialog):
         if device.interface == "virtual":
             return  # already seeded
         self._add_device(device)
+
+    def _on_backend_failed(self, backend: str, reason: str) -> None:
+        if reason == "timeout":
+            self._hung_backends.add(backend)
 
     def _on_probe_finished(self) -> None:
         self._prober = None
@@ -500,7 +515,7 @@ class CreateCanBusDialog(QDialog):
             if w is not None:
                 w.setParent(None)
 
-        taken = [self._channel_taken(device.interface, ch.channel) for ch in device.channels]
+        taken = [self._channel_taken(device.interface, ch) for ch in device.channels]
         # A single-channel device normally hides the row; reveal it when its
         # sole channel is unavailable so the greyed pill explains why Create
         # is disabled.
@@ -562,8 +577,9 @@ class CreateCanBusDialog(QDialog):
 
     # -- validation ---------------------------------------------------------
 
-    def _channel_taken(self, interface: str, channel: str | int) -> bool:
-        return (interface, str(channel)) in self._existing_channels
+    def _channel_taken(self, interface: str, channel: ChannelInfo) -> bool:
+        keys = channel_keys(interface, channel.channel, channel.hw_id)
+        return not keys.isdisjoint(self._existing_keys)
 
     def _name_problem(self) -> str | None:
         name = self._name_edit.text().strip()
@@ -621,6 +637,7 @@ class CreateCanBusDialog(QDialog):
                 fd=False,
                 listen_only=self._listen_only.is_on(),
                 connect_on_startup=self._startup_row.toggle.isChecked(),
+                hw_id=self._channel.hw_id,
             )
         except ValidationError as exc:
             self._name_error.show_message(_first_error_message(exc), kind="error")

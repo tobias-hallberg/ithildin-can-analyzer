@@ -11,11 +11,13 @@ Spec: handoff §4.
                   Drag source for ``SignalPayload``.
     Messages    — list of `(0xID · name · DLC · period)`.
                   Drag source for ``MessagePayload``.
-    Buses       — declared buses with bound DBCs as child rows; live
-                  ones get a filled dot. Two header actions:
-                    ``bus_plus`` (Add bus…)
-                    ``database_plus`` (Add database to selected bus…,
-                    disabled until a bus is selected).
+    Buses       — declared buses with bound DBCs as child rows; each
+                  row's status dot shows its state and connects or
+                  disconnects it on a click. Three header actions:
+                    ``+ Bus`` (Add bus…)
+                    ``+ DBC`` (Add database to selected bus…,
+                    disabled until a bus is selected)
+                    ``↻`` (Rescan adapters).
 - Footer hint: "Drag onto a view button or open tab".
 
 Implemented as a single ``QWidget`` containing a ``QVBoxLayout`` of
@@ -30,6 +32,7 @@ from typing import TYPE_CHECKING, Literal
 
 from PySide6.QtCore import (
     QAbstractListModel,
+    QItemSelectionModel,
     QMimeData,
     QModelIndex,
     QPersistentModelIndex,
@@ -39,6 +42,7 @@ from PySide6.QtCore import (
     Qt,
     QThread,
     Signal,
+    SignalInstance,
 )
 from PySide6.QtGui import (
     QAction,
@@ -47,6 +51,7 @@ from PySide6.QtGui import (
     QDragMoveEvent,
     QDropEvent,
     QFont,
+    QMouseEvent,
     QStandardItem,
     QStandardItemModel,
 )
@@ -64,6 +69,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ithildin.core.bus import ADAPTER_NOT_ATTACHED
 from ithildin.core.decoder import Decoder
 from ithildin.core.types import BusHealth
 from ithildin.ui._drag_payload import (
@@ -81,7 +87,7 @@ from ithildin.ui.collapsible_section import HEADER_BAND_HEIGHT, CollapsibleSecti
 from ithildin.ui.dbc_loader import DbcLoader
 from ithildin.ui.icons import icon, themed_callback, themed_icon
 from ithildin.ui.theme import ThemeManager
-from ithildin.workspace.schema import DbcRef
+from ithildin.workspace.schema import BusConfig, DbcRef, channel_key, channel_keys
 
 if TYPE_CHECKING:
     from ithildin.app_state.context import AppContext
@@ -244,6 +250,7 @@ LiveState = Literal[
     "errors",
     "bus_off",
     "lost",
+    "failed",
     "closing",
     "stopped",
     "available",
@@ -256,12 +263,14 @@ LiveState = Literal[
 - ``errors`` / ``bus_off`` — capturing, but the bus is degraded.
 - ``lost`` — the adapter went away; holds until the bus is opened or
   closed again.
+- ``failed`` — the worker died on its own (``BusReader.failures()``), the
+  reason in the tooltip; holds until the bus is opened again.
 - ``closing`` — Disconnect timed out: the driver has not released the
   channel, and connecting is refused until it does.
-- ``stopped`` — this bus was opened earlier in this session but its
-  worker has exited (user disconnect, or hardware unplug / error).
-- ``available`` — a detected adapter matches this row's
-  ``(interface, channel)``; never opened in this session.
+- ``stopped`` — this bus was opened earlier in this session and the user
+  closed it.
+- ``available`` — a detected adapter matches this row
+  (``schema.channel_key``); never opened in this session.
 - ``unavailable`` — declared bus has no matching detected adapter.
 """
 
@@ -271,11 +280,15 @@ _DOT_FOR_STATE: dict[LiveState, str] = {
     "errors": "▲",
     "bus_off": "■",
     "lost": "✕",
+    "failed": "⊗",
     "closing": "◐",
     "stopped": "◌",
     "available": "○",
     "unavailable": "⊘",
 }
+
+_RUNNING_STATES: frozenset[LiveState] = frozenset({"live", "opening", "errors", "bus_off"})
+_WAITING_STATES: frozenset[LiveState] = frozenset({"lost", "failed"})
 
 _STATE_FOR_HEALTH: dict[BusHealth, LiveState] = {
     BusHealth.OK: "live",
@@ -298,6 +311,8 @@ _STATE_HINTS: dict[LiveState, tuple[str, str | None]] = {
         "err",
     ),
     "lost": ("Adapter lost — plug it back in, then connect the bus again.", "err"),
+    # The failure itself says what failed.
+    "failed": ("", "err"),
     "closing": (
         "Closing — the adapter has not released the channel yet. "
         "Connecting is refused until it does.",
@@ -309,6 +324,9 @@ _STATE_HINTS: dict[LiveState, tuple[str, str | None]] = {
 _BUS_ROW_ROLE = Qt.ItemDataRole.UserRole + 1
 _DBC_PATH_ROLE = Qt.ItemDataRole.UserRole + 2
 
+_GLYPH_HIT_PX = 24
+"""Width of the status dot's click zone, from the row's left edge."""
+
 
 class _BusRow:
     """Lightweight container for a bus row's metadata.
@@ -316,14 +334,18 @@ class _BusRow:
     Stored on each top-level ``QStandardItem`` via ``setData`` so the
     drop handler and context-menu builder can recover the bus name,
     matching adapter info, and droppability without text parsing.
+    ``detail`` adds tooltip lines (a failure's reason, an adapter back);
+    ``pin_label`` is the context menu's "Pin to …" text, when one is offered.
     """
 
     __slots__ = (
         "accepts_drops",
         "bus_name",
         "channel",
+        "detail",
         "interface",
         "listen_only",
+        "pin_label",
         "state",
     )
 
@@ -335,6 +357,8 @@ class _BusRow:
         state: LiveState,
         accepts_drops: bool,
         listen_only: bool = False,
+        detail: str = "",
+        pin_label: str | None = None,
     ) -> None:
         self.bus_name = bus_name
         self.interface = interface
@@ -342,6 +366,20 @@ class _BusRow:
         self.state = state
         self.accepts_drops = accepts_drops
         self.listen_only = listen_only
+        self.detail = detail
+        self.pin_label = pin_label
+
+
+def _pin_label(adapter: AdapterChoice) -> str:
+    """The "Pin to …" menu text, in the device's own words."""
+    device = adapter.device
+    if device is None:
+        return f"Pin to {adapter.interface} {adapter.channel}"
+    channel = next(
+        (ch.label for ch in device.channels if ch.channel == adapter.channel),
+        str(adapter.channel),
+    )
+    return f"Pin to {device.display_label} {channel}"
 
 
 def _format_bus_label(row: _BusRow) -> str:
@@ -408,6 +446,11 @@ class BusTreeView(QTreeView):
     Right-click on a child DBC row exposes "Unbind from <bus>" which
     emits ``unbind_requested(path, bus_name)``.
 
+    A bus row's status dot is its Connect / Disconnect control: a click
+    within ``_GLYPH_HIT_PX`` of the row's left edge emits
+    ``connect_requested`` or ``disconnect_requested`` by state. The right-
+    click menu offers the same plus Reconnect and Pin.
+
     Per-bus expand state is tracked by name across model rebuilds so
     loading another DBC (which triggers a refresh) doesn't snap
     collapsed buses back open.
@@ -417,6 +460,10 @@ class BusTreeView(QTreeView):
     unbind_requested = Signal(object, str)  # (Path, bus_name)
     remove_bus_requested = Signal(str)  # bus_name
     signal_centric_toggled = Signal(object, bool)  # (Path, new_value)
+    # Open the bus, or reopen it when it is running (a degraded bus).
+    connect_requested = Signal(str)  # bus_name
+    disconnect_requested = Signal(str)  # bus_name
+    pin_requested = Signal(str)  # bus_name
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -434,6 +481,8 @@ class BusTreeView(QTreeView):
         self.setDragDropMode(QAbstractItemView.DragDropMode.DragDrop)
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self._on_context_menu)
+        # For the hand cursor over a status dot.
+        self.setMouseTracking(True)
 
         # Names of buses the user has explicitly collapsed. Survives
         # model rebuilds — see ``set_rows``.
@@ -442,6 +491,8 @@ class BusTreeView(QTreeView):
         self.collapsed.connect(self._on_index_collapsed)
 
         self._signal_centric_getter: Callable[[Path], bool] | None = None
+        # Bus whose status dot the left button went down on.
+        self._glyph_pressed: str | None = None
 
     def set_signal_centric_getter(self, getter: Callable[[Path], bool] | None) -> None:
         """Provide a callback the context menu uses to show current state.
@@ -456,7 +507,12 @@ class BusTreeView(QTreeView):
     # ---- Public API ----
 
     def set_rows(self, rows: list[tuple[_BusRow, list[Path]]]) -> None:
-        """Repopulate the tree from a flat list of (bus, dbcs) pairs."""
+        """Repopulate the tree from a flat list of (bus, dbcs) pairs.
+
+        Keeps the selected bus or DBC row selected: every adapter rescan
+        rebuilds the tree, and must not take the "+ DBC" target away.
+        """
+        selected = self._selected_row()
         self._tree_model.removeRows(0, self._tree_model.rowCount())
         tokens = ThemeManager.instance().current_tokens()
         for bus, dbc_paths in rows:
@@ -467,13 +523,19 @@ class BusTreeView(QTreeView):
             hint = _STATE_HINTS.get(bus.state)
             if hint is not None:
                 tip, tint = hint
-                tips.append(tip)
+                if tip:
+                    tips.append(tip)
                 if tint is not None:
                     parent_item.setForeground(QColor(tokens[tint]))
+            if bus.detail:
+                tips.append(bus.detail)
             if bus.listen_only:
                 tips.append("Listen only — this bus cannot transmit.")
-            if tips:
-                parent_item.setToolTip("\n".join(tips))
+            if bus.state in _RUNNING_STATES:
+                tips.append("Click the dot to disconnect.")
+            elif bus.state != "closing":
+                tips.append("Click the dot to connect.")
+            parent_item.setToolTip("\n".join(tips))
             for path in dbc_paths:
                 child = QStandardItem(path.name)
                 child.setData(path, _DBC_PATH_ROLE)
@@ -491,6 +553,38 @@ class BusTreeView(QTreeView):
                 self.collapse(idx)
             else:
                 self.expand(idx)
+
+        if selected is not None:
+            index = self._index_for_row(*selected)
+            if index is not None:
+                # Not setCurrentIndex: that scrolls to the row on every rescan.
+                self.selectionModel().select(
+                    index, QItemSelectionModel.SelectionFlag.ClearAndSelect
+                )
+
+    def _selected_row(self) -> tuple[str, Path | None] | None:
+        """The selected row as (bus name, DBC path or ``None`` for the bus row)."""
+        selection = self.selectionModel().selectedIndexes()
+        if not selection:
+            return None
+        index = selection[0]
+        if index.parent().isValid():
+            bus = index.parent().data(_BUS_ROW_ROLE)
+            path = index.data(_DBC_PATH_ROLE)
+        else:
+            bus = index.data(_BUS_ROW_ROLE)
+            path = None
+        return (bus.bus_name, path) if isinstance(bus, _BusRow) else None
+
+    def _index_for_row(self, bus_name: str, path: Path | None) -> QModelIndex | None:
+        index = self._index_for_bus(bus_name)
+        if index is None or path is None:
+            return index
+        for r in range(self._tree_model.rowCount(index)):
+            child = self._tree_model.index(r, 0, index)
+            if child.data(_DBC_PATH_ROLE) == path:
+                return child
+        return None
 
     def bus_names(self) -> list[str]:
         out: list[str] = []
@@ -568,6 +662,57 @@ class BusTreeView(QTreeView):
             return
         event.ignore()
 
+    # ---- Status dot ----
+
+    def _glyph_bus(self, pos: QPoint) -> _BusRow | None:
+        """The bus whose status dot is under ``pos``, if any."""
+        index = self.indexAt(pos)
+        if not index.isValid() or index.parent().isValid():
+            return None
+        # Left of the item rect is the expand arrow, which indexAt also maps
+        # to the row.
+        if not 0 <= pos.x() - self.visualRect(index).left() < _GLYPH_HIT_PX:
+            return None
+        bus = index.data(_BUS_ROW_ROLE)
+        return bus if isinstance(bus, _BusRow) else None
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        bus = None
+        if event.button() == Qt.MouseButton.LeftButton:
+            bus = self._glyph_bus(event.position().toPoint())
+        self._glyph_pressed = bus.bus_name if bus is not None else None
+        # A press on the dot neither selects the row nor starts a drag.
+        if bus is None:
+            super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        pressed, self._glyph_pressed = self._glyph_pressed, None
+        if pressed is None:
+            super().mouseReleaseEvent(event)
+            return
+        bus = self._glyph_bus(event.position().toPoint())
+        if bus is None or bus.bus_name != pressed:
+            return
+        if bus.state in _RUNNING_STATES:
+            self.disconnect_requested.emit(bus.bus_name)
+        elif bus.state != "closing":
+            self.connect_requested.emit(bus.bus_name)
+
+    def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
+        # A double-click's second press arrives here instead: swallowing it
+        # on the dot leaves its release with no press, so the bus toggles once.
+        if self._glyph_bus(event.position().toPoint()) is None:
+            super().mouseDoubleClickEvent(event)
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        if self._glyph_bus(event.position().toPoint()) is None:
+            self.viewport().unsetCursor()
+        else:
+            self.viewport().setCursor(Qt.CursorShape.PointingHandCursor)
+        # The view never saw a press swallowed on the dot: nothing to drag.
+        if self._glyph_pressed is None:
+            super().mouseMoveEvent(event)
+
     # ---- Context menu ----
 
     def _on_context_menu(self, pos: QPoint) -> None:
@@ -580,8 +725,22 @@ class BusTreeView(QTreeView):
             if not isinstance(bus, _BusRow):
                 return
             menu = QMenu(self)
-            remove_action = menu.addAction(f"Remove {bus.bus_name}")
             bus_name = bus.bus_name
+            actions: list[tuple[str, SignalInstance]] = []
+            if bus.state in ("errors", "bus_off"):
+                actions.append(("Reconnect", self.connect_requested))
+            if bus.state in _RUNNING_STATES:
+                actions.append(("Disconnect", self.disconnect_requested))
+            elif bus.state != "closing":
+                actions.append(("Connect", self.connect_requested))
+            if bus.pin_label is not None:
+                actions.append((bus.pin_label, self.pin_requested))
+            for text, signal in actions:
+                action = menu.addAction(text)
+                action.triggered.connect(lambda _checked=False, s=signal: s.emit(bus_name))
+            if actions:
+                menu.addSeparator()
+            remove_action = menu.addAction(f"Remove {bus.bus_name}")
             remove_action.triggered.connect(
                 lambda _checked=False: self.remove_bus_requested.emit(bus_name)
             )
@@ -653,11 +812,27 @@ class LeftDockWidget(QWidget):
         self._messages_proxy = QSortFilterProxyModel(self)
         self._messages_proxy.setSourceModel(self._messages_model)
         self._messages_proxy.setFilterCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        # Detected adapters, as of each backend's latest probe.
         self._adapter_rows: list[AdapterChoice] = []
+        # Backend failures of the latest probes, timeouts aside.
         self._failed_backends: list[tuple[str, str]] = []
-        self._probe_finished = False
+        # Backends a probe timed out on, skipped by every later probe. Shared
+        # with the Create dialog's prober.
+        self._hung_backends: set[str] = set()
         self._prober: AdapterProber | None = None
         self._prober_thread: QThread | None = None
+        # The probe in flight's results, swapped in one backend at a time,
+        # so a rescan never flashes a bus unavailable.
+        self._probe_rows: list[AdapterChoice] = []
+        self._probe_failures: list[tuple[str, str]] = []
+        self._probe_gen = 0
+        self._rescan_pending = False
+        # Lost or refused buses waiting for their adapter to come back, with
+        # the first probe generation allowed to see it: one started before
+        # the loss may list the adapter from before.
+        self._waiting: dict[str, int] = {}
+        # Buses whose adapter came back; the bus stays down until clicked.
+        self._adapter_back: set[str] = set()
         self._loader: DbcLoader | None = None
         self._loader_thread: QThread | None = None
         # Bus name captured at "Add DBC" click time; carried through the
@@ -683,6 +858,7 @@ class LeftDockWidget(QWidget):
         ctx.bus_reader.bus_stopped.connect(self._on_bus_state_changed)
         ctx.bus_reader.bus_released.connect(self._on_bus_state_changed)
         ctx.bus_reader.bus_health_changed.connect(self._on_bus_health_changed)
+        ctx.bus_reader.bus_failed.connect(self._on_bus_failed)
         if self._bus_tree is not None:
             self._bus_tree.set_signal_centric_getter(ctx.database.is_signal_centric)
         self._refresh_dbc_lists()
@@ -694,9 +870,22 @@ class LeftDockWidget(QWidget):
 
         Separate from ``bind`` so that tests which only care about the
         DBC-driven models don't spawn a worker thread that has to be
-        torn down. ``MainWindow`` calls this once after ``show()``.
+        torn down. ``MainWindow`` calls this once after ``show()``; later
+        probes come from :meth:`rescan_adapters`.
         """
-        self._start_prober()
+        self.rescan_adapters()
+
+    def rescan_adapters(self) -> None:
+        """Probe the adapters again: a device came or went, or the user asked.
+
+        Requests while a probe runs merge into one more probe after it.
+        Never opens a bus: an adapter coming back only offers its bus a
+        reconnect.
+        """
+        if self._prober is not None:
+            self._rescan_pending = True
+        else:
+            self._start_prober()
 
     # ---- Persistence ----
     #
@@ -868,6 +1057,9 @@ class LeftDockWidget(QWidget):
         self._bus_tree.unbind_requested.connect(self._on_unbind)
         self._bus_tree.remove_bus_requested.connect(self._on_remove_bus)
         self._bus_tree.signal_centric_toggled.connect(self._on_signal_centric_toggled)
+        self._bus_tree.connect_requested.connect(self._on_connect_requested)
+        self._bus_tree.disconnect_requested.connect(self._on_disconnect_requested)
+        self._bus_tree.pin_requested.connect(self._on_pin_requested)
         sel_model = self._bus_tree.selectionModel()
         sel_model.selectionChanged.connect(self._on_bus_selection_changed)
         buses_inner_layout.addWidget(self._bus_tree)
@@ -910,6 +1102,13 @@ class LeftDockWidget(QWidget):
             callback=self._on_load_dbc,
         )
         self._dbc_load_btn.setEnabled(False)
+        # Linux has no device-change hook, and Windows drops the event
+        # while the GUI thread is blocked.
+        self._rescan_btn = self._buses_section.add_header_action(
+            text="↻",
+            tooltip="Rescan adapters",
+            callback=self.rescan_adapters,
+        )
 
         # User-resizable stack: the three sections live in a vertical
         # splitter so the user can drag handles to allocate space
@@ -1057,9 +1256,7 @@ class LeftDockWidget(QWidget):
         bus_reader = self._ctx.bus_reader
         live_names = set(bus_reader.bus_names())
         ever_opened = {cfg.name for cfg in bus_reader.last_configs()}
-        detected: dict[tuple[str, object], AdapterChoice] = {
-            (a.interface, a.channel): a for a in self._adapter_rows
-        }
+        failures = bus_reader.failures()
         # Group bound DBCs by bus name so we can render them as child rows.
         dbcs_per_bus: dict[str, list[Path]] = {}
         for path in self._ctx.database.loaded_paths():
@@ -1067,60 +1264,115 @@ class LeftDockWidget(QWidget):
                 dbcs_per_bus.setdefault(bus, []).append(path)
 
         rows: list[tuple[_BusRow, list[Path]]] = []
+        lost_or_failed: set[str] = set()
         for cfg in project.workspace.bus:
             state: LiveState
             health = bus_reader.health(cfg.name)
+            detected = self._detected_for(cfg)
+            details: list[str] = []
             if cfg.name in live_names:
                 state = "opening" if health is None else _STATE_FOR_HEALTH[health[0]]
             elif bus_reader.is_closing(cfg.name):
                 state = "closing"
             elif health is not None and health[0] is BusHealth.LOST:
                 state = "lost"
+            elif cfg.name in failures:
+                state = "failed"
+                details.append(failures[cfg.name])
             elif cfg.name in ever_opened:
                 state = "stopped"
-            elif (cfg.interface, cfg.channel) in detected:
+            elif detected is not None:
                 state = "available"
             else:
                 state = "unavailable"
+            if state in _WAITING_STATES:
+                lost_or_failed.add(cfg.name)
+                if cfg.name in self._adapter_back:
+                    details.append("Adapter is back — click the dot to reconnect.")
+            pin = self._pin_candidate(cfg) if state not in _RUNNING_STATES else None
             rows.append(
                 (
                     _BusRow(
                         bus_name=cfg.name,
                         interface=cfg.interface,
-                        channel=cfg.channel,
+                        # Where the adapter is now: a pinned one may have moved.
+                        channel=detected.channel if detected is not None else cfg.channel,
                         state=state,
                         accepts_drops=True,
                         listen_only=cfg.listen_only,
+                        detail="\n".join(details),
+                        pin_label=_pin_label(pin) if pin is not None else None,
                     ),
                     sorted(dbcs_per_bus.get(cfg.name, []), key=lambda p: p.name),
                 )
             )
+        # Opened, closed, forgotten or gone from the project: nothing to wait for.
+        self._waiting = {n: g for n, g in self._waiting.items() if n in lost_or_failed}
+        self._adapter_back &= lost_or_failed
 
         tree.set_rows(rows)
         tree.setVisible(bool(rows))
         self._buses_hint.setVisible(not rows)
-        # Tree rebuild wipes selection; re-sync the cached bus name and
-        # the Add-DBC button's enabled state.
+        # The selected bus may be gone; re-sync the cached bus name and the
+        # Add-DBC button's enabled state.
         self._recompute_selected_bus()
 
         # Failed-backends warning footer.
-        if self._failed_backends:
-            text = "  ".join(f"⚠ {name}: {reason}" for name, reason in self._failed_backends)
-            self._failed_backends_label.setText(text)
-            self._failed_backends_label.setVisible(True)
-        else:
-            self._failed_backends_label.setVisible(False)
+        warnings = [f"⚠ {name}: {reason}" for name, reason in self._failed_backends]
+        warnings += [
+            f"⚠ {name}: timed out — restart to retry" for name in sorted(self._hung_backends)
+        ]
+        self._failed_backends_label.setText("  ".join(warnings))
+        self._failed_backends_label.setVisible(bool(warnings))
+
+    def _detected_for(self, cfg: BusConfig) -> AdapterChoice | None:
+        """The detected adapter channel this bus opens, if any."""
+        return next(iter(self._adapters_for(cfg)), None)
+
+    def _adapters_for(self, cfg: BusConfig) -> list[AdapterChoice]:
+        """Every detected adapter channel this bus would open."""
+        key = channel_key(cfg.interface, cfg.channel, cfg.hw_id)
+        # An unpinned bus matches by channel alone, whatever the adapter's id.
+        return [
+            a
+            for a in self._adapter_rows
+            if channel_key(a.interface, a.channel, a.hw_id if cfg.hw_id is not None else None)
+            == key
+        ]
+
+    def _pin_candidate(self, cfg: BusConfig) -> AdapterChoice | None:
+        """The adapter on this bus's channel to offer pinning it to.
+
+        Offered for an unpinned bus, and for a pinned one whose adapter the
+        latest probe didn't find (a different adapter took its place). Never
+        when the pin is already right, nor when the adapter has no identity.
+        """
+        if cfg.hw_id is not None and self._detected_for(cfg) is not None:
+            return None
+        return next(
+            (
+                a
+                for a in self._adapter_rows
+                if a.interface == cfg.interface
+                and str(a.channel) == str(cfg.channel)
+                and a.hw_id is not None
+                and a.hw_id != cfg.hw_id
+            ),
+            None,
+        )
 
     def _on_add_bus(self) -> None:
         if self._ctx is None:
             return
         from ithildin.ui.create_bus_dialog import CreateCanBusDialog
 
-        existing = {b.name for b in self._ctx.project.workspace.bus}
-        existing_channels = {(b.interface, b.channel) for b in self._ctx.project.workspace.bus}
+        buses = self._ctx.project.workspace.bus
         dlg = CreateCanBusDialog(
-            existing_names=existing,
-            existing_channels=existing_channels,
+            existing_names={b.name for b in buses},
+            existing_keys=frozenset().union(
+                *(channel_keys(b.interface, b.channel, b.hw_id) for b in buses)
+            ),
+            hung_backends=self._hung_backends,
             parent=self,
         )
         dlg.bus_declared.connect(self._on_bus_declared)
@@ -1134,20 +1386,17 @@ class LeftDockWidget(QWidget):
         duplicate-name guard rejected it (so DBCs aren't bound to a
         pre-existing bus's name).
         """
-        from ithildin.workspace.schema import BusConfig
-
         if self._ctx is None or not isinstance(cfg, BusConfig):
             return False
         project = self._ctx.project
         if any(b.name == cfg.name for b in project.workspace.bus):
             self._ctx.database.error.emit(f"Bus name {cfg.name!r} already declared; pick another.")
             return False
-        if any(
-            b.interface == cfg.interface and b.channel == cfg.channel for b in project.workspace.bus
-        ):
+        holder = self._channel_holder(cfg.name, cfg.interface, cfg.channel, cfg.hw_id)
+        if holder is not None:
             self._ctx.database.error.emit(
-                f"{cfg.interface} channel {cfg.channel!r} is already used by "
-                "another bus; pick a different channel."
+                f"Bus {holder!r} already uses that {cfg.interface} channel or adapter; "
+                "pick another."
             )
             return False
         project.workspace.bus = [*project.workspace.bus, cfg]
@@ -1184,9 +1433,23 @@ class LeftDockWidget(QWidget):
             bound = True
         return bound
 
-    def _on_bus_declared_and_connect(self, cfg: object, dbcs: object = ()) -> None:
-        from ithildin.workspace.schema import BusConfig
+    def _channel_holder(
+        self, name: str, interface: str, channel: str | int, hw_id: str | None
+    ) -> str | None:
+        """Another declared bus on that channel or adapter (``schema.channel_keys``)."""
+        assert self._ctx is not None
+        keys = channel_keys(interface, channel, hw_id)
+        return next(
+            (
+                b.name
+                for b in self._ctx.project.workspace.bus
+                if b.name != name
+                and not keys.isdisjoint(channel_keys(b.interface, b.channel, b.hw_id))
+            ),
+            None,
+        )
 
+    def _on_bus_declared_and_connect(self, cfg: object, dbcs: object = ()) -> None:
         if self._ctx is None or not isinstance(cfg, BusConfig):
             return
         # Capture newness *before* declaring: a duplicate name is rejected
@@ -1213,6 +1476,54 @@ class LeftDockWidget(QWidget):
         self._refresh_buses()
         self._save_project_silently()
         self._ctx.events.buses_changed.emit()
+
+    def _workspace_config(self, bus_name: str) -> BusConfig | None:
+        assert self._ctx is not None
+        return next((b for b in self._ctx.project.workspace.bus if b.name == bus_name), None)
+
+    def _on_connect_requested(self, bus_name: str) -> None:
+        """Open the bus from its workspace config, pin included; reopen a running one."""
+        if self._ctx is None:
+            return
+        reader = self._ctx.bus_reader
+        cfg = self._workspace_config(bus_name)
+        if cfg is None or reader.is_closing(bus_name):
+            return
+        if bus_name in reader.bus_names():
+            reader.reopen(cfg)
+        else:
+            reader.open(cfg)
+
+    def _on_disconnect_requested(self, bus_name: str) -> None:
+        if self._ctx is not None:
+            self._ctx.bus_reader.close(bus_name)
+
+    def _on_pin_requested(self, bus_name: str) -> None:
+        """Pin the bus to the adapter now on its channel, unless another bus has it."""
+        if self._ctx is None:
+            return
+        cfg = self._workspace_config(bus_name)
+        adapter = self._pin_candidate(cfg) if cfg is not None else None
+        if cfg is None or adapter is None:
+            return
+        holder = self._channel_holder(bus_name, cfg.interface, cfg.channel, adapter.hw_id)
+        if holder is not None:
+            self._ctx.database.error.emit(
+                f"Can't pin bus {bus_name!r}: bus {holder!r} is pinned to that adapter."
+            )
+            return
+        project = self._ctx.project
+        project.workspace.bus = [
+            b.model_copy(update={"hw_id": adapter.hw_id}) if b.name == bus_name else b
+            for b in project.workspace.bus
+        ]
+        self._refresh_buses()
+        if not project.is_saved:
+            return
+        try:
+            project.save_adapter_pins()
+        except OSError as exc:
+            self._ctx.database.error.emit(f"Failed to save adapter pins: {exc}")
 
     def _save_project_silently(self) -> None:
         """Persist the project iff it has a path; surface OS errors via Database.error."""
@@ -1322,14 +1633,28 @@ class LeftDockWidget(QWidget):
         if row is not None and row.state != _STATE_FOR_HEALTH[BusHealth(state)]:
             self._refresh_buses()
 
-    def _start_prober(self) -> None:
-        if self._prober is not None:
+    def _on_bus_failed(self, bus_name: str, message: str) -> None:
+        """Wait for a lost or missing adapter to come back, and look for it again."""
+        if self._ctx is None:
             return
-        self._adapter_rows = []
-        self._failed_backends = []
-        self._probe_finished = False
-        self._refresh_buses()
-        self._prober = AdapterProber()
+        health = self._ctx.bus_reader.health(bus_name)
+        lost = health is not None and health[0] is BusHealth.LOST
+        cfg = self._workspace_config(bus_name)
+        if cfg is None or not (lost or ADAPTER_NOT_ATTACHED in message):
+            return
+        # A probe already running may still list the adapter: only the next counts.
+        self._waiting[bus_name] = self._probe_gen + 1
+        self._adapter_back.discard(bus_name)
+        gone = self._adapters_for(cfg)
+        self._adapter_rows = [a for a in self._adapter_rows if a not in gone]
+        self.rescan_adapters()
+
+    def _start_prober(self) -> None:
+        self._rescan_pending = False
+        self._probe_gen += 1
+        self._probe_rows = []
+        self._probe_failures = []
+        self._prober = AdapterProber(skip_backends=frozenset(self._hung_backends))
         # No QObject parent: lifetime is managed via signal-driven
         # deleteLater. Parenting to the dock would let qtbot dispose
         # the widget while the worker thread is still mid-probe, and
@@ -1339,6 +1664,7 @@ class LeftDockWidget(QWidget):
         self._prober_thread.started.connect(self._prober.run)
         self._prober.adapter_found.connect(self._on_adapter_found)
         self._prober.backend_failed.connect(self._on_backend_failed)
+        self._prober.backend_done.connect(self._on_backend_done)
         self._prober.finished.connect(self._on_prober_finished)
         # DirectConnection so the worker thread itself triggers quit;
         # otherwise the queued slot would target the main thread, which
@@ -1346,21 +1672,73 @@ class LeftDockWidget(QWidget):
         self._prober.finished.connect(self._prober_thread.quit, Qt.ConnectionType.DirectConnection)
         self._prober.finished.connect(self._prober.deleteLater)
         self._prober_thread.finished.connect(self._prober_thread.deleteLater)
-        self._prober_thread.start()
         # Cancel + join this probe if the app quits mid-enumeration.
         register_prober(self._prober, self._prober_thread)
+        self._prober_thread.start()
 
     def _on_adapter_found(self, adapter: AdapterChoice) -> None:
-        self._adapter_rows.append(adapter)
-        self._refresh_buses()
+        self._probe_rows.append(adapter)
 
     def _on_backend_failed(self, backend: str, reason: str) -> None:
-        self._failed_backends.append((backend, reason))
-        self._refresh_buses()
+        if reason == "timeout":
+            self._hung_backends.add(backend)
+        else:
+            self._probe_failures.append((backend, reason))
+
+    def _on_backend_done(self, backend: str) -> None:
+        self._take_probe_results(backend)
 
     def _on_prober_finished(self) -> None:
-        self._probe_finished = True
+        # The dev-mode loopback comes last, with no backend_done of its own.
+        self._take_probe_results("virtual")
+        self._prober = None
+        self._prober_thread = None
+        if self._rescan_pending:
+            self._start_prober()
+
+    def _take_probe_results(self, backend: str) -> None:
+        """Replace one backend's adapters and failures with this probe's.
+
+        A backend that has since hung (in the Create dialog's probe, say)
+        gets no more probes, so its rows would never be replaced: drop them.
+        """
+        self._adapter_rows = [
+            a
+            for a in self._adapter_rows
+            if a.interface != backend and a.interface not in self._hung_backends
+        ]
+        self._adapter_rows += [a for a in self._probe_rows if a.interface == backend]
+        self._failed_backends = [f for f in self._failed_backends if f[0] != backend]
+        self._failed_backends += [f for f in self._probe_failures if f[0] == backend]
+        self._report_adapters_back(backend)
         self._refresh_buses()
+
+    def _report_adapters_back(self, backend: str) -> None:
+        """Tell the user once when a waiting bus's adapter is listed again.
+
+        Judged only on ``backend``'s rows just taken from a probe started
+        after the loss: another backend's rows may still come from a probe
+        that was running when the adapter went. The bus stays down:
+        reopening it by itself would ACK on the wire and let MCP or Replay
+        send with nobody having acted.
+        """
+        if self._ctx is None:
+            return
+        for bus_name, first_gen in list(self._waiting.items()):
+            cfg = self._workspace_config(bus_name)
+            if (
+                self._probe_gen < first_gen
+                or cfg is None
+                or cfg.interface != backend
+                or self._detected_for(cfg) is None
+            ):
+                continue
+            del self._waiting[bus_name]
+            self._adapter_back.add(bus_name)
+            self._ctx.events.report_requested.emit(
+                f"Adapter for bus {bus_name} is back — click its status dot in Buses to reconnect.",
+                "info",
+            )
 
     def _on_load_dbc(self) -> None:
         """Import a DBC and bind it to the currently selected bus."""

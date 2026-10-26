@@ -685,10 +685,9 @@ def test_add_dbc_button_enables_when_child_dbc_row_selected(
     assert dock._dbc_load_btn.isEnabled() is True
 
 
-def test_add_dbc_button_disables_after_refresh_clears_selection(
-    qapp, qtbot, tmp_path: Path
-) -> None:  # type: ignore[no-untyped-def]
-    """A tree rebuild wipes the selection and disables the button again."""
+def test_add_dbc_button_follows_the_selection_across_a_refresh(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    """A tree rebuild keeps the selected bus selected, and disables the
+    button again once that bus is gone."""
     project = _make_project(tmp_path, ["Engine", "Body"])
     ctx = make_app_context(tmp_path, project=project)
     dock = LeftDockWidget()
@@ -701,6 +700,11 @@ def test_add_dbc_button_disables_after_refresh_clears_selection(
     )
     assert dock._dbc_load_btn.isEnabled() is True
 
+    dock._refresh_buses()
+    assert dock._selected_bus_name == "Engine"
+    assert dock._dbc_load_btn.isEnabled() is True
+
+    project.workspace.bus = [b for b in project.workspace.bus if b.name != "Engine"]
     dock._refresh_buses()
 
     assert dock._selected_bus_name is None

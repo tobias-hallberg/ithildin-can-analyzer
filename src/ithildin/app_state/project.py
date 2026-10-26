@@ -4,8 +4,8 @@
 
 A ``Project`` represents one open ``.itp`` file. It owns the workspace
 config and resolves the ``~/.ithildin/<project>/`` directory where layout,
-allowlist, and audit log live (kept out of the project file so the project
-itself is shareable).
+allowlist, audit log and adapter pins live (kept out of the project file so
+the project itself is shareable).
 
 On first open of a legacy v1 ``.ithildin`` file, ``open_or_migrate`` writes
 the legacy MCP allowlist out as ``AllowRule`` rows in
@@ -14,6 +14,9 @@ the legacy MCP allowlist out as ``AllowRule`` rows in
 
 from __future__ import annotations
 
+import json
+import logging
+import os
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -34,6 +37,8 @@ from ithildin.workspace.schema import (
     McpConfig,
     Workspace,
 )
+
+_log = logging.getLogger(__name__)
 
 _USER_ROOT = Path.home() / ".ithildin"
 _SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
@@ -117,8 +122,45 @@ class Project:
     def audit_path(self) -> Path:
         return self.user_dir / "audit.jsonl"
 
+    @property
+    def adapter_pins_path(self) -> Path:
+        """Bus name → ``BusConfig.hw_id``: the adapter each bus is pinned to."""
+        return self.user_dir / "adapter_pins.json"
+
     def ensure_user_dir(self) -> None:
         self.user_dir.mkdir(parents=True, exist_ok=True)
+
+    def load_adapter_pins(self) -> None:
+        """Pin each bus to the adapter this user's pins file names for it."""
+        path = self.adapter_pins_path
+        try:
+            pins = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError):
+            _log.error("Adapter pins in %s are unreadable; no bus is pinned", path, exc_info=True)
+            return
+        if not isinstance(pins, dict):
+            _log.error("Adapter pins in %s are not a mapping; no bus is pinned", path)
+            return
+        self._workspace.bus = [
+            b.model_copy(update={"hw_id": pins[b.name]}) if isinstance(pins.get(b.name), str) else b
+            for b in self._workspace.bus
+        ]
+
+    def save_adapter_pins(self) -> None:
+        """Write the buses' pins to :attr:`adapter_pins_path` (atomic)."""
+        pins = {b.name: b.hw_id for b in self._workspace.bus if b.hw_id is not None}
+        path = self.adapter_pins_path
+        if not pins and not path.exists():
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(pins, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
 
     def set_workspace(self, workspace: Workspace) -> None:
         """Replace the in-memory workspace before save.
@@ -147,9 +189,11 @@ class Project:
         self._user_root = other._user_root
 
     def save(self) -> None:
+        """Write the ``.itp``, and the adapter pins beside this user's other state."""
         if self._path is None:
             raise ValueError("Project has no path; call set_path first")
         save_workspace(self._workspace, self._path)
+        self.save_adapter_pins()
 
 
 def new_unsaved(*, user_root: Path | None = None) -> Project:
@@ -182,8 +226,9 @@ def open_or_migrate(
     p = Path(path).resolve()
     version = detect_schema_version(p)
     if version == 2:
-        ws = load_workspace(p)
-        return Project(p, ws, user_root=user_root), None
+        project = Project(p, load_workspace(p), user_root=user_root)
+        project.load_adapter_pins()
+        return project, None
     if version == 1:
         return _migrate_v1(p, user_root=user_root)
     raise ValueError(f"Unsupported schema_version={version} in {p!s}")

@@ -670,6 +670,7 @@ def test_health_banner_never_replaces_a_failure_banner(qapp, qtbot, tmp_path: Pa
     qtbot.addWidget(win)
     win.bind(ctx)
 
+    ctx.bus_reader._failures["CAN_2"] = "adapter disconnected"
     ctx.bus_reader.bus_failed.emit("CAN_2", "adapter disconnected")
     ctx.bus_reader.bus_health_changed.emit("CAN_1", "bus_off", "")
     ctx.bus_reader.bus_health_changed.emit("CAN_1", "ok", "")
@@ -721,6 +722,7 @@ def test_banner_taken_by_another_message_frees_the_health_banner(  # type: ignor
     qtbot.addWidget(win)
     win.bind(ctx)
 
+    ctx.bus_reader._failures["CAN_2"] = "adapter disconnected"
     ctx.bus_reader.bus_failed.emit("CAN_2", "adapter disconnected")
     win._on_superseded("Superseded by the whole bus")
     ctx.bus_reader.bus_health_changed.emit("CAN_1", "bus_off", "")
@@ -1050,3 +1052,66 @@ def test_lost_label_only_when_nonzero(qapp, qtbot, tmp_path: Path) -> None:  # t
     assert win._counts_label.text() == "RX 3   ERR 1"
     win._model.counters_changed.emit(3, 1, 5)
     assert win._counts_label.text() == "RX 3   ERR 1   LOST 5"
+
+
+# ---- Failure banner over every failed bus ----
+
+
+def _trace_on_two_failed_buses(qtbot, tmp_path: Path):  # type: ignore[no-untyped-def]
+    project = new_unsaved(user_root=tmp_path)
+    project.workspace.bus = [
+        BusConfig(
+            name=name, interface="virtual", channel=f"tr-{uuid.uuid4().hex[:8]}", bitrate=500000
+        )
+        for name in ("CAN_1", "CAN_2")
+    ]
+    ctx = make_app_context(tmp_path, project=project)
+    win = TraceWindow(instance_id="t1")
+    qtbot.addWidget(win)
+    win.bind(ctx)
+    for cfg in project.workspace.bus:
+        with qtbot.waitSignal(ctx.bus_reader.bus_started, timeout=2000):
+            ctx.bus_reader.open(cfg)
+    for cfg in project.workspace.bus:
+        with qtbot.waitSignal(ctx.bus_reader.bus_failed, timeout=2000):
+            kill_capture(ctx.bus_reader, cfg.name)
+    return ctx, win, project
+
+
+def test_failure_banner_shows_the_newest_and_reconnects_all(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    ctx, win, project = _trace_on_two_failed_buses(qtbot, tmp_path)
+    assert win._banner._label.text().startswith("Bus CAN_2 disconnected:")
+    assert win._banner._label.text().endswith("(+1 more)")
+    assert win._banner._action_btn.text() == "Reconnect all"
+    # Pinned since they opened: the reconnect must carry the pin.
+    project.workspace.bus = [
+        b.model_copy(update={"hw_id": f"pin-{b.name}"}) for b in project.workspace.bus
+    ]
+
+    win._banner._action_btn.click()
+    reader = ctx.bus_reader
+    qtbot.waitUntil(
+        lambda: all(reader.health(n) is not None for n in ("CAN_1", "CAN_2")), timeout=2000
+    )
+    for name in ("CAN_1", "CAN_2"):
+        cfg = reader.last_config_for(name)
+        assert cfg is not None and cfg.hw_id == f"pin-{name}"
+    assert win._banner.isHidden()
+
+
+def test_failure_banner_reconnecting_one_names_the_other(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    ctx, win, project = _trace_on_two_failed_buses(qtbot, tmp_path)
+
+    with qtbot.waitSignal(ctx.bus_reader.bus_started, timeout=2000):
+        ctx.bus_reader.open(project.workspace.bus[1])
+    assert win._banner._label.text().startswith("Bus CAN_1 disconnected:")
+    assert win._banner._action_btn.text() == "Reconnect"
+
+
+def test_dismissed_failure_banner_stays_closed_on_a_reconnect(qapp, qtbot, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    ctx, win, project = _trace_on_two_failed_buses(qtbot, tmp_path)
+    win._banner._close_btn.click()
+
+    with qtbot.waitSignal(ctx.bus_reader.bus_started, timeout=2000):
+        ctx.bus_reader.open(project.workspace.bus[1])
+    assert win._banner.isHidden()

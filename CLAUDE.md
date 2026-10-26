@@ -27,7 +27,9 @@ Process-level singletons live in `app_state/`:
   exposes `bus_opening / bus_started / bus_stopped / bus_failed /
   frames_received(list) / error`, plus `cyclic_failed / send_failed` for
   TX and `bus_health_changed(name, state, detail)` with `health(name)` for
-  bus health. `send_message` is synchronous and callable from any thread
+  bus health. `failures()` holds every bus that failed and wasn't opened
+  again or forgotten since (the dock's "failed" rows, the Trace banner).
+  `send_message` is synchronous and callable from any thread
   (Replay, MCP); `send_message_async` is the TX window's one-shot path.
 - `Database` (`database.py`) — wraps `core/decoder.py`'s `Decoder`,
   emits `database_changed / error`.
@@ -144,7 +146,8 @@ MCP layer (`src/ithildin/mcp/`):
   capturing the reader frees it mid-destruction when the controller is
   deleted. A close that misses its deadline leaves the controller
   *retiring* (`is_closing`, dock "closing"); `open()` refuses its name
-  and channel until its thread exits and `bus_released` fires.
+  and channel or adapter (`schema.channel_keys`) until its thread exits
+  and `bus_released` fires.
 - **Delete a thread's owner only after the thread is joined.**
   `BusController.finished`, `TeeLogger.stopped` and
   `ReplayController.finished` fire after `QThread.finished` + `wait()`;
@@ -228,8 +231,9 @@ MCP layer (`src/ithildin/mcp/`):
   change.
 - **Vendor backends imported off the GUI thread.** `import ithildin`
   still does no vendor work; adapter detection runs on a background
-  `QThread` (`ui/adapter_prober.py::AdapterProber`) kicked off from
-  `LeftDockWidget.start_adapter_probe()` after `MainWindow.show()`. The
+  `QThread` (`ui/adapter_prober.py::AdapterProber`), first from
+  `LeftDockWidget.start_adapter_probe()` after `MainWindow.show()`, then
+  from `LeftDockWidget.rescan_adapters()` (below). The
   supported set is deliberately narrow (`pcan`, `kvaser`, `gs_usb`,
   `socketcan`, `ixxat`) — every name in `_SUPPORTED_BACKENDS` is a
   vendor module the probe imports (python-can's
@@ -237,7 +241,10 @@ MCP layer (`src/ithildin/mcp/`):
   adding one is paying real startup cost. Each per-backend probe runs
   in a sub-thread with a hard `BACKEND_TIMEOUT_S` ceiling; a vendor
   module that hangs on import is reported via `backend_failed` and the
-  prober moves on rather than wedging the dock. The `virtual` loopback
+  prober moves on rather than wedging the dock. The hung helper thread
+  stays, so the dock keeps the backend in `_hung_backends` and every later
+  probe, the Create dialog's included, skips it (`skip_backends=`) until a
+  restart. `register_prober` before `thread.start()`. The `virtual` loopback
   is a dev-only surface: it's emitted by the prober and seeded in the
   Create-bus dialog **only** when `adapter_prober.dev_mode()` is on
   (`ITHILDIN_DEV` env / `--dev` launch flag). Normal users never see it;
@@ -253,9 +260,16 @@ MCP layer (`src/ithildin/mcp/`):
   the device counter's 71.6 min wrap, a listen-only-safe shutdown and
   `flush_tx_buffer`. python-can can't enumerate gs_usb, so
   `adapter_prober._detect_gs_usb` scans on Windows only (on Linux the
-  kernel driver owns the adapter: use SocketCAN) and reads no string
-  descriptors — opening a WinUSB device is exclusive and would race a bus
-  opening on it. Call `libusb_package.get_libusb1_backend()` before
+  kernel driver owns the adapter: use SocketCAN). It reads only the USB
+  serial, the adapter's identity (the scan index follows plug order), and
+  releases the handle at once (`usb.util.dispose_resources`): opening a
+  WinUSB device is exclusive, so an adapter a bus holds has no serial.
+  `GsUsbBus(serial=)` opens a pinned adapter at whatever index it scans
+  at, reading every adapter's serial (refused when clones share it). A
+  serial read on another thread makes an open of that adapter fail, so
+  the prober's reads and every `GsUsbBus` construction hold
+  `gs_usb_bus.GS_USB_LOCK`, waited for with a timeout like
+  `KVASER_ENUM_LOCK` (`BusWorker._take_driver_lock`). Call `libusb_package.get_libusb1_backend()` before
   `GsUsb.scan()` so pyusb loads the bundled libusb. `BusConfig` migrates
   saved `cantact` buses (0.1.0 / 0.1.1) to `gs_usb`.
 - **Kvaser channel numbers are re-enumerated under one lock.**
@@ -264,7 +278,8 @@ MCP layer (`src/ithildin/mcp/`):
   `canEnumHardware`), so an adapter plugged in after launch is found and
   a replugged one reopens. Re-enumerating renumbers the channels, so hold
   `KVASER_ENUM_LOCK` across it and every use of the numbers: the prober's
-  detection and channel-data read, the worker's `can.Bus`. A vendor call
+  detection and channel-data read, the worker's `_pin_adapter` and
+  `can.Bus` (a rescan after a replug races a Reconnect). A vendor call
   that hangs keeps the lock, so never wait for it unbounded: a probe gives
   up after 2 s (below `BACKEND_TIMEOUT_S`, reported as driver busy rather
   than a timeout), an open after 10 s or once its bus is stopped. Kvaser
@@ -293,6 +308,46 @@ MCP layer (`src/ithildin/mcp/`):
   with `GetValue(PCAN_LISTEN_ONLY)` and the open refused unless the read
   succeeds and it is on: `PcanBus` ignores that `SetValue`'s result.
   `_finish_pcan_open` runs these steps; any failure shuts the bus down.
+- **Adapter pins are user-private and explicit.** `BusConfig.hw_id`
+  (`Field(exclude=True)`, so never in the git-shared `.itp`) pins a bus to
+  one adapter channel, in `schema.hw_id_of`'s format: pcan device ID (set
+  in PCAN-View; the factory 0xFF / 0xFFFFFFFF identify nothing) +
+  controller, kvaser serial + channel on the card, IXXAT unique hardware
+  id, gs_usb USB serial. Pins live in `~/.ithildin/<project>/adapter_pins.json`
+  (bus name → hw_id, atomic `os.replace`), loaded by `open_or_migrate` and
+  written by `Project.save()` / `save_adapter_pins()`. A pin is set only by
+  the Create dialog's choice or the dock's "Pin to …" (offered for a bus
+  that isn't running and has no pin, or whose adapter the latest probe
+  didn't find) — never silently. The worker resolves it in
+  `core/bus.py::_pin_adapter`, on the worker thread: ixxat
+  `unique_hardware_id`, gs_usb `GsUsbBus(serial=)`, pcan / kvaser by
+  `detect_available_configs` (keep the channel, follow the adapter to a
+  single other one, refuse with `ADAPTER_NOT_ATTACHED` or "N adapters
+  report …"); never open a pinned bus by channel alone, never
+  `PcanBus(device_id=)` (first match). Two buses clash when their
+  `schema.channel_keys` meet: the pinned adapter or the configured channel,
+  which stays unique so the `.itp` loads without the pins (the `Workspace`
+  validator checks `(interface, channel)`) and a teammate without them
+  never gets two buses on one channel. The cost: two buses can't share a
+  channel number even when pinned apart (two single-channel IXXAT devices'
+  channel 0). Every reconnect path (dock dot
+  and menu, Trace banner, toolbar) opens the **workspace** config, which
+  carries the pin; `BusReader._last_configs` may predate it.
+- **Device changes rescan; an adapter returning never reopens a bus.** On
+  Windows `MainWindow.nativeEvent` takes `WM_DEVICECHANGE` /
+  `DBT_DEVNODES_CHANGED` only (no `RegisterDeviceNotification`; pass Qt's
+  `VoidPtr` message back to `super()`, it refuses an int) and debounces it
+  into `LeftDockWidget.rescan_adapters()`: `_DEVICE_SETTLE_MS` after the
+  last event, at most `_DEVICE_MAX_WAIT_MS` after the first. Linux has no
+  hook; the Buses "↻" works everywhere. Rescans merge while one runs, and
+  replace each backend's rows on its `backend_done`, so no row flashes
+  unavailable. A bus that goes LOST or is refused "not attached" waits for
+  its adapter: a probe started after the loss that lists it sends one info
+  Report entry and a tooltip, and the bus stays down until the user clicks
+  its dot — reopening it would ACK on the wire and let MCP or Replay send
+  with nobody having acted. The dock's status dot is the bus's control
+  (24 px zone, activates on release, swallows a double-click); "failed"
+  (⊗, reason in the tooltip) comes from `BusReader.failures()`.
 - **Diagnostics go through `logging`.** `diagnostics.install()` is the
   first statement of `app.main`: one log file per launch in
   `~/.ithildin/logs` (newest 10 kept), `None` stdio (the windowed frozen
@@ -453,9 +508,11 @@ widget (drops on the inner GraphicsView don't propagate reliably).
 | Add an MCP read tool | implement in `mcp/tools.py`, register in `mcp/server.py::register_read_tools` |
 | Add an MCP write tool | same split; the body runs inside `tools._audited` and goes through `AllowlistStore.check_*`; register an `async` wrapper in `mcp/server.py::register_write_tools` that calls it via `to_thread.run_sync` with the server's `sends` limiter |
 | Wire a `BusReader` error display | `MainWindow.report()` and per-view banners |
-| Add or re-enable a CAN backend | `ui/adapter_prober.py::_SUPPORTED_BACKENDS` + `workspace/schema.py::SupportedInterface` (must update both); for listen-only also `LISTEN_ONLY_INTERFACES` + `core/bus.py::_apply_listen_only_kwargs` |
+| Add or re-enable a CAN backend | `ui/adapter_prober.py::_SUPPORTED_BACKENDS` + `workspace/schema.py::SupportedInterface` (must update both); for listen-only also `LISTEN_ONLY_INTERFACES` + `core/bus.py::_apply_listen_only_kwargs`; for pinning `schema.hw_id_of` + `core/bus.py::_pin_adapter` |
+| Change what identifies an adapter | `workspace/schema.py::hw_id_of` / `channel_key(s)` |
+| React to a device change | `ui/main_window.py::nativeEvent` (Windows) → `LeftDockWidget.rescan_adapters` |
 | Add a vendor dep that limits the Python range | `[project.optional-dependencies]` in `pyproject.toml` + the `--extra` in `.github/workflows/release.yml` |
-| Persist user-private state | `~/.ithildin/<project>/` (allowlist, audit, layout) |
+| Persist user-private state | `~/.ithildin/<project>/` (allowlist, audit, layout, adapter pins) |
 | Log a diagnostic | `logging.getLogger(__name__)`; levels and dock mirroring in `app_state/diagnostics.py` |
 | Read the diagnostic logs | `~/.ithildin/logs/` (app-global, one file per launch) |
 | Persist project state | the `.itp` file (TOML schema v2) |

@@ -11,8 +11,8 @@ This module probes the supported backends one at a time on a worker
 ``QThread``, streaming each enriched device (``device_found``) and its
 derived channel rows (``adapter_found``) to the UI as Qt signals. The
 Create CAN bus dialog runs its own instance of this prober on open and
-on rescan; the left dock runs one at startup to mark declared buses
-available.
+on rescan; the left dock runs one at startup and on every rescan (a
+device change on Windows, or its ↻) to mark declared buses available.
 
 The no-hardware virtual loopback is emitted last, but only in dev mode
 (``ITHILDIN_DEV`` / ``--dev``) — normal users never see it. See
@@ -29,13 +29,14 @@ CANlib) must not be able to wedge the dock indefinitely.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import sys
 import threading
 from dataclasses import dataclass
 
-from PySide6.QtCore import QObject, QThread, Signal, Slot
+from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot
 from PySide6.QtWidgets import QApplication
 
 from ithildin.ui.adapter_enrich import ChannelInfo, DeviceInfo, enrich
@@ -58,10 +59,10 @@ BACKEND_TIMEOUT_S = 3.0
 reported via ``backend_failed`` and the worker thread carries on; the
 hung helper thread is a daemon, left to die when the process exits."""
 
-_KVASER_LOCK_WAIT_S = 2.0
-"""Below :data:`BACKEND_TIMEOUT_S`: a Kvaser probe queued behind a slow or
-hung Kvaser open reports the driver busy and its thread ends, instead of
-timing out with the thread parked on ``KVASER_ENUM_LOCK``."""
+_PROBE_LOCK_WAIT_S = 2.0
+"""Below :data:`BACKEND_TIMEOUT_S`: a Kvaser or gs_usb probe queued behind a
+slow or hung open reports the driver busy and its thread ends, instead of
+timing out with the thread parked on ``KVASER_ENUM_LOCK`` / ``GS_USB_LOCK``."""
 
 
 @dataclass(frozen=True)
@@ -78,6 +79,7 @@ class AdapterChoice:
     interface: SupportedInterface
     channel: str | int
     device: DeviceInfo | None = None
+    hw_id: str | None = None
 
 
 VIRTUAL_LOOPBACK = AdapterChoice(
@@ -139,9 +141,14 @@ class AdapterProber(QObject):
         self,
         timeout_s: float = BACKEND_TIMEOUT_S,
         parent: QObject | None = None,
+        *,
+        skip_backends: frozenset[str] = frozenset(),
     ) -> None:
         super().__init__(parent)
         self._timeout_s = timeout_s
+        # Backends an earlier probe timed out on: their helper thread is
+        # still hung, and probing again would only hang another.
+        self._skip_backends = skip_backends
         self._cancelled = False
 
     @Slot()
@@ -157,10 +164,12 @@ class AdapterProber(QObject):
 
     @Slot()
     def run(self) -> None:
-        seen: set[tuple[str, object]] = set()
+        seen: set[tuple[str, str | None, str | int]] = set()
         for backend in _SUPPORTED_BACKENDS:
             if self._cancelled:
                 break
+            if backend in self._skip_backends:
+                continue
             for device in self._probe_with_timeout(backend):
                 self._emit_device(device, seen)
             self.backend_done.emit(backend)
@@ -170,11 +179,14 @@ class AdapterProber(QObject):
         # and the thread tears down cleanly, cancelled or not.
         self.finished.emit()
 
-    def _emit_device(self, device: DeviceInfo, seen: set[tuple[str, object]]) -> None:
+    def _emit_device(
+        self, device: DeviceInfo, seen: set[tuple[str, str | None, str | int]]
+    ) -> None:
         """Emit a device plus a derived ``adapter_found`` row per channel."""
         self.device_found.emit(device)
         for ch in device.channels:
-            key = (device.interface, ch.channel)
+            # With the id: two IXXAT devices both have a channel 0.
+            key = (device.interface, ch.hw_id, ch.channel)
             if key in seen:
                 continue
             seen.add(key)
@@ -184,6 +196,7 @@ class AdapterProber(QObject):
                     interface=device.interface,
                     channel=ch.channel,
                     device=device,
+                    hw_id=ch.hw_id,
                 )
             )
 
@@ -236,16 +249,22 @@ _quit_guard_installed = False
 
 
 def register_prober(prober: AdapterProber, thread: QThread) -> None:
-    """Retain a running probe until its thread ends; arm the quit guard.
+    """Retain a probe until its thread ends; arm the quit guard.
 
-    Call right after ``thread.start()``. The owner still wires its own
-    ``finished`` handlers; this only guarantees the objects survive long
-    enough to tear down cleanly regardless of the owner's lifetime.
+    Call right before ``thread.start()``: a probe with little to do can
+    finish before a later call connects to ``finished``, and would then be
+    held, deleted, for good. The owner still wires its own ``finished``
+    handlers; this only guarantees the objects survive long enough to tear
+    down cleanly regardless of the owner's lifetime.
     """
     global _quit_guard_installed
     pair = (prober, thread)
     _INFLIGHT_PROBES.add(pair)
-    thread.finished.connect(lambda: _INFLIGHT_PROBES.discard(pair))
+    # Direct, on the finishing thread: queued, the call was at times never
+    # delivered, as the same signal has the thread deleted.
+    thread.finished.connect(
+        lambda: _INFLIGHT_PROBES.discard(pair), Qt.ConnectionType.DirectConnection
+    )
     app = QApplication.instance()
     if app is not None and not _quit_guard_installed:
         app.aboutToQuit.connect(_stop_all_probes)
@@ -294,7 +313,7 @@ def _detect_configs(backend: str) -> list[dict[str, object]]:
 
     from ithildin.core.bus import KVASER_ENUM_LOCK, kvaser_enum_hardware
 
-    if not KVASER_ENUM_LOCK.acquire(timeout=_KVASER_LOCK_WAIT_S):
+    if not KVASER_ENUM_LOCK.acquire(timeout=_PROBE_LOCK_WAIT_S):
         raise RuntimeError("Kvaser driver busy: a Kvaser bus or earlier scan is still in it")
     try:
         kvaser_enum_hardware()
@@ -306,17 +325,34 @@ def _detect_configs(backend: str) -> list[dict[str, object]]:
 
 
 def _detect_gs_usb() -> list[dict[str, object]]:
-    """One config per connected gs_usb adapter, by its ``GsUsb.scan()`` index.
+    """One config per connected gs_usb adapter: its ``GsUsb.scan()`` index and USB serial.
 
-    Reads no string descriptors: that opens the device, which WinUSB grants
-    to one handle at a time, so it would race a bus opening on the adapter.
-    ``GsUsbBus`` opens the adapter at the same index of the same scan.
+    The index follows plug order, so ``GsUsbBus`` opens a pinned bus by the
+    serial. Reading it opens the device, which WinUSB grants to one handle
+    at a time: the reads hold ``GS_USB_LOCK`` so no bus opens meanwhile, the
+    handle is released at once, and an adapter a bus holds open reports no
+    serial.
     """
     import libusb_package
+    import usb.util
     from gs_usb.gs_usb import GsUsb
 
+    from ithildin.core.gs_usb_bus import GS_USB_LOCK, SERIAL_READ_ERRORS
+
     libusb_package.get_libusb1_backend()
-    return [{"interface": "gs_usb", "channel": index} for index in range(len(GsUsb.scan()))]
+    if not GS_USB_LOCK.acquire(timeout=_PROBE_LOCK_WAIT_S):
+        raise RuntimeError("gs_usb driver busy: a gs_usb bus is still opening")
+    try:
+        configs: list[dict[str, object]] = []
+        for index, dev in enumerate(GsUsb.scan()):
+            serial: str | None = None
+            with contextlib.suppress(*SERIAL_READ_ERRORS):
+                serial = dev.serial_number
+            usb.util.dispose_resources(dev.gs_usb)
+            configs.append({"interface": "gs_usb", "channel": index, "serial": serial})
+    finally:
+        GS_USB_LOCK.release()
+    return configs
 
 
 def _add_kvaser_channel_data(configs: list[dict[str, object]]) -> None:

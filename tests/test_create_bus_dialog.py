@@ -18,7 +18,7 @@ from can.interfaces.pcan.basic import PCAN_BITRATES
 from ithildin.ui import adapter_prober as prober_mod
 from ithildin.ui.adapter_enrich import ChannelInfo, DeviceInfo
 from ithildin.ui.create_bus_dialog import CreateCanBusDialog
-from ithildin.workspace.schema import BusConfig
+from ithildin.workspace.schema import BusConfig, channel_keys
 from tests.conftest import make_app_context
 
 
@@ -31,8 +31,12 @@ def _no_real_probe(monkeypatch):  # type: ignore[no-untyped-def]
     monkeypatch.setenv("ITHILDIN_DEV", "1")
 
 
-def _make_dialog(qtbot, existing=frozenset(), existing_channels=frozenset()):  # type: ignore[no-untyped-def]
-    dlg = CreateCanBusDialog(existing_names=set(existing), existing_channels=set(existing_channels))
+def _make_dialog(qtbot, existing=frozenset(), existing_buses=(), hung_backends=None):  # type: ignore[no-untyped-def]
+    """``existing_buses``: ``(interface, channel, hw_id)`` of the declared buses."""
+    keys = frozenset().union(*(channel_keys(*bus) for bus in existing_buses))
+    dlg = CreateCanBusDialog(
+        existing_names=set(existing), existing_keys=keys, hung_backends=hung_backends
+    )
     qtbot.addWidget(dlg)
     dlg.show()
     return dlg
@@ -84,7 +88,7 @@ def test_duplicate_name_disables_create(qapp, qtbot) -> None:  # type: ignore[no
 
 def test_already_added_channel_is_skipped(qapp, qtbot) -> None:  # type: ignore[no-untyped-def]
     # Virtual device has two channels; mark the first as already declared.
-    dlg = _make_dialog(qtbot, existing_channels={("virtual", "ithildin_virtual")})
+    dlg = _make_dialog(qtbot, existing_buses=[("virtual", "ithildin_virtual", None)])
     assert dlg._channel is not None
     assert dlg._channel.channel == "ithildin_virtual_1"
 
@@ -92,10 +96,10 @@ def test_already_added_channel_is_skipped(qapp, qtbot) -> None:  # type: ignore[
 def test_all_channels_added_disables_create(qapp, qtbot) -> None:  # type: ignore[no-untyped-def]
     dlg = _make_dialog(
         qtbot,
-        existing_channels={
-            ("virtual", "ithildin_virtual"),
-            ("virtual", "ithildin_virtual_1"),
-        },
+        existing_buses=[
+            ("virtual", "ithildin_virtual", None),
+            ("virtual", "ithildin_virtual_1", None),
+        ],
     )
     assert dlg._channel is None
     assert not dlg._create_btn.isEnabled()
@@ -413,3 +417,73 @@ def test_create_and_connect_opens_one_bus(qapp, qtbot, tmp_path: Path) -> None: 
 
     assert "LiveBus" in ctx.bus_reader.bus_names()
     ctx.bus_reader.close()
+
+
+# ---- Adapter identity ----
+
+
+def _pcan_device(*channels: tuple[str, str | None]) -> DeviceInfo:
+    return DeviceInfo(
+        interface="pcan",
+        vendor="PEAK-System",
+        model="PCAN-USB",
+        channels=tuple(ChannelInfo(channel=ch, label=ch, hw_id=hw_id) for ch, hw_id in channels),
+    )
+
+
+def test_create_pins_the_bus_to_the_chosen_adapter(qapp, qtbot) -> None:  # type: ignore[no-untyped-def]
+    dlg = _make_dialog(qtbot)
+    dlg._add_device(_pcan_device(("PCAN_USBBUS2", "0000002a.0")))
+    dlg._device_combo.setCurrentIndex(dlg._device_combo.count() - 1)
+    dlg._name_edit.setText("Bench")
+    captured: list[BusConfig] = []
+    dlg.bus_declared.connect(lambda cfg, _dbcs: captured.append(cfg))
+
+    dlg._on_create()
+
+    assert captured[0].hw_id == "0000002a.0"
+    assert "hw_id" not in captured[0].model_dump()
+
+
+def test_a_pinned_adapter_is_taken_wherever_it_enumerates(qapp, qtbot) -> None:  # type: ignore[no-untyped-def]
+    dlg = _make_dialog(qtbot, existing_buses=[("pcan", "PCAN_USBBUS1", "0000002a.0")])
+    moved = ChannelInfo(channel="PCAN_USBBUS2", label="2", hw_id="0000002a.0")
+    other = ChannelInfo(channel="PCAN_USBBUS3", label="3", hw_id="0000002b.0")
+    unidentified = ChannelInfo(channel="PCAN_USBBUS3", label="3")
+    on_its_channel = ChannelInfo(channel="PCAN_USBBUS1", label="1", hw_id="0000002b.0")
+
+    assert dlg._channel_taken("pcan", moved)
+    assert not dlg._channel_taken("pcan", other)
+    assert not dlg._channel_taken("pcan", unidentified)
+    # The .itp holds no pins: two buses never share a configured channel.
+    assert dlg._channel_taken("pcan", on_its_channel)
+
+
+def test_dialog_skips_hung_backends_and_shares_new_ones(qapp, qtbot, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """Each probe of a hung backend would leave one more hung thread behind."""
+    import threading
+    from functools import partial
+
+    from ithildin.ui import create_bus_dialog as dialog_mod
+
+    release = threading.Event()
+    probed: list[str] = []
+
+    def detect(backend: str) -> list[dict[str, object]]:
+        probed.append(backend)
+        if backend == "kvaser":
+            release.wait(5)
+        return []
+
+    monkeypatch.setattr(prober_mod, "_detect_configs", detect)
+    monkeypatch.setattr(
+        dialog_mod, "AdapterProber", partial(prober_mod.AdapterProber, timeout_s=0.1)
+    )
+    hung = {"pcan"}
+    try:
+        dlg = _make_dialog(qtbot, hung_backends=hung)
+        qtbot.waitUntil(lambda: dlg._prober is None, timeout=5000)
+        assert "pcan" not in probed
+        assert hung == {"pcan", "kvaser"}
+    finally:
+        release.set()

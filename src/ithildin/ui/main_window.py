@@ -23,16 +23,20 @@ Settings / MCP / About are ``QDialog``s opened from toolbar actions,
 not MDI subwindows. Bus declaration lives in the left dock's Buses
 ``+``; the toolbar Connect action is a stateful toggle that opens /
 closes every declared bus in one click.
+
+On Windows, ``nativeEvent`` debounces device changes (``WM_DEVICECHANGE``
+/ ``DBT_DEVNODES_CHANGED``) into one adapter rescan of the left dock.
 """
 
 from __future__ import annotations
 
 import html
 import logging
+import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from PySide6.QtCore import QSize, Qt, Slot
+from PySide6.QtCore import QByteArray, QElapsedTimer, QSize, Qt, QTimer, Slot
 from PySide6.QtGui import QAction, QActionGroup
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from PySide6.QtWidgets import (
@@ -65,6 +69,9 @@ from ithildin.ui.view_launcher import ViewLauncherButton
 from ithildin.ui.window_tray import WindowTrayWidget
 from ithildin.workspace.schema import BusConfig, DbcRef, McpConfig, ViewState, Workspace
 
+if sys.platform == "win32":
+    import ctypes.wintypes
+
 if TYPE_CHECKING:
     from ithildin.app_state.bus_reader import BusReader
     from ithildin.app_state.context import AppContext
@@ -76,6 +83,15 @@ from ithildin.ui.window_manager import WindowManager
 _DEFAULT_SIZE = (1280, 800)
 
 _REPORT_LOG = logging.getLogger("ithildin.report")
+
+_WM_DEVICECHANGE = 0x0219
+# Broadcast to every top-level window when a device is added or removed;
+# the arrival / removal events need RegisterDeviceNotification for USB.
+_DBT_DEVNODES_CHANGED = 0x0007
+_DEVICE_SETTLE_MS = 1500
+"""Device changes rescan the adapters once they have been quiet this long."""
+_DEVICE_MAX_WAIT_MS = 5000
+"""A storm of device changes rescans this long after its first, at the latest."""
 
 
 class MainWindow(QMainWindow):
@@ -115,6 +131,10 @@ class MainWindow(QMainWindow):
         self._workspace_baseline: dict[str, object] | None = None
         # Last health state reported per running bus; absent means OK.
         self._health_seen: dict[str, BusHealth] = {}
+        self._device_change_timer = QTimer(self)
+        self._device_change_timer.setSingleShot(True)
+        self._device_change_timer.timeout.connect(self._on_devices_changed)
+        self._device_change_clock = QElapsedTimer()
 
         # Give the bottom-left corner to the left dock so the project pane
         # keeps full height and the report pane only spans the central
@@ -641,6 +661,31 @@ class MainWindow(QMainWindow):
         Called from ``app.main`` immediately after ``show()``.
         """
         self._left_dock_widget.start_adapter_probe()
+
+    if sys.platform == "win32":
+
+        def nativeEvent(
+            self, eventType: QByteArray | bytes | bytearray | memoryview, message: int, /
+        ) -> object:
+            if eventType == b"windows_generic_MSG":
+                # A VoidPtr, whatever the stub says: int() reads it, and
+                # super() takes only it back, not an int.
+                msg = ctypes.wintypes.MSG.from_address(int(message))
+                if msg.message == _WM_DEVICECHANGE:
+                    self._on_device_change(msg.wParam)
+            return super().nativeEvent(eventType, message)
+
+    def _on_device_change(self, wparam: int) -> None:
+        """Debounce Windows device changes into one adapter rescan."""
+        if wparam != _DBT_DEVNODES_CHANGED:
+            return
+        if not self._device_change_timer.isActive():
+            self._device_change_clock.start()
+        left = _DEVICE_MAX_WAIT_MS - self._device_change_clock.elapsed()
+        self._device_change_timer.start(max(0, min(_DEVICE_SETTLE_MS, left)))
+
+    def _on_devices_changed(self) -> None:
+        self._left_dock_widget.rescan_adapters()
 
     # ---- Slots ----
 

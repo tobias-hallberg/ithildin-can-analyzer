@@ -20,6 +20,7 @@ Schema versions:
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Literal
 
@@ -83,11 +84,16 @@ class BusConfig(BaseModel):
     """
 
     connect_on_startup: bool = False
-    """Open this bus automatically at app launch (``app.py`` acts on it).
+    """Open this bus automatically at app launch (``app.py`` acts on it)."""
 
-    Device identity is keyed on ``(interface, channel)``. A replug-stable
-    ``device_id`` (from a hardware serial) is deferred to a future
-    migration.
+    hw_id: str | None = Field(default=None, exclude=True)
+    """The adapter channel this bus is pinned to, in :func:`hw_id_of`'s format.
+
+    The worker opens that adapter wherever it enumerates now, and refuses
+    to open when it is missing, instead of opening whatever sits on
+    ``channel`` (``core.bus._pin_adapter``). Never written to the shared
+    ``.itp``: pins name this user's hardware, so they live in
+    ``~/.ithildin/<project>/adapter_pins.json`` (``Project``).
     """
 
     @model_validator(mode="before")
@@ -109,6 +115,69 @@ class BusConfig(BaseModel):
                 "bus or use a pcan/kvaser/gs_usb adapter."
             )
         return self
+
+
+PCAN_DEFAULT_DEVICE_IDS = (0xFF, 0xFFFFFFFF)
+"""Factory-default PCAN device IDs: every adapter nobody numbered shares them."""
+
+
+def hw_id_of(interface: str, detected: Mapping[str, object]) -> str | None:
+    """The replug-stable identity of one detected channel; ``None`` when it has none.
+
+    ``detected`` is one ``detect_available_configs`` dict (gs_usb's from
+    ``adapter_prober._detect_gs_usb``). pcan: the device ID set in PCAN-View
+    and the controller number, ``"{device_id:08x}.{controller}"``; kvaser:
+    the card serial and channel on the card, ``"{serial}.{dongle_channel}"``;
+    ixxat: the unique hardware id, which names the device, not the channel;
+    gs_usb: the USB serial.
+    """
+    if interface == "pcan":
+        device_id = detected.get("device_id")
+        controller = detected.get("controller_number")
+        if not isinstance(device_id, int) or not isinstance(controller, int):
+            return None
+        return None if device_id in PCAN_DEFAULT_DEVICE_IDS else f"{device_id:08x}.{controller}"
+    if interface == "kvaser":
+        serial = detected.get("serial")
+        dongle = detected.get("dongle_channel")
+        # CANlib reports serial 0 for its Virtual channels.
+        if not isinstance(serial, int) or not isinstance(dongle, int) or serial == 0:
+            return None
+        return f"{serial}.{dongle}"
+    if interface == "ixxat":
+        value = detected.get("unique_hardware_id")
+    elif interface == "gs_usb":
+        value = detected.get("serial")
+    else:
+        return None
+    return value if isinstance(value, str) and value else None
+
+
+ChannelKey = tuple[str, str | None, str | None]
+
+
+def channel_key(interface: str, channel: str | int, hw_id: str | None) -> ChannelKey:
+    """The physical channel a bus means: its adapter when pinned, else its channel.
+
+    A pcan, kvaser or gs_usb id names the channel wherever it enumerates,
+    so the channel number drops out; an ixxat id names the device, so the
+    channel index still counts.
+    """
+    if hw_id is None:
+        return (interface, None, str(channel))
+    return (interface, hw_id, str(channel) if interface == "ixxat" else None)
+
+
+def channel_keys(interface: str, channel: str | int, hw_id: str | None) -> frozenset[ChannelKey]:
+    """Every key by which two buses can share a channel: they clash when these meet.
+
+    The configured channel counts even for a pinned bus, so the ``.itp``,
+    which carries no pins, keeps the unique channels the ``Workspace``
+    validator requires.
+    """
+    return frozenset(
+        {channel_key(interface, channel, hw_id), channel_key(interface, channel, None)}
+    )
 
 
 class DbcRef(BaseModel):
