@@ -431,10 +431,12 @@ class _PcanBasic:
     the exception it raises, and ``unreadable`` to the error ``GetValue``
     returns for it. Listen-only set before ``Initialize`` is read back after
     it, until ``Uninitialize``. ``received`` is the receive queue: ``Read``
-    pops it, ``Reset`` empties it.
+    pops it, ``Reset`` empties it. ``api_version`` is the PCAN-Basic version
+    it reports.
     """
 
     def __init__(self, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+        self.api_version = b"4.6.0.0"
         self.initialised: set[int] = set()
         self.init_result = basic.PCAN_ERROR_OK
         self.refused: dict[int, int] = {}
@@ -466,7 +468,7 @@ class _PcanBasic:
 
     def GetValue(self, _channel: ctypes.c_ushort, parameter: ctypes.c_ubyte) -> tuple[int, object]:
         if parameter.value == basic.PCAN_API_VERSION.value:
-            return basic.PCAN_ERROR_OK, b"4.6.0.0"
+            return basic.PCAN_ERROR_OK, self.api_version
         if parameter.value in self.unreadable:
             return self.unreadable[parameter.value], 0
         return basic.PCAN_ERROR_OK, self.values.get(parameter.value, 0)
@@ -535,9 +537,34 @@ def test_pcan_open_refuses_non_preset_bitrate_before_any_driver_call(  # type: i
     assert driver.calls == []
 
 
+@pytest.mark.parametrize("api_version", [b"4.5.4.353", b"4.4.0.290", b"1, 3, 0, 50"])
+def test_pcan_open_refuses_a_pcan_basic_without_echo_frames_before_any_driver_call(  # type: ignore[no-untyped-def]
+    qapp, monkeypatch, api_version: bytes
+) -> None:
+    """4.4 and 4.5 list the adapters but refuse echo frames, which every open
+    turns on, and only after Initialize."""
+    driver = _PcanBasic(monkeypatch)
+    driver.api_version = api_version
+    installed = api_version.decode().replace(", ", ".")
+
+    with pytest.raises(can.CanInitializationError, match=f"PCAN-Basic {installed} is too old"):
+        _pcan_worker()._open_bus()
+    assert driver.calls == []
+
+
+@pytest.mark.parametrize("api_version", [b"4.10.1.968", b"5.1.0.1151"])
+def test_pcan_open_accepts_a_pcan_basic_from_4_6_on(  # type: ignore[no-untyped-def]
+    qapp, monkeypatch, api_version: bytes
+) -> None:
+    driver = _PcanBasic(monkeypatch)
+    driver.api_version = api_version
+
+    _pcan_worker()._open_bus().shutdown()
+
+
 def test_pcan_open_failing_after_initialize_releases_the_channel(qapp, monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    """A PCANBasic older than 4.6 refuses echo frames after Initialize; the
-    channel stayed initialised and every later open failed until a restart."""
+    """A driver refusing echo frames does so after Initialize; the channel
+    stayed initialised and every later open failed until a restart."""
     driver = _PcanBasic(monkeypatch)
     driver.refused[basic.PCAN_ALLOW_ECHO_FRAMES.value] = basic.PCAN_ERROR_ILLPARAMTYPE
 

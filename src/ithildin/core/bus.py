@@ -477,8 +477,9 @@ class BusWorker(QObject):
             raise can.CanInitializationError(
                 f"PCAN has no preset for {bitrate} bit/s (presets: {rates} bit/s)"
             )
-        _pin_adapter(self._config, kwargs)
         driver = cast(Any, basic.PCANBasic)()
+        _check_pcan_api_version(driver)
+        _pin_adapter(self._config, kwargs)
         channel = kwargs["channel"]
         handle = channel if isinstance(channel, int) else basic.PCAN_CHANNEL_NAMES[channel]
         held = _pcan_initialised(driver, handle)
@@ -574,6 +575,27 @@ def _pcan_level(code: int) -> _Level:
     if code & (basic.PCAN_ERROR_BUSLIGHT | basic.PCAN_ERROR_BUSHEAVY):
         return _PCAN_WARNING
     return _OK
+
+
+def _check_pcan_api_version(driver: Any) -> None:
+    """Refuse a PCAN-Basic older than 4.6.0, which added the echo frames
+    every open turns on (``receive_own_messages``). 4.4.0 already lists the
+    adapters, so a PEAK driver setup from 2019-11 to 2021-05 shows the
+    adapter, and PcanBus would fail only after Initialize, with the driver's
+    invalid-parameter error."""
+    from can.interfaces.pcan import basic
+
+    result, value = driver.GetValue(basic.PCAN_NONEBUS, basic.PCAN_API_VERSION)
+    if result != basic.PCAN_ERROR_OK:
+        # PcanBus refuses an unreadable version itself.
+        return
+    # A broken install reported "1, 3, 0, 50" (python-can issue 1642).
+    installed = value.decode("ascii").replace(",", ".").replace(" ", "")
+    if tuple(int(part) for part in installed.split(".")[:2]) < (4, 6):
+        raise can.CanInitializationError(
+            f"PCAN-Basic {installed} is too old: opening a bus needs 4.6 or newer. "
+            "Install the current PEAK driver setup from peak-system.com"
+        )
 
 
 def _pcan_initialised(driver: Any, handle: Any) -> bool:

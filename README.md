@@ -144,6 +144,9 @@ the one matching your adapter:
 
 - **PEAK** (PCAN-USB, PCAN-PCI, …) — driver setup from
   [peak-system.com](https://www.peak-system.com/Drivers.523.0.html).
+  It needs PCAN-Basic 4.6 or newer, which the driver setups ship from
+  December 2021 on: an older one lists the adapter but can't open it, so
+  update the driver if a PCAN bus reports PCAN-Basic as too old.
   Give each PCAN adapter its own device ID in PCAN-View so a bus can be
   pinned to it: adapters left at the factory ID can't be told apart once
   they are replugged in another order.
