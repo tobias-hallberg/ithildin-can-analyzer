@@ -329,7 +329,10 @@ MCP layer (`src/ithildin/mcp/`):
 - **PCAN buses open through `BusWorker._open_pcan`.** Only PCAN-Basic
   preset bitrates (`PCAN_BITRATES`), checked before any driver call:
   `PcanBus` runs any other rate at 500 kbit/s without a word (the Create
-  dialog's default rates are all presets). An open that fails after
+  dialog's default rates are all presets). Then PCAN-Basic ≥ 4.6, before
+  any channel call: every open sets echo frames (`receive_own_messages`),
+  which 4.4 and 4.5 refuse after Initialize though they list the adapters.
+  An open that fails after
   `CAN_Initialize` initialised the channel — a later step failed, or
   Initialize returned CAUTION — uninitialises it, or every later open of
   it fails until a restart. Whether this open initialised it comes from

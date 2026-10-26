@@ -22,6 +22,13 @@ once it reaches 1.0.
   made on one stays on it: it follows its Virtual channel when an adapter
   plugged in later renumbers the channels, and never opens that adapter.
 
+### Fixed
+
+- A PCAN bus on a computer whose PEAK driver is from before December 2021
+  (PCAN-Basic older than 4.6) failed to open with the driver's
+  invalid-parameter error, although the adapter was listed. It now says
+  that PCAN-Basic is too old and to install the current PEAK driver setup.
+
 ## [0.1.2] - 2026-10-26
 
 ### Added
