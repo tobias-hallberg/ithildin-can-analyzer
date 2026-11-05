@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import csv
 import math
 import uuid
 from pathlib import Path
@@ -12,9 +13,11 @@ import can
 import pytest
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor
+from PySide6.QtWidgets import QFileDialog
 
 from ithildin.app_state.project import Project
 from ithildin.core.types import FrameRecord
+from ithildin.ui import export_prefs
 from ithildin.ui.signal_plot import (
     SignalPlotWindow,
     _maxlen_for_window,
@@ -600,15 +603,20 @@ def test_new_session_clears_plot(  # type: ignore[no-untyped-def]
         assert len(curve.values) == 0
 
 
-def _engine_frame(raw: int, *, is_error_frame: bool = False) -> FrameRecord:
+def _engine_frame(raw: int, *, t: float = 1.0, is_error_frame: bool = False) -> FrameRecord:
     payload = raw.to_bytes(2, "little") + (700).to_bytes(2, "little") + bytes(4)
     return FrameRecord(
         bus_name="CAN_1",
-        timestamp=1.0,
+        timestamp=t,
         arbitration_id=0x100,
         data=payload,
         is_error_frame=is_error_frame,
     )
+
+
+def _body_frame(raw_speed: int, *, t: float) -> FrameRecord:
+    payload = raw_speed.to_bytes(2, "little") + bytes([1, 0])
+    return FrameRecord(bus_name="CAN_1", timestamp=t, arbitration_id=0x200, data=payload)
 
 
 def test_error_frame_with_a_dbc_id_is_not_plotted(  # type: ignore[no-untyped-def]
@@ -630,3 +638,136 @@ def test_error_frame_with_a_dbc_id_is_not_plotted(  # type: ignore[no-untyped-de
 
     win._on_frames_received([_engine_frame(6400)])
     assert list(curve.values) == [800.0]
+
+
+# ---- CSV export ----
+
+
+def _paused_capable_plot(qtbot, tmp_path: Path, dbc: Path):  # type: ignore[no-untyped-def]
+    ctx = make_app_context(tmp_path)
+    ctx.database.add_dbc(dbc, ["CAN_1"])
+    ctx.bus_reader._session_t0 = 0.0
+    win = SignalPlotWindow(instance_id="p1")
+    qtbot.addWidget(win)
+    win.bind(ctx)
+    return ctx, win
+
+
+def _read_csv(path: Path) -> list[list[str]]:
+    with path.open(encoding="utf-8-sig", newline="") as fh:
+        return list(csv.reader(fh))
+
+
+def test_export_needs_pause_and_samples(  # type: ignore[no-untyped-def]
+    qapp, qtbot, tmp_path: Path, example_dbc_path: Path
+) -> None:
+    ctx, win = _paused_capable_plot(qtbot, tmp_path, example_dbc_path)
+    win.add_signal(_SPEED)
+    btn = win._export_btn
+
+    win._paused_btn.click()
+    assert not btn.isEnabled()
+    win._running_btn.click()
+
+    win._on_frames_received([_engine_frame(6400, t=1.0)])
+    assert not btn.isEnabled()
+    assert "Pause" in btn.toolTip()
+
+    win._paused_btn.click()
+    assert btn.isEnabled()
+
+    win._on_visibility_toggled(_SPEED, False)
+    win._refresh_legend_live()
+    assert not btn.isEnabled()
+    win._on_visibility_toggled(_SPEED, True)
+    win._refresh_legend_live()
+    assert btn.isEnabled()
+
+    ctx.bus_reader.session_t0_changed.emit(None)
+    assert not btn.isEnabled()
+
+
+def test_export_writes_visible_curves_over_visible_window(  # type: ignore[no-untyped-def]
+    qapp, qtbot, tmp_path: Path, example_dbc_path: Path, monkeypatch
+) -> None:
+    ctx, win = _paused_capable_plot(qtbot, tmp_path, example_dbc_path)
+    export_prefs.save_csv_format("comma")
+    win.add_signal(_SPEED)
+    win.add_signal("EngineCommand.IdleSetpoint")
+    lower = win._add_subplot()
+    lower.add_signal("BodyStatus.VehicleSpeed")
+    lower.add_signal("BodyStatus.DoorOpen")
+    lower.add_signal(_SPEED)
+    lower._on_visibility_toggled("BodyStatus.DoorOpen", False)
+
+    win._on_frames_received([_engine_frame(6400, t=1.0)])
+    win._on_frames_received([_body_frame(2500, t=15.0)])
+    win._on_frames_received([_engine_frame(7200, t=20.0), _body_frame(5000, t=20.0)])
+    win._paused_btn.click()
+    # Frames arriving while paused are not plotted, so not exported either.
+    win._on_frames_received([_engine_frame(8000, t=21.0)])
+
+    reports: list[tuple[str, str]] = []
+    ctx.events.report_requested.connect(lambda msg, kind: reports.append((msg, kind)))
+    out_dir = tmp_path / "exports"
+    out_dir.mkdir()
+    monkeypatch.setattr(
+        QFileDialog, "getSaveFileName", lambda *_a, **_k: (str(out_dir / "speeds"), "")
+    )
+    win._export_btn.click()
+
+    out = out_dir / "speeds.csv"
+    # The 12 s window ends at 20 s, so the sample at 1 s is left out.
+    assert _read_csv(out) == [
+        [
+            "time_s",
+            "EngineCommand.EngineSpeed [rpm]",
+            "EngineCommand.IdleSetpoint [rpm]",
+            "BodyStatus.VehicleSpeed [km/h]",
+        ],
+        ["15.000000", "", "", "25"],
+        ["20.000000", "900", "700", "50"],
+    ]
+    assert reports == [(f"Exported 2 rows × 3 signals to {out}", "info")]
+    assert export_prefs.last_export_dir() == out_dir
+
+    # Widening the window while paused widens the export with it.
+    win._apply_window_seconds(30.0, mark_user=True)
+    win._export_btn.click()
+    assert [row[0] for row in _read_csv(out)[1:]] == ["1.000000", "15.000000", "20.000000"]
+
+
+def test_cancelled_export_writes_nothing(  # type: ignore[no-untyped-def]
+    qapp, qtbot, tmp_path: Path, example_dbc_path: Path, monkeypatch
+) -> None:
+    ctx, win = _paused_capable_plot(qtbot, tmp_path, example_dbc_path)
+    win.add_signal(_SPEED)
+    win._on_frames_received([_engine_frame(6400, t=1.0)])
+    win._paused_btn.click()
+
+    reports: list[tuple[str, str]] = []
+    ctx.events.report_requested.connect(lambda msg, kind: reports.append((msg, kind)))
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *_a, **_k: ("", ""))
+    win._export_btn.click()
+
+    assert reports == []
+    assert export_prefs.last_export_dir() == Path.home()
+
+
+def test_failed_export_is_reported(  # type: ignore[no-untyped-def]
+    qapp, qtbot, tmp_path: Path, example_dbc_path: Path, monkeypatch
+) -> None:
+    ctx, win = _paused_capable_plot(qtbot, tmp_path, example_dbc_path)
+    win.add_signal(_SPEED)
+    win._on_frames_received([_engine_frame(6400, t=1.0)])
+    win._paused_btn.click()
+
+    reports: list[tuple[str, str]] = []
+    ctx.events.report_requested.connect(lambda msg, kind: reports.append((msg, kind)))
+    missing = tmp_path / "no-such-dir" / "out.csv"
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *_a, **_k: (str(missing), ""))
+    win._export_btn.click()
+
+    assert len(reports) == 1
+    assert reports[0][0].startswith("Export failed:")
+    assert reports[0][1] == "error"

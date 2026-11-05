@@ -71,6 +71,7 @@ _INVENTORY: Final[tuple[str, ...]] = (
     "down",
     "eye",
     "eye-off",
+    "export",
     "file",
     "filter",
     "folder",
@@ -211,8 +212,9 @@ def icon(name: str) -> QIcon:
     """
     _ensure_subscribed()
 
-    tint = ThemeManager.instance().current_tokens()["fg_1"]
-    key = (name, tint)
+    tokens = ThemeManager.instance().current_tokens()
+    tint, dim = tokens["fg_1"], tokens["fg_3"]
+    key = (name, tint, dim)
     cached = _cache.get(key)
     if cached is not None:
         return cached
@@ -224,11 +226,14 @@ def icon(name: str) -> QIcon:
         _cache[key] = empty
         return empty
 
-    svg_bytes = svg_text.replace("currentColor", tint).encode("utf-8")
-
     qicon = QIcon()
-    for size in _PIXMAP_SIZES:
-        qicon.addPixmap(_render(svg_bytes, size), QIcon.Mode.Normal, QIcon.State.Off)
+    # Qt's generated Disabled pixmap greys a grey glyph into the same grey,
+    # so a disabled button would look live: paint it in the disabled-text
+    # token instead.
+    for mode, color in ((QIcon.Mode.Normal, tint), (QIcon.Mode.Disabled, dim)):
+        svg_bytes = svg_text.replace("currentColor", color).encode("utf-8")
+        for size in _PIXMAP_SIZES:
+            qicon.addPixmap(_render(svg_bytes, size), mode, QIcon.State.Off)
     _cache[key] = qicon
     return qicon
 
@@ -241,24 +246,28 @@ def toggle_icon(off_name: str, on_name: str) -> QIcon:
     """
     _ensure_subscribed()
 
-    tint = ThemeManager.instance().current_tokens()["fg_1"]
-    key = (off_name, on_name, tint)
+    tokens = ThemeManager.instance().current_tokens()
+    tint, dim = tokens["fg_1"], tokens["fg_3"]
+    key = (off_name, on_name, tint, dim)
     cached = _cache.get(key)
     if cached is not None:
         return cached
 
     try:
-        off_svg = _svg_text(off_name).replace("currentColor", tint).encode("utf-8")
-        on_svg = _svg_text(on_name).replace("currentColor", tint).encode("utf-8")
+        off_text = _svg_text(off_name)
+        on_text = _svg_text(on_name)
     except FileNotFoundError:
         empty = QIcon()
         _cache[key] = empty
         return empty
 
     qicon = QIcon()
-    for size in _PIXMAP_SIZES:
-        qicon.addPixmap(_render(off_svg, size), QIcon.Mode.Normal, QIcon.State.Off)
-        qicon.addPixmap(_render(on_svg, size), QIcon.Mode.Normal, QIcon.State.On)
+    for mode, color in ((QIcon.Mode.Normal, tint), (QIcon.Mode.Disabled, dim)):
+        off_svg = off_text.replace("currentColor", color).encode("utf-8")
+        on_svg = on_text.replace("currentColor", color).encode("utf-8")
+        for size in _PIXMAP_SIZES:
+            qicon.addPixmap(_render(off_svg, size), mode, QIcon.State.Off)
+            qicon.addPixmap(_render(on_svg, size), mode, QIcon.State.On)
     _cache[key] = qicon
     return qicon
 
