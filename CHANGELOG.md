@@ -35,6 +35,11 @@ once it reaches 1.0.
   (PCAN-Basic older than 4.6) failed to open with the driver's
   invalid-parameter error, although the adapter was listed. It now says
   that PCAN-Basic is too old and to install the current PEAK driver setup.
+- Pausing a Signal Plot dropped every frame that arrived until you
+  resumed, and the plot then drew a straight line across the gap. The
+  plot now keeps recording while paused and shows it all when you resume.
+  The paused picture, its legend values and **Export** stay as they were
+  at the pause.
 - A Signal Plot kept every sample it had drawn since the capture started,
   so over a long capture its memory use grew without limit and redrawing
   it got slower. It now keeps only as many samples per signal as its time
