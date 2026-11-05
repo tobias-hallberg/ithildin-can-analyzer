@@ -1100,6 +1100,7 @@ class _SubPlot(QObject):
 
         self._plot = GLPlotWidget(self._plot_drop)
         self._plot.set_x_range(0.0, self._window_seconds)
+        self._plot.set_segment_limit(_maxlen_for_window(self._window_seconds))
         self._plot.set_close_button_visible(can_remove)
         self._plot.close_clicked.connect(self.remove_requested)
         self._plot_drop.set_inner(self._plot)
@@ -1214,8 +1215,7 @@ class _SubPlot(QObject):
         self._plot.set_curve_unit(curve.path, curve.unit)
         self._plot.set_curve_visible(curve.path, curve.visible)
         self._apply_curve_y_axis(curve)
-        for t, val in zip(curve.times, curve.values, strict=False):
-            self._plot.append_point(curve.path, t, val)
+        self._plot.set_points(curve.path, curve.times, curve.values)
         self.invalidate_wanted_aids()
         sc, tt = self._display_extras(curve.message)
         self._curve_list.add_row(curve, signal_centric=sc, tooltip=tt)
@@ -1486,6 +1486,7 @@ class _SubPlot(QObject):
         """Resize per-curve buffers, preserving the most recent samples."""
         self._window_seconds = seconds
         new_max = _maxlen_for_window(seconds)
+        self._plot.set_segment_limit(new_max)
         for curve in self._curves.values():
             if curve.times.maxlen == new_max:
                 continue

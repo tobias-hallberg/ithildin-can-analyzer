@@ -35,6 +35,10 @@ once it reaches 1.0.
   (PCAN-Basic older than 4.6) failed to open with the driver's
   invalid-parameter error, although the adapter was listed. It now says
   that PCAN-Basic is too old and to install the current PEAK driver setup.
+- A Signal Plot kept every sample it had drawn since the capture started,
+  so over a long capture its memory use grew without limit and redrawing
+  it got slower. It now keeps only as many samples per signal as its time
+  window needs.
 
 ## [0.1.2] - 2026-10-26
 

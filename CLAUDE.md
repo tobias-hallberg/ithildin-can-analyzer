@@ -489,7 +489,15 @@ the `application/x-ithildin-signal` MIME type. Drop-target widgets use
 `ui/_signal_drop.py`'s `SignalDropArea` wrapper around any pyqtgraph
 widget (drops on the inner GraphicsView don't propagate reliably).
 
-### Plot export
+### Signal Plot samples and export
+
+Each curve's samples live in two rings (`_SignalCurve.times` / `values`,
+`maxlen = _maxlen_for_window(window)`: one window at 1 kHz, 1024 to
+200 000). `GLPlotWidget` draws from its own float32 segment buffer, which
+`set_segment_limit` bounds to the same count plus a quarter of slack, so
+memory and the per-paint upload don't grow with the capture. Rebuild a
+curve's line with `set_points` (vectorised), never a loop of
+`append_point`.
 
 The Signal Plot's Export button works only while paused. It writes the
 visible curves over the visible time window (`[shown_hi − window, shown_hi]`)

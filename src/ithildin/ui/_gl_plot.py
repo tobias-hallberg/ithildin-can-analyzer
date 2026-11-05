@@ -20,7 +20,9 @@ Public API (consumed by ``signal_plot.py``):
 
 - ``add_curve(path, color)`` / ``remove_curve(path)`` /
   ``set_curve_color(path, color)`` / ``set_curve_unit(path, unit)``
-- ``append_point(path, x, y)`` / ``clear_curve(path)``
+- ``append_point(path, x, y)`` / ``set_points(path, xs, ys)`` /
+  ``clear_curve(path)``
+- ``set_segment_limit(n)``
 - ``set_x_range(lo, hi)``
 - ``set_y_numeric(path, lo, hi)`` / ``set_y_categorical(path, cats)``
 - ``set_theme_colors(bg, fg, grid)``
@@ -60,6 +62,8 @@ from PySide6.QtOpenGL import (
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from PySide6.QtWidgets import QWidget
 
 
@@ -135,6 +139,17 @@ _LINE_WIDTH_PX = 1.0
 _VERTEX_STRIDE = 5 * 4
 _VERTICES_PER_SEGMENT = 6
 _FLOATS_PER_SEGMENT = _VERTICES_PER_SEGMENT * 5
+# The six vertices of segment A→B, in ``append_point``'s order: whether the
+# vertex sits at B (else at A, with the other end as ``a_other``), and its
+# side.
+_SEGMENT_VERTICES = (
+    (False, 1.0),
+    (False, -1.0),
+    (True, -1.0),
+    (False, -1.0),
+    (True, 1.0),
+    (True, -1.0),
+)
 
 # Layout constants — from Claude Design's chosen prototypes
 # (``design_handoff_signal_plot/`` for the tiered axes and
@@ -226,6 +241,8 @@ class GLPlotWidget(QOpenGLWidget):
         self._curves: dict[str, _Curve] = {}
         self._x_min: float = 0.0
         self._x_max: float = 1.0
+        # 0 keeps every segment; see ``set_segment_limit``.
+        self._segment_limit: int = 0
 
         self._bg = QColor("#0d1117")
         self._fg = QColor("#c9d1d9")
@@ -329,10 +346,48 @@ class GLPlotWidget(QOpenGLWidget):
             )
             curve.segment_count += 1
             curve.uploaded = False
+            limit = self._segment_limit
+            # Trimming moves every kept segment, so it waits for a quarter
+            # of the limit to pile up.
+            if limit and curve.segment_count > limit + limit // 4:
+                self._drop_oldest(curve, curve.segment_count - limit)
         curve.last_x = x
         curve.last_y = y
         curve.has_last = True
         self.update()
+
+    def set_points(self, path: str, xs: Sequence[float], ys: Sequence[float]) -> None:
+        """Replace the curve's line with ``(xs, ys)``, drawn as
+        ``append_point`` would draw them one by one."""
+        curve = self._curves.get(path)
+        if curve is None:
+            return
+        x = np.fromiter(xs, dtype=np.float64, count=len(xs))
+        y = np.fromiter(ys, dtype=np.float64, count=len(ys))
+        joined = np.isfinite(y[:-1]) & np.isfinite(y[1:])
+        a = np.column_stack((x[:-1], y[:-1]))[joined]
+        b = np.column_stack((x[1:], y[1:]))[joined]
+        if self._segment_limit and len(a) > self._segment_limit:
+            a = a[-self._segment_limit :]
+            b = b[-self._segment_limit :]
+        segments = np.empty((len(a), _VERTICES_PER_SEGMENT, 5), dtype=np.float32)
+        for v, (at_b, side) in enumerate(_SEGMENT_VERTICES):
+            segments[:, v, 0:2] = b if at_b else a
+            segments[:, v, 2:4] = a if at_b else b
+            segments[:, v, 4] = side
+        curve.data = segments.reshape(-1)
+        curve.segment_count = curve.segment_capacity = len(a)
+        curve.uploaded = False
+        curve.has_last = len(y) > 0 and math.isfinite(y[-1])
+        if curve.has_last:
+            curve.last_x = float(x[-1])
+            curve.last_y = float(y[-1])
+        self.update()
+
+    def set_segment_limit(self, limit: int) -> None:
+        """Keep each curve's newest ``limit`` segments (and up to a quarter
+        more) instead of every one since it was last cleared; 0 keeps all."""
+        self._segment_limit = limit
 
     def clear_curve(self, path: str) -> None:
         curve = self._curves.get(path)
@@ -599,6 +654,15 @@ class GLPlotWidget(QOpenGLWidget):
             new_data[:n] = curve.data[:n]
         curve.data = new_data
         curve.segment_capacity = new_capacity
+
+    @staticmethod
+    def _drop_oldest(curve: _Curve, count: int) -> None:
+        keep = curve.segment_count - count
+        start = count * _FLOATS_PER_SEGMENT
+        curve.data[: keep * _FLOATS_PER_SEGMENT] = curve.data[
+            start : start + keep * _FLOATS_PER_SEGMENT
+        ]
+        curve.segment_count = keep
 
     # ---- Layout --------------------------------------------------------
 
