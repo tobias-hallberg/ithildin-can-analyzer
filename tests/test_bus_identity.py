@@ -27,6 +27,7 @@ from ithildin.workspace.schema import (
     channel_keys,
     hw_id_of,
 )
+from tests.fake_bus import FakePcanBasic
 
 
 def _pcan(channel: str, device_id: int, controller: int = 0) -> dict[str, object]:
@@ -321,6 +322,8 @@ def test_missing_pinned_adapter_fails_the_bus_without_opening_anything(
     qapp, qtbot, monkeypatch
 ) -> None:  # type: ignore[no-untyped-def]
     detected = _Detected(monkeypatch, [_pcan("PCAN_USBBUS1", 0x2B)])
+    # The PCAN-Basic version is read before the pin, so the open needs a driver.
+    FakePcanBasic(monkeypatch)
     reader = BusReader()
     try:
         with qtbot.waitSignal(reader.bus_failed, timeout=5000) as blocker:

@@ -536,7 +536,10 @@ test org, as it does for the dock and theme.
   writing another fake. `GsUsbBus` itself runs against a fake `GsUsb`
   adapter in `tests/test_gs_usb_bus.py`, and `_open_pcan` runs
   python-can's own `PcanBus` against a fake PCAN-Basic driver
-  (`tests/test_bus.py::_PcanBasic`). `fake_bus.LiveReader` makes named
+  (`fake_bus.FakePcanBasic`), which any test that opens a pcan bus through
+  `_open_pcan` needs, a pinned one included: it loads PCAN-Basic and
+  checks its version before resolving the pin, and CI has no PEAK driver.
+  `fake_bus.LiveReader` makes named
   buses read as open and live where only their names matter (MCP sends).
 - The conftest fails a test whose `make_app_context` reader still has a
   worker running after `shutdown()`; a reader a test builds itself ends

@@ -34,7 +34,7 @@ from ithildin.ui.left_dock import BusTreeView, LeftDockWidget, _BusRow
 from ithildin.ui.main_window import MainWindow
 from ithildin.workspace.schema import BusConfig
 from tests.conftest import kill_capture, make_app_context
-from tests.fake_bus import use_fake_bus
+from tests.fake_bus import FakePcanBasic, use_fake_bus
 
 _BACK = "Adapter for bus Engine is back — click its status dot in Buses to reconnect."
 
@@ -549,6 +549,8 @@ def test_a_refused_pinned_bus_waits_for_its_adapter(
     monkeypatch.setattr(
         bus_mod, "detect_configs", lambda interface: attached.configs.get(interface, [])
     )
+    # The PCAN-Basic version is read before the pin, so the open needs a driver.
+    FakePcanBasic(monkeypatch)
     dock = make_dock(_engine(hw_id="0000002a.0"))
     reports: list[tuple[str, str]] = []
     dock._ctx.events.report_requested.connect(lambda msg, kind: reports.append((msg, kind)))
