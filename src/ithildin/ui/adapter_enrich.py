@@ -20,8 +20,8 @@ default dressed up as a fact. Each channel carries the replug-stable
 ``hw_id`` its backend reports (``schema.hw_id_of``), cleared when two
 channels of one probe report the same. No enricher here makes blocking
 calls: the kvaser firmware string and card type come from ``"firmware"``
-and ``"card_type"`` keys the prober folds into each config via extra
-CANlib queries (see ``adapter_prober._add_kvaser_channel_data``);
+and ``"card_type"`` keys ``core.bus.detect_configs`` folds into each config
+via extra CANlib queries (see ``core.bus._add_kvaser_channel_data``);
 enrichers just read them.
 """
 
@@ -33,6 +33,7 @@ from dataclasses import dataclass, field, replace
 from typing import Literal
 
 from ithildin.workspace.schema import (
+    KVASER_HWTYPE_VIRTUAL,
     PCAN_DEFAULT_DEVICE_IDS,
     SupportedInterface,
     channel_key,
@@ -47,8 +48,6 @@ Transport = Literal["USB", "Kernel", "Software", "Unknown"]
 # importing the backend just to read three constants).
 _PCAN_AVAILABLE = 0x01
 _PCAN_OCCUPIED = 0x02
-# CANlib canHWTYPE_VIRTUAL, the card type of Kvaser Virtual channels.
-_KVASER_HWTYPE_VIRTUAL = 0x01
 
 
 @dataclass(frozen=True)
@@ -115,8 +114,16 @@ _VENDORS: dict[str, str] = {
 }
 
 
-def enrich(backend: str, configs: list[dict[str, object]]) -> list[DeviceInfo]:
-    """Map raw configs for one backend into devices."""
+def enrich(
+    backend: str, configs: list[dict[str, object]], *, include_virtual: bool = False
+) -> list[DeviceInfo]:
+    """Map raw configs for one backend into devices.
+
+    Kvaser Virtual channels are left out unless ``include_virtual`` (dev
+    mode): they reach no wire, so a normal user has no use for them.
+    """
+    if backend == "kvaser" and not include_virtual:
+        configs = [c for c in configs if c.get("card_type") != KVASER_HWTYPE_VIRTUAL]
     return _drop_shared_ids(_ENRICHERS.get(backend, _enrich_default)(backend, configs))
 
 
@@ -201,12 +208,13 @@ def _enrich_ixxat(backend: str, configs: list[dict[str, object]]) -> list[Device
 def _enrich_kvaser(backend: str, configs: list[dict[str, object]]) -> list[DeviceInfo]:
     """Group kvaser channels by serial — channels of one dongle share it.
 
-    Virtual channels are left out: buses open Kvaser channels with
-    ``accept_virtual=False``, so they could never be opened.
+    Virtual channels, when :func:`enrich` keeps them, make a device of
+    their own: their serial is 0, like an unkeyed adapter's.
     """
-    by_serial: OrderedDict[str, list[dict[str, object]]] = OrderedDict()
+    by_serial: OrderedDict[str | None, list[dict[str, object]]] = OrderedDict()
     for cfg in configs:
-        if cfg.get("card_type") == _KVASER_HWTYPE_VIRTUAL:
+        if cfg.get("card_type") == KVASER_HWTYPE_VIRTUAL:
+            by_serial.setdefault(None, []).append(cfg)
             continue
         serial_raw = cfg.get("serial")
         # CANlib reports 0 for the virtual driver and unkeyed channels.
@@ -214,7 +222,7 @@ def _enrich_kvaser(backend: str, configs: list[dict[str, object]]) -> list[Devic
         by_serial.setdefault(serial, []).append(cfg)
 
     out: list[DeviceInfo] = []
-    for serial, group in by_serial.items():
+    for card_serial, group in by_serial.items():
         first = group[0]
         name = first.get("device_name")
         model = str(name) if isinstance(name, str) and name else "Kvaser device"
@@ -235,9 +243,9 @@ def _enrich_kvaser(backend: str, configs: list[dict[str, object]]) -> list[Devic
                 interface="kvaser",
                 vendor="Kvaser",
                 model=model,
-                serial=serial or None,
+                serial=card_serial or None,
                 firmware=firmware,
-                transport="USB",
+                transport="Software" if card_serial is None else "USB",
                 channels=tuple(channels),
             )
         )

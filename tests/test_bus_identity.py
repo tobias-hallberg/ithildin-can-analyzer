@@ -20,7 +20,13 @@ from ithildin.core import bus as bus_mod
 from ithildin.core.bus import KVASER_ENUM_LOCK, BusWorker, _pin_adapter
 from ithildin.core.ringbuf import RingBuffer
 from ithildin.ui import adapter_prober as prober_mod
-from ithildin.workspace.schema import BusConfig, channel_key, channel_keys, hw_id_of
+from ithildin.workspace.schema import (
+    KVASER_HWTYPE_VIRTUAL,
+    BusConfig,
+    channel_key,
+    channel_keys,
+    hw_id_of,
+)
 
 
 def _pcan(channel: str, device_id: int, controller: int = 0) -> dict[str, object]:
@@ -44,6 +50,18 @@ def _kvaser(channel: int, serial: int, dongle_channel: int = 1) -> dict[str, obj
     }
 
 
+def _kvaser_virtual(channel: int, dongle_channel: int) -> dict[str, object]:
+    """A Kvaser Virtual channel, with the card type detection folds in."""
+    return {
+        "interface": "kvaser",
+        "channel": channel,
+        "serial": 0,
+        "dongle_channel": dongle_channel,
+        "device_name": "Kvaser Virtual CAN Driver",
+        "card_type": KVASER_HWTYPE_VIRTUAL,
+    }
+
+
 # ---- Formats and keys ----
 
 
@@ -55,7 +73,9 @@ def _kvaser(channel: int, serial: int, dongle_channel: int = 1) -> dict[str, obj
         ("pcan", _pcan("PCAN_USBBUS1", 0xFFFFFFFF), None),
         ("pcan", {"interface": "pcan", "channel": "PCAN_USBBUS1"}, None),
         ("kvaser", _kvaser(0, 84621, 2), "84621.2"),
+        ("kvaser", {**_kvaser(0, 84621, 2), "card_type": 48}, "84621.2"),
         ("kvaser", _kvaser(0, 0), None),
+        ("kvaser", _kvaser_virtual(3, 2), "virtual.2"),
         ("ixxat", {"channel": 1, "unique_hardware_id": "HW123456"}, "HW123456"),
         ("gs_usb", {"channel": 0, "serial": "206C3EA1"}, "206C3EA1"),
         ("gs_usb", {"channel": 0, "serial": None}, None),
@@ -356,7 +376,6 @@ def test_kvaser_pin_waits_for_a_probe_holding_the_lock(monkeypatch) -> None:  # 
     monkeypatch.setattr(bus_mod, "kvaser_enum_hardware", enum)
     monkeypatch.setattr(bus_mod, "detect_configs", detect)
     monkeypatch.setattr(can, "Bus", lambda **_kwargs: object())
-    monkeypatch.setattr(prober_mod, "_add_kvaser_channel_data", lambda _configs: None)
     cfg = _pinned("kvaser", 0, "84621.1")
     probe = threading.Thread(target=prober_mod._detect_configs, args=("kvaser",), name="probe")
     worker = threading.Thread(
@@ -374,3 +393,107 @@ def test_kvaser_pin_waits_for_a_probe_holding_the_lock(monkeypatch) -> None:  # 
         probe.join(5)
         worker.join(5)
     assert order == ["enum probe", "detect probe", "enum worker", "detect worker"]
+
+
+# ---- Kvaser Virtual channels ----
+
+
+@pytest.mark.parametrize(
+    ("hw_id", "channel", "accept_virtual"),
+    [("virtual.1", 1, True), ("84621.1", 0, False), (None, 0, False)],
+)
+def test_only_a_virtual_pin_opens_a_kvaser_virtual_channel(  # type: ignore[no-untyped-def]
+    monkeypatch, hw_id: str | None, channel: int, accept_virtual: bool
+) -> None:
+    """A Leaf plugged in after the bus was made took channel 0 and moved the
+    Virtual channels up: the virtual pin follows its channel, and only a
+    virtual pin opens with ``accept_virtual``."""
+    monkeypatch.setattr(bus_mod, "kvaser_enum_hardware", lambda: None)
+    detected = _Detected(
+        monkeypatch, [_kvaser(0, 84621), _kvaser_virtual(1, 1), _kvaser_virtual(2, 2)]
+    )
+    cfg = _pinned("kvaser", 0, hw_id)
+
+    BusWorker(cfg.name, cfg, RingBuffer(8))._open_bus()
+
+    assert detected.opened[0]["channel"] == channel
+    assert detected.opened[0]["accept_virtual"] is accept_virtual
+
+
+def test_a_virtual_pin_never_opens_an_adapter(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """With the Virtual channels gone, the adapter now on the bus's number
+    doesn't stand in for them."""
+    _Detected(monkeypatch, [_kvaser(0, 84621)])
+    with pytest.raises(can.CanInitializationError, match="is not attached"):
+        _pin_adapter(_pinned("kvaser", 0, "virtual.1"), {"channel": 0})
+
+
+def test_kvaser_detection_carries_the_channel_data(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """The card type tells a Virtual channel's pin apart, so the worker's
+    detection needs it as much as the dock's probe."""
+
+    class Backend:
+        @staticmethod
+        def _detect_available_configs() -> list[dict[str, object]]:
+            return [{"channel": 0}]
+
+    def channel_data(configs: list[dict[str, object]]) -> None:
+        for cfg in configs:
+            cfg["card_type"] = KVASER_HWTYPE_VIRTUAL
+
+    monkeypatch.setattr(bus_mod, "_get_class_for_interface", lambda _interface: Backend)
+    monkeypatch.setattr(bus_mod, "_add_kvaser_channel_data", channel_data)
+
+    assert bus_mod.detect_configs("kvaser") == [
+        {"interface": "kvaser", "channel": 0, "card_type": KVASER_HWTYPE_VIRTUAL}
+    ]
+    assert bus_mod.detect_configs("pcan") == [{"interface": "pcan", "channel": 0}]
+
+
+def test_add_kvaser_channel_data_is_a_noop_without_canlib(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """The deepen degrades silently when python-can's kvaser wrapper can't be
+    imported — it must not raise and must leave the config dicts untouched
+    so enrichment still keeps the channel and reports firmware None."""
+    monkeypatch.setitem(sys.modules, "can.interfaces.kvaser", None)
+    configs: list[dict[str, object]] = [
+        {"interface": "kvaser", "channel": 0, "device_name": "Leaf"},
+        {"interface": "kvaser", "channel": "weird"},
+    ]
+    bus_mod._add_kvaser_channel_data(configs)
+    assert configs == [
+        {"interface": "kvaser", "channel": 0, "device_name": "Leaf"},
+        {"interface": "kvaser", "channel": "weird"},
+    ]
+
+
+def test_add_kvaser_channel_data_reads_card_type_and_firmware(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """Channel 1 is a Virtual channel (canHWTYPE_VIRTUAL) with no firmware;
+    channel 2's queries fail, which leaves its dict alone; channel 3's
+    firmware query fails, which still keeps its card type."""
+    from can.interfaces.kvaser import canlib, constants
+
+    def get_channel_data(channel: int, item: int, buf, _size: int) -> int:  # type: ignore[no-untyped-def]
+        firmware = item == constants.canCHANNELDATA_CARD_FIRMWARE_REV
+        if channel == 2 or (channel == 3 and firmware):
+            raise RuntimeError("Specified device not found")
+        # buf is a ctypes.byref(); _obj is the buffer it points at.
+        if item == constants.canCHANNELDATA_CARD_TYPE:
+            buf._obj.value = 1 if channel == 1 else 48
+        elif firmware and channel == 0:
+            buf._obj[:] = [123, 0, 18, 3]
+        return 0
+
+    monkeypatch.setattr(canlib, "canGetChannelData", get_channel_data, raising=False)
+    configs: list[dict[str, object]] = [
+        {"interface": "kvaser", "channel": 0},
+        {"interface": "kvaser", "channel": 1},
+        {"interface": "kvaser", "channel": 2},
+        {"interface": "kvaser", "channel": 3},
+    ]
+    bus_mod._add_kvaser_channel_data(configs)
+    assert configs == [
+        {"interface": "kvaser", "channel": 0, "card_type": 48, "firmware": "3.18.0.123"},
+        {"interface": "kvaser", "channel": 1, "card_type": 1},
+        {"interface": "kvaser", "channel": 2},
+        {"interface": "kvaser", "channel": 3, "card_type": 48},
+    ]

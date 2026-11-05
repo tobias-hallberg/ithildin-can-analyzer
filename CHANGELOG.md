@@ -17,6 +17,10 @@ once it reaches 1.0.
   region's number format (semicolon-separated with a decimal comma where
   1,5 is written that way). **Settings → Export** can switch it to
   comma-separated or semicolon-separated.
+- With `--dev`, the Create CAN bus dialog also lists Kvaser's Virtual
+  channels, so you can work with a Kvaser bus without an adapter. A bus
+  made on one stays on it: it follows its Virtual channel when an adapter
+  plugged in later renumbers the channels, and never opens that adapter.
 
 ## [0.1.2] - 2026-10-26
 
