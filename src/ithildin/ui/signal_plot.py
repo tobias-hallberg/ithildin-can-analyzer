@@ -29,14 +29,21 @@ Samples outlive their bus: a bus that stops or degrades breaks its
 curves' lines (a NaN marker) instead of clearing them, and only a new
 capture session clears the plot. The X axis keeps moving while a bus is
 open but silent.
+
+While paused, Export writes the visible curves over the visible time
+window to CSV (``core/signal_export.py``), from the samples already held:
+nothing is decoded for it.
 """
 
 from __future__ import annotations
 
+import logging
 import math
 import time
 from collections import deque
 from collections.abc import Callable
+from datetime import datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from cantools.database.namedsignalvalue import NamedSignalValue
@@ -71,6 +78,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
     QColorDialog,
+    QFileDialog,
     QFrame,
     QGraphicsOpacityEffect,
     QGridLayout,
@@ -88,11 +96,18 @@ from PySide6.QtWidgets import (
     QWidgetAction,
 )
 
+from ithildin.core.signal_export import ExportColumn, write_signal_csv
 from ithildin.core.types import BusHealth
 from ithildin.ui._child_base import ChildView
 from ithildin.ui._drag_payload import MessagePayload, SignalPayload, pack_into_mime
 from ithildin.ui._gl_plot import GLPlotWidget
 from ithildin.ui._signal_drop import SignalDropArea
+from ithildin.ui.export_prefs import (
+    csv_dialect,
+    last_export_dir,
+    load_csv_format,
+    remember_export_dir,
+)
 from ithildin.ui.fonts import tabular_font
 from ithildin.ui.icons import icon, themed_callback, themed_icon
 from ithildin.ui.theme import ThemeManager, pyqtgraph_palette
@@ -101,6 +116,8 @@ from ithildin.ui.view_header import ViewHeaderBar
 if TYPE_CHECKING:
     from ithildin.app_state.context import AppContext
     from ithildin.core.types import FrameRecord
+
+_log = logging.getLogger(__name__)
 
 
 _DEFAULT_WINDOW_SECONDS = 12.0
@@ -1363,6 +1380,30 @@ class _SubPlot(QObject):
             default=None,
         )
 
+    def has_samples_since(self, t: float) -> bool:
+        """Whether a visible curve holds a real (non-NaN) sample at or after ``t``."""
+        for curve in self._curves.values():
+            if not curve.visible:
+                continue
+            for st, value in zip(reversed(curve.times), reversed(curve.values), strict=True):
+                if st < t:
+                    break
+                if not math.isnan(value):
+                    return True
+        return False
+
+    def export_columns(self) -> list[ExportColumn]:
+        """The visible curves in legend order, each with a copy of its samples."""
+        return [
+            ExportColumn(
+                header=f"{curve.path} [{curve.unit}]" if curve.unit else curve.path,
+                times=list(curve.times),
+                values=list(curve.values),
+            )
+            for curve in self._curves.values()
+            if curve.visible
+        ]
+
     def set_x_range(self, lo: float, hi: float) -> None:
         self._plot.set_x_range(lo, hi)
 
@@ -1701,6 +1742,15 @@ class SignalPlotWindow(ChildView):
         pause_layout.addWidget(self._paused_btn)
         top_strip.add_widget(self._pause_segment)
 
+        self._export_btn = QToolButton(top_strip)
+        self._export_btn.setAutoRaise(True)
+        self._export_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        themed_icon("export", self._export_btn.setIcon)
+        self._export_btn.clicked.connect(self._on_export_clicked)
+        self._export_tip: str | None = None
+        self._sync_export_enabled()
+        top_strip.add_widget(self._export_btn)
+
         self._window_btn = QToolButton(top_strip)
         self._window_btn.setAutoRaise(True)
         self._window_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -1935,6 +1985,7 @@ class SignalPlotWindow(ChildView):
             lo = hi - seconds
         for sp in self._subplots:
             sp.set_x_range(lo, hi)
+        self._sync_export_enabled()
 
     def _sync_window_button_text(self) -> None:
         btn = getattr(self, "_window_btn", None)
@@ -1972,6 +2023,7 @@ class SignalPlotWindow(ChildView):
         self._shown_hi = None
         for sp in self._subplots:
             sp.clear_session()
+        self._sync_export_enabled()
 
     def _on_bus_stopped(self, bus_name: str) -> None:
         for sp in self._subplots:
@@ -1994,6 +2046,75 @@ class SignalPlotWindow(ChildView):
         for sp in self._subplots:
             sp.refresh_legend_live()
         self._advance_x_idle()
+        # Also catches curves added, removed, hidden or shown while paused.
+        self._sync_export_enabled()
+
+    # ---- CSV export ----
+
+    def _export_span(self) -> tuple[float, float] | None:
+        if self._shown_hi is None:
+            return None
+        return self._shown_hi - self._window_seconds, self._shown_hi
+
+    def _sync_export_enabled(self) -> None:
+        span = self._export_span()
+        if not self._paused:
+            tip = "Pause the plot to export what it shows"
+        elif span is None or not any(sp.has_samples_since(span[0]) for sp in self._subplots):
+            tip = "No samples in the visible time window"
+        else:
+            tip = ""
+        if tip == self._export_tip:
+            return
+        self._export_tip = tip
+        self._export_btn.setEnabled(not tip)
+        self._export_btn.setToolTip(
+            tip or "Export CSV… — the visible signals over the visible time window"
+        )
+
+    def _on_export_clicked(self) -> None:
+        span = self._export_span()
+        if span is None:
+            return
+        columns: list[ExportColumn] = []
+        seen: set[str] = set()
+        for sp in self._subplots:
+            for column in sp.export_columns():
+                if column.header not in seen:
+                    seen.add(column.header)
+                    columns.append(column)
+        if not columns:
+            return
+        default = last_export_dir() / f"plot_{datetime.now():%Y%m%d_%H%M%S}.csv"
+        path_str, _ = QFileDialog.getSaveFileName(
+            self, "Export plot data", str(default), "CSV (*.csv)"
+        )
+        if not path_str:
+            return
+        path = Path(path_str)
+        if not path.suffix:
+            path = path.with_suffix(".csv")
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            rows = write_signal_csv(
+                path,
+                columns,
+                t_lo=span[0],
+                t_hi=span[1],
+                dialect=csv_dialect(load_csv_format()),
+            )
+        except OSError as exc:
+            _log.warning("Plot export to %s failed", path, exc_info=True)
+            if self._ctx is not None:
+                self._ctx.events.report_requested.emit(f"Export failed: {exc}", "error")
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+        remember_export_dir(path.parent)
+        if self._ctx is not None:
+            self._ctx.events.report_requested.emit(
+                f"Exported {rows} rows × {len(columns)} signals to {path}", "info"
+            )
 
     # ---- Left column toggle ----
 
@@ -2026,6 +2147,7 @@ class SignalPlotWindow(ChildView):
 
     def _on_pause_selected(self, paused: bool) -> None:
         self._paused = paused
+        self._sync_export_enabled()
 
     # ---- Public API (delegates) ----
 

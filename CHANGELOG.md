@@ -7,6 +7,17 @@ once it reaches 1.0.
 
 ## [Unreleased]
 
+### Added
+
+- Export plot data to CSV. Pause a Signal Plot and click **Export** in its
+  header to save the visible signals over the visible time window, with one
+  `time_s` column and one column per signal. Signals from the same frame
+  share a row, and a signal with no sample at that moment leaves its cell
+  empty. Hidden curves are left out. By default the file follows your
+  region's number format (semicolon-separated with a decimal comma where
+  1,5 is written that way). **Settings → Export** can switch it to
+  comma-separated or semicolon-separated.
+
 ## [0.1.2] - 2026-10-26
 
 ### Added

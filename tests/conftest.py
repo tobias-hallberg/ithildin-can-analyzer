@@ -17,6 +17,7 @@ from ithildin.mcp.audit import AuditWriter
 from ithildin.mcp.bridge import McpServerBridge
 from ithildin.mcp.permissions import AllowlistStore
 from ithildin.mcp.tools import McpReadContext
+from ithildin.ui import export_prefs
 from ithildin.ui.left_dock import LeftDockWidget
 from ithildin.ui.theme import ThemeManager
 from ithildin.ui.ui_events import UiEvents
@@ -28,14 +29,16 @@ _TEST_SETTINGS = "IthildinTests"
 def _private_settings(monkeypatch):  # type: ignore[no-untyped-def]
     """Point the user-scoped ``QSettings`` at a test-only org, emptied after
     each test. The real ones are the developer's (the registry on Windows):
-    a closing MainWindow writes the dock layout there, and the dock and the
-    theme read them on construction."""
-    for cls, org, app in (
+    a closing MainWindow writes the dock layout there, the dock and the
+    theme read them on construction, and export_prefs keeps the CSV format
+    and last export folder."""
+    for owner, org, app in (
         (LeftDockWidget, "_SETTINGS_ORG", "_SETTINGS_APP"),
         (ThemeManager, "SETTINGS_ORG", "SETTINGS_APP"),
+        (export_prefs, "SETTINGS_ORG", "SETTINGS_APP"),
     ):
-        monkeypatch.setattr(cls, org, _TEST_SETTINGS)
-        monkeypatch.setattr(cls, app, _TEST_SETTINGS)
+        monkeypatch.setattr(owner, org, _TEST_SETTINGS)
+        monkeypatch.setattr(owner, app, _TEST_SETTINGS)
     yield
     QSettings(_TEST_SETTINGS, _TEST_SETTINGS).clear()
 

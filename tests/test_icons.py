@@ -57,6 +57,32 @@ def test_theme_switch_invalidates_cache(qapp) -> None:  # type: ignore[no-untype
     assert a is not b
 
 
+def _opaque_colors(qicon: QIcon, mode: QIcon.Mode, state: QIcon.State) -> set[str]:
+    image = qicon.pixmap(24, 24, mode, state).toImage()
+    return {
+        image.pixelColor(x, y).name()
+        for x in range(image.width())
+        for y in range(image.height())
+        if image.pixelColor(x, y).alpha() == 255
+    }
+
+
+def test_disabled_icons_use_the_disabled_text_color(qapp) -> None:  # type: ignore[no-untyped-def]
+    ThemeManager.reset_for_tests()
+    mgr = ThemeManager.instance()
+    mgr.apply("dark", persist=False)
+    tokens = mgr.current_tokens()
+    icons.refresh()
+
+    plain = icons.icon("export")
+    assert _opaque_colors(plain, QIcon.Mode.Normal, QIcon.State.Off) == {tokens["fg_1"]}
+    assert _opaque_colors(plain, QIcon.Mode.Disabled, QIcon.State.Off) == {tokens["fg_3"]}
+
+    toggle = icons.toggle_icon("eye", "eye-off")
+    for state in (QIcon.State.Off, QIcon.State.On):
+        assert _opaque_colors(toggle, QIcon.Mode.Disabled, state) == {tokens["fg_3"]}
+
+
 def test_toggle_icon_provides_off_and_on_states(qapp) -> None:  # type: ignore[no-untyped-def]
     icons.refresh()
     qicon = icons.toggle_icon("eye", "eye-off")

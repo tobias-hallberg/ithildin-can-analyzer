@@ -420,7 +420,9 @@ etc. over hard-coding hex. When you need a colour from Python, read
 theme-tinted multi-size `QIcon` cached by `(name, tint)`. Bundled SVGs
 live in `src/ithildin/resources/icons/`; they paint with
 `stroke="currentColor"` (or `fill="currentColor"` for filled glyphs)
-and are rewritten at load time to the active `fg_1`. The cache is
+and are rewritten at load time to the active `fg_1`, plus a Disabled-mode
+pixmap in `fg_3` (the disabled-text token): Qt's generated one greys a grey
+glyph into the same grey, so a disabled button looked live. The cache is
 cleared on `ThemeManager.theme_changed`. `toggle_icon(off, on)` makes a
 two-state icon for checkable buttons.
 
@@ -479,6 +481,20 @@ maximized.
 the `application/x-ithildin-signal` MIME type. Drop-target widgets use
 `ui/_signal_drop.py`'s `SignalDropArea` wrapper around any pyqtgraph
 widget (drops on the inner GraphicsView don't propagate reliably).
+
+### Plot export
+
+The Signal Plot's Export button works only while paused. It writes the
+visible curves over the visible time window (`[shown_hi − window, shown_hi]`)
+from the samples the curves already hold, so it decodes nothing.
+`core/signal_export.py` is the Qt-free writer: wide CSV, one row per
+distinct timestamp, blank cells where a signal has no sample, NaN
+line-break markers skipped, UTF-8 with BOM for Excel. The CSV format
+(system locale / comma / semicolon) and the last export folder are
+user-scoped `QSettings` in `ui/export_prefs.py`, never the `.itp`: the
+format follows the user's spreadsheet locale, not the project. The test
+conftest points that module's `SETTINGS_ORG` / `SETTINGS_APP` at the
+test org, as it does for the dock and theme.
 
 ## Coding conventions
 
@@ -573,6 +589,7 @@ docs as if they exist.
 - **Replay pause / scrub.** `core/replay.py` plays linearly from start
   to end. The Replay window discloses this in its hint.
 - **Settings dialog content.** `ui/settings_window.py` exposes only the
-  Project · Plot defaults section. Capture / MCP sections land in v0.2.
+  Project · Plot defaults section and the Export · CSV format choice.
+  Capture / MCP sections land in v0.2.
 - **Frame inspector bit-spanning hover highlight.** Byte cells render
   but bit-level highlight is a Stage 1.E polish item, not done.
