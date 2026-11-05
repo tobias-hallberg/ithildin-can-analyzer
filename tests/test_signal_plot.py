@@ -328,11 +328,14 @@ def test_apply_window_seconds_resizes_curve_deques(  # type: ignore[no-untyped-d
     win.add_signal("EngineCommand.EngineSpeed")
     curve = win._curves["EngineCommand.EngineSpeed"]
     assert curve.times.maxlen == _maxlen_for_window(12.0)
+    # The plot draws as many samples as the curves hold, not the session.
+    assert win._plot._segment_limit == _maxlen_for_window(12.0)
 
     win._apply_window_seconds(60.0, mark_user=True)
     assert win._window_seconds == 60.0
     assert curve.times.maxlen == _maxlen_for_window(60.0)
     assert curve.values.maxlen == _maxlen_for_window(60.0)
+    assert win._plot._segment_limit == _maxlen_for_window(60.0)
 
 
 def test_save_restore_round_trips_window_seconds(  # type: ignore[no-untyped-def]
