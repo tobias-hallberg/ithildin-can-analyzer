@@ -22,6 +22,13 @@ once it reaches 1.0.
   made on one stays on it: it follows its Virtual channel when an adapter
   plugged in later renumbers the channels, and never opens that adapter.
 
+### Removed
+
+- The **Connect on startup** option in the Create CAN bus dialog. A bus
+  opens only when you connect it: **Create & connect**, its status dot in
+  the Buses panel, or **Connect** in the toolbar. A project saved with the
+  option on still opens, with its buses waiting to be connected.
+
 ### Fixed
 
 - A PCAN bus on a computer whose PEAK driver is from before December 2021

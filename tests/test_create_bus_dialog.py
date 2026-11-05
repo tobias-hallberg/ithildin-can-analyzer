@@ -134,7 +134,6 @@ def test_create_emits_config_with_field_defaults(qapp, qtbot) -> None:  # type: 
     assert cfg.bitrate == 500_000
     assert cfg.fd is False
     assert cfg.listen_only is False
-    assert cfg.connect_on_startup is False
 
 
 def test_listen_only_toggle_flips_state(qapp, qtbot) -> None:  # type: ignore[no-untyped-def]

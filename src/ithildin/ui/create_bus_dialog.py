@@ -4,13 +4,12 @@
 
 A modal ``QDialog`` (design handoff ``design_handoff_create_can_bus``):
 name, device + channel, baudrate, a prominent listen-only safety panel,
-a connect-on-startup toggle, and a DBC picker (:class:`DbcPicker`). The
-footer offers **Create** (declare only) and **Create & connect** (declare
-then open just this bus).
+and a DBC picker (:class:`DbcPicker`). The footer offers **Create**
+(declare only) and **Create & connect** (declare then open just this bus).
 
 Scope: CAN FD is out, so there is no bus-mode/data-baudrate row. The
 dialog only sets ``BusConfig`` fields the bus layer actually consumes
-(bitrate, listen-only, and ``connect_on_startup``, acted on at launch).
+(bitrate, listen-only).
 Picked databases ride alongside the emitted ``BusConfig`` as parsed
 ``(path, Decoder)`` pairs; the left dock binds them to the new bus.
 
@@ -171,35 +170,10 @@ class _ListenOnlyPanel(QFrame):
     _locked = False
 
 
-class _ToggleRow(QWidget):
-    """A pill toggle with a label + hint, laid out like the design rows."""
-
-    def __init__(
-        self, label: str, hint: str, *, on: bool = False, parent: QWidget | None = None
-    ) -> None:
-        super().__init__(parent)
-        row = QHBoxLayout(self)
-        row.setContentsMargins(0, 6, 0, 6)
-        row.setSpacing(10)
-        self.toggle = IthildinPillToggle(parent=self)
-        self.toggle.setChecked(on)
-        row.addWidget(self.toggle, 0, Qt.AlignmentFlag.AlignTop)
-        col = QVBoxLayout()
-        col.setContentsMargins(0, 0, 0, 0)
-        col.setSpacing(2)
-        self._label = QLabel(label, self)
-        col.addWidget(self._label)
-        self._hint = QLabel(hint, self)
-        self._hint.setWordWrap(True)
-        self._hint.setObjectName("ToggleHint")
-        col.addWidget(self._hint)
-        row.addLayout(col, 1)
-
-
 class CreateCanBusDialog(QDialog):
     """Declare a CAN bus; optionally open it immediately."""
 
-    DEFAULT_SIZE = (560, 700)
+    DEFAULT_SIZE = (560, 650)
 
     bus_declared = Signal(BusConfig, list)  # (config, [(path, Decoder), …])
     bus_declared_and_connect = Signal(BusConfig, list)
@@ -309,12 +283,6 @@ class CreateCanBusDialog(QDialog):
         self._listen_only.toggled.connect(lambda _on: self._refresh_safety_hint())
         layout.addWidget(self._listen_only)
 
-        # Connect on startup
-        self._startup_row = _ToggleRow(
-            "Connect on startup", "Open this bus when Ithildin launches."
-        )
-        layout.addWidget(self._startup_row)
-
         # Databases (DBC) — picked or dropped here, parsed off-thread, bound to
         # the new bus by the left dock on Create. The dashed box is a drop zone.
         self._dbc_picker = DbcPicker(self)
@@ -359,7 +327,6 @@ class CreateCanBusDialog(QDialog):
             self._rescan_btn,
             self._baud_combo,
             self._listen_only._switch,
-            self._startup_row.toggle,
             self._cancel_btn,
             self._create_btn,
             self._connect_btn,
@@ -638,7 +605,6 @@ class CreateCanBusDialog(QDialog):
                 bitrate=int(self._baud_combo.currentData() or _DEFAULT_BAUD),
                 fd=False,
                 listen_only=self._listen_only.is_on(),
-                connect_on_startup=self._startup_row.toggle.isChecked(),
                 hw_id=self._channel.hw_id,
             )
         except ValidationError as exc:
@@ -670,7 +636,7 @@ class CreateCanBusDialog(QDialog):
             f"QLabel#DeviceInfoStrip {{ color: {tokens['fg_3']};"
             f" background: {tokens['bg_1']}; border: 1px solid {tokens['border_0']};"
             f" border-radius: 3px; padding: 4px 6px; }}"
-            f"QLabel#ToggleHint, QLabel#ListenOnlyCopy {{ color: {tokens['fg_3']}; }}"
+            f"QLabel#ListenOnlyCopy {{ color: {tokens['fg_3']}; }}"
             f"QPushButton#LinkButton {{ color: {tokens['fg_2']}; border: none; }}"
             f"QPushButton#ChannelPill {{ background: {tokens['bg_2']};"
             f" color: {tokens['fg_1']}; border: 1px solid {tokens['border_1']};"
