@@ -279,7 +279,8 @@ MCP layer (`src/ithildin/mcp/`):
   restart. `register_prober` before `thread.start()`. The `virtual` loopback
   is a dev-only surface: it's emitted by the prober and seeded in the
   Create-bus dialog **only** when `adapter_prober.dev_mode()` is on
-  (`ITHILDIN_DEV` env / `--dev` launch flag). Normal users never see it;
+  (`ITHILDIN_DEV` env / `--dev` launch flag), and so are Kvaser Virtual
+  channels (`enrich(include_virtual=)`). Normal users never see them;
   the test suite still uses the `virtual` backend directly (it stays a
   valid `SupportedInterface`).
 - **gs_usb (CANable / CANtact / candleLight) goes through `GsUsbBus`.**
@@ -317,10 +318,12 @@ MCP layer (`src/ithildin/mcp/`):
   than a timeout), an open after 10 s or once its bus is stopped. Kvaser
   buses open through `BusWorker._open_kvaser`: `accept_virtual=False` (a
   number shifted by an unplugged adapter must fail, not open a Kvaser
-  Virtual channel, so the enricher hides Virtual channels by card type),
-  and only CANlib preset bitrates, checked before any driver call
-  (`KvaserBus` leaks an init-access handle when CANlib refuses one; the
-  Create dialog offers no 800 kbit/s for Kvaser). Listen-only uses a
+  Virtual channel) unless the bus is pinned to a Virtual channel
+  (`virtual.N`, told apart by the `card_type` `detect_configs` folds in;
+  such a pin never resolves to an adapter). The enricher lists Virtual
+  channels in dev mode only. Only CANlib preset bitrates, checked before
+  any driver call (`KvaserBus` leaks an init-access handle when CANlib
+  refuses one; the Create dialog offers no 800 kbit/s for Kvaser). Listen-only uses a
   single handle: python-can sets silent mode on its write handle, which
   has no init access.
 - **PCAN buses open through `BusWorker._open_pcan`.** Only PCAN-Basic
@@ -344,7 +347,8 @@ MCP layer (`src/ithildin/mcp/`):
   (`Field(exclude=True)`, so never in the git-shared `.itp`) pins a bus to
   one adapter channel, in `schema.hw_id_of`'s format: pcan device ID (set
   in PCAN-View; the factory 0xFF / 0xFFFFFFFF identify nothing) +
-  controller, kvaser serial + channel on the card, IXXAT unique hardware
+  controller, kvaser serial + channel on the card (`virtual.` + channel for
+  a Kvaser Virtual channel), IXXAT unique hardware
   id, gs_usb USB serial. Pins live in `~/.ithildin/<project>/adapter_pins.json`
   (bus name → hw_id, atomic `os.replace`), loaded by `open_or_migrate` and
   written by `Project.save()` / `save_adapter_pins()`. A pin is set only by

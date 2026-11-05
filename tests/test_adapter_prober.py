@@ -224,49 +224,35 @@ def test_device_found_emits_enriched_grouped_device(qtbot) -> None:  # type: ign
     assert _has_virtual(devices)
 
 
-def test_add_kvaser_channel_data_is_a_noop_without_canlib(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    """The deepen degrades silently when python-can's kvaser wrapper can't be
-    imported — it must not raise and must leave the config dicts untouched
-    so enrichment still keeps the channel and reports firmware None."""
-    monkeypatch.setitem(sys.modules, "can.interfaces.kvaser", None)
+@pytest.mark.parametrize("dev", [True, False])
+def test_kvaser_virtual_channels_are_listed_in_dev_mode_only(monkeypatch, dev: bool) -> None:  # type: ignore[no-untyped-def]
+    if not dev:
+        monkeypatch.delenv("ITHILDIN_DEV")
     configs: list[dict[str, object]] = [
-        {"interface": "kvaser", "channel": 0, "device_name": "Leaf"},
-        {"interface": "kvaser", "channel": "weird"},
+        {
+            "interface": "kvaser",
+            "channel": 0,
+            "serial": 0,
+            "dongle_channel": 1,
+            "device_name": "Kvaser Virtual CAN Driver",
+            "card_type": 1,
+        },
+        {
+            "interface": "kvaser",
+            "channel": 1,
+            "serial": 84621,
+            "dongle_channel": 1,
+            "device_name": "Leaf Pro HS v2",
+            "card_type": 48,
+        },
     ]
-    prober_mod._add_kvaser_channel_data(configs)
-    assert configs == [
-        {"interface": "kvaser", "channel": 0, "device_name": "Leaf"},
-        {"interface": "kvaser", "channel": "weird"},
-    ]
+    monkeypatch.setattr(prober_mod, "_detect_configs", lambda _backend: configs)
 
+    models = [d.model for d in prober_mod._detect_and_enrich("kvaser")]
 
-def test_add_kvaser_channel_data_reads_card_type_and_firmware(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    """Channel 1 is a Virtual channel (canHWTYPE_VIRTUAL) with no firmware;
-    channel 2's query fails, which leaves its dict alone."""
-    from can.interfaces.kvaser import canlib, constants
-
-    def get_channel_data(channel: int, item: int, buf, _size: int) -> int:  # type: ignore[no-untyped-def]
-        if channel == 2:
-            raise RuntimeError("Specified device not found")
-        # buf is a ctypes.byref(); _obj is the buffer it points at.
-        if item == constants.canCHANNELDATA_CARD_TYPE:
-            buf._obj.value = 1 if channel == 1 else 48
-        elif item == constants.canCHANNELDATA_CARD_FIRMWARE_REV and channel == 0:
-            buf._obj[:] = [123, 0, 18, 3]
-        return 0
-
-    monkeypatch.setattr(canlib, "canGetChannelData", get_channel_data, raising=False)
-    configs: list[dict[str, object]] = [
-        {"interface": "kvaser", "channel": 0},
-        {"interface": "kvaser", "channel": 1},
-        {"interface": "kvaser", "channel": 2},
-    ]
-    prober_mod._add_kvaser_channel_data(configs)
-    assert configs == [
-        {"interface": "kvaser", "channel": 0, "card_type": 48, "firmware": "3.18.0.123"},
-        {"interface": "kvaser", "channel": 1, "card_type": 1},
-        {"interface": "kvaser", "channel": 2},
-    ]
+    assert models == (
+        ["Kvaser Virtual CAN Driver", "Leaf Pro HS v2"] if dev else ["Leaf Pro HS v2"]
+    )
 
 
 def test_kvaser_probe_reenumerates_and_detects_under_the_lock(monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -285,10 +271,9 @@ def test_kvaser_probe_reenumerates_and_detects_under_the_lock(monkeypatch) -> No
 
     monkeypatch.setattr(bus_mod, "kvaser_enum_hardware", record("enum"))
     monkeypatch.setattr(bus_mod, "detect_configs", record("detect"))
-    monkeypatch.setattr(prober_mod, "_add_kvaser_channel_data", record("channel data"))
 
     assert prober_mod._detect_configs("kvaser") == [{"interface": "kvaser", "channel": 0}]
-    assert calls == [("enum", True), ("detect", True), ("channel data", True)]
+    assert calls == [("enum", True), ("detect", True)]
     assert not bus_mod.KVASER_ENUM_LOCK.locked()
 
 

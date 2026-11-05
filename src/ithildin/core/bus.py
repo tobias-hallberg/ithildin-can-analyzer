@@ -25,6 +25,7 @@ app one thing to start/stop.
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import importlib
 import logging
@@ -41,7 +42,7 @@ from PySide6.QtCore import QDeadlineTimer, QObject, Qt, QThread, Signal, Slot
 
 from ithildin.core.ringbuf import RingBuffer
 from ithildin.core.types import HEALTH_RANK, BusHealth, FrameRecord
-from ithildin.workspace.schema import BusConfig, hw_id_of
+from ithildin.workspace.schema import KVASER_VIRTUAL_PREFIX, BusConfig, hw_id_of
 
 _log = logging.getLogger(__name__)
 
@@ -516,8 +517,11 @@ class BusWorker(QObject):
                 f"Kvaser has no preset for {bitrate} bit/s (presets: {rates} bit/s)"
             )
         # A channel number shifted by an unplugged adapter must fail to open,
-        # not open a Kvaser Virtual channel that looks like a live bus.
-        kwargs["accept_virtual"] = False
+        # not open a Kvaser Virtual channel that looks like a live bus. A bus
+        # pinned to a Virtual channel is the exception: its pin resolves only
+        # to a Virtual channel, never to an adapter's.
+        hw_id = self._config.hw_id
+        kwargs["accept_virtual"] = hw_id is not None and hw_id.startswith(KVASER_VIRTUAL_PREFIX)
         self._take_driver_lock(KVASER_ENUM_LOCK, "Kvaser")
         try:
             kvaser_enum_hardware()
@@ -718,6 +722,9 @@ def detect_configs(interface: str) -> list[dict[str, Any]]:
     A hung driver call would hang the exit, and a slow one would read as no
     adapters while it carried on outside the caller's ``KVASER_ENUM_LOCK``.
     A backend whose module doesn't import, or that can't detect, has none.
+    Kvaser channels also carry ``"card_type"`` and ``"firmware"``
+    (:func:`_add_kvaser_channel_data`): the card type tells a Virtual
+    channel's ``hw_id`` apart.
     """
     try:
         bus_class = _get_class_for_interface(interface)
@@ -727,7 +734,56 @@ def detect_configs(interface: str) -> list[dict[str, Any]]:
         detected = bus_class._detect_available_configs()
     except NotImplementedError:
         return []
-    return [{"interface": interface, **config} for config in detected]
+    configs = [{"interface": interface, **config} for config in detected]
+    if interface == "kvaser":
+        _add_kvaser_channel_data(configs)
+    return configs
+
+
+def _add_kvaser_channel_data(configs: list[dict[str, Any]]) -> None:
+    """Fold the CANlib card type and firmware revision into each kvaser
+    config dict.
+
+    ``detect_available_configs`` gives name/serial/dongle_channel but not
+    these; two extra passive ``canGetChannelData`` queries per channel
+    add them (no channel open, so it's cheap and side-effect free). A
+    query that fails leaves its key absent: with no card type the channel
+    counts as hardware, with no firmware that reads as unknown.
+
+    The revision is returned as four 16-bit words. CANlib packs it
+    most-significant word first as ``major.minor.build.release``; that
+    ordering is not documented by python-can, so confirm against a real
+    Kvaser. A wrong guess only mislabels the string — it can't break the
+    probe.
+    """
+    try:
+        from can.interfaces.kvaser import canlib, constants
+    except Exception:
+        return
+    for cfg in configs:
+        channel = cfg.get("channel")
+        if not isinstance(channel, int):
+            continue
+        card_type = ctypes.c_uint()
+        with contextlib.suppress(Exception):
+            canlib.canGetChannelData(
+                channel,
+                constants.canCHANNELDATA_CARD_TYPE,
+                ctypes.byref(card_type),
+                ctypes.sizeof(card_type),
+            )
+            cfg["card_type"] = card_type.value
+        firmware = (ctypes.c_ushort * 4)()
+        with contextlib.suppress(Exception):
+            canlib.canGetChannelData(
+                channel,
+                constants.canCHANNELDATA_CARD_FIRMWARE_REV,
+                ctypes.byref(firmware),
+                ctypes.sizeof(firmware),
+            )
+            words = tuple(firmware)
+            if any(words):
+                cfg["firmware"] = ".".join(str(w) for w in reversed(words))
 
 
 KVASER_ENUM_LOCK = threading.Lock()

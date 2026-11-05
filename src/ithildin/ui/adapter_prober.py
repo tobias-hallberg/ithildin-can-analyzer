@@ -13,9 +13,9 @@ Create CAN bus dialog runs its own instance of this prober on open and
 on rescan; the left dock runs one at startup and on every rescan (a
 device change on Windows, or its ↻) to mark declared buses available.
 
-The no-hardware virtual loopback is emitted last, but only in dev mode
-(``ITHILDIN_DEV`` / ``--dev``) — normal users never see it. See
-:func:`dev_mode`.
+The no-hardware virtual loopback is emitted last, and Kvaser Virtual
+channels are listed, but only in dev mode (``ITHILDIN_DEV`` / ``--dev``) —
+normal users never see them. See :func:`dev_mode`.
 
 Per-backend probing (one ``core.bus.detect_configs`` call per backend)
 lets adapters appear in the dock progressively rather than as a single
@@ -93,11 +93,11 @@ VIRTUAL_LOOPBACK = AdapterChoice(
 
 
 def dev_mode() -> bool:
-    """Whether dev-only surfaces (currently the virtual loopback adapter)
-    are exposed in the UI.
+    """Whether dev-only surfaces (the virtual loopback adapter, Kvaser
+    Virtual channels) are exposed in the UI.
 
-    The loopback exists for development, demos, and the test suite — it
-    is not something a normal user should connect to — so it is hidden
+    They exist for development, demos, and the test suite — not something
+    a normal user should connect to — so they are hidden
     unless ``ITHILDIN_DEV`` is set in the environment (the ``--dev``
     launch flag sets it). Read live rather than cached so tests can flip
     it per case via ``monkeypatch.setenv``.
@@ -288,7 +288,7 @@ def _detect_and_enrich(backend: str) -> list[DeviceInfo]:
     Runs the raw probe and the enrichment together so both are bounded
     by ``_probe_with_timeout``'s ceiling.
     """
-    return enrich(backend, _detect_configs(backend))
+    return enrich(backend, _detect_configs(backend), include_virtual=dev_mode())
 
 
 def _detect_configs(backend: str) -> list[dict[str, object]]:
@@ -313,11 +313,9 @@ def _detect_configs(backend: str) -> list[dict[str, object]]:
         raise RuntimeError("Kvaser driver busy: a Kvaser bus or earlier scan is still in it")
     try:
         kvaser_enum_hardware()
-        configs = detect_configs(backend)
-        _add_kvaser_channel_data(configs)
+        return detect_configs(backend)
     finally:
         KVASER_ENUM_LOCK.release()
-    return configs
 
 
 def _detect_gs_usb() -> list[dict[str, object]]:
@@ -349,53 +347,3 @@ def _detect_gs_usb() -> list[dict[str, object]]:
     finally:
         GS_USB_LOCK.release()
     return configs
-
-
-def _add_kvaser_channel_data(configs: list[dict[str, object]]) -> None:
-    """Fold the CANlib card type and firmware revision into each kvaser
-    config dict.
-
-    ``detect_available_configs`` gives name/serial/dongle_channel but not
-    these; two extra passive ``canGetChannelData`` queries per channel
-    add them (no channel open, so it's cheap and side-effect free). The
-    enricher hides Kvaser Virtual channels by ``"card_type"``. On any
-    CANlib hiccup both keys are simply absent — the enricher then keeps
-    the channel and reports firmware as ``None``.
-
-    The revision is returned as four 16-bit words. CANlib packs it
-    most-significant word first as ``major.minor.build.release``; that
-    ordering is not documented by python-can, so confirm against a real
-    Kvaser. A wrong guess only mislabels the string — it can't break the
-    probe.
-    """
-    try:
-        import ctypes
-
-        from can.interfaces.kvaser import canlib, constants
-    except Exception:
-        return
-    for cfg in configs:
-        channel = cfg.get("channel")
-        if not isinstance(channel, int):
-            continue
-        card_type = ctypes.c_uint()
-        firmware = (ctypes.c_ushort * 4)()
-        try:
-            canlib.canGetChannelData(
-                channel,
-                constants.canCHANNELDATA_CARD_TYPE,
-                ctypes.byref(card_type),
-                ctypes.sizeof(card_type),
-            )
-            canlib.canGetChannelData(
-                channel,
-                constants.canCHANNELDATA_CARD_FIRMWARE_REV,
-                ctypes.byref(firmware),
-                ctypes.sizeof(firmware),
-            )
-        except Exception:
-            continue
-        cfg["card_type"] = card_type.value
-        words = tuple(firmware)
-        if any(words):
-            cfg["firmware"] = ".".join(str(w) for w in reversed(words))

@@ -47,41 +47,65 @@ def test_kvaser_groups_channels_by_serial() -> None:
     assert dev.firmware is None
 
 
+_KVASER_VIRTUAL_AND_HARDWARE: list[dict[str, object]] = [
+    {
+        "interface": "kvaser",
+        "channel": 0,
+        "device_name": "Kvaser Virtual CAN Driver",
+        "serial": 0,
+        "dongle_channel": 1,
+        "card_type": 1,
+    },
+    {
+        "interface": "kvaser",
+        "channel": 1,
+        "device_name": "Kvaser Virtual CAN Driver",
+        "serial": 0,
+        "dongle_channel": 2,
+        "card_type": 1,
+    },
+    {
+        "interface": "kvaser",
+        "channel": 2,
+        "device_name": "Kvaser Leaf Light v2",
+        "serial": 12345,
+        "dongle_channel": 1,
+        "card_type": 48,
+    },
+    {
+        # An unkeyed adapter: serial 0, like a Virtual channel.
+        "interface": "kvaser",
+        "channel": 3,
+        "device_name": "Kvaser Leaf Light v2",
+        "serial": 0,
+        "dongle_channel": 1,
+        "card_type": 48,
+    },
+]
+
+
 def test_kvaser_virtual_channels_are_dropped() -> None:
-    """A bus opens Kvaser channels with ``accept_virtual=False``, so a
-    Virtual channel (card type canHWTYPE_VIRTUAL) is never offered."""
-    devices = enrich(
-        "kvaser",
-        [
-            {
-                "interface": "kvaser",
-                "channel": 0,
-                "device_name": "Kvaser Virtual CAN Driver",
-                "serial": 0,
-                "dongle_channel": 1,
-                "card_type": 1,
-            },
-            {
-                "interface": "kvaser",
-                "channel": 1,
-                "device_name": "Kvaser Virtual CAN Driver",
-                "serial": 0,
-                "dongle_channel": 2,
-                "card_type": 1,
-            },
-            {
-                "interface": "kvaser",
-                "channel": 2,
-                "device_name": "Kvaser Leaf Light v2",
-                "serial": 12345,
-                "dongle_channel": 1,
-                "card_type": 48,
-            },
-        ],
-    )
+    """Outside dev mode a Virtual channel (card type canHWTYPE_VIRTUAL) is
+    never offered: it reaches no wire."""
+    devices = enrich("kvaser", _KVASER_VIRTUAL_AND_HARDWARE)
     assert [(d.model, [c.channel for c in d.channels]) for d in devices] == [
-        ("Kvaser Leaf Light v2", [2])
+        ("Kvaser Leaf Light v2", [2]),
+        ("Kvaser Leaf Light v2", [3]),
     ]
+
+
+def test_kvaser_virtual_channels_are_a_device_of_their_own_in_dev_mode() -> None:
+    """Pinned as ``virtual.N``, apart from the unkeyed adapter sharing serial 0."""
+    virtual, leaf, unkeyed = enrich("kvaser", _KVASER_VIRTUAL_AND_HARDWARE, include_virtual=True)
+    assert virtual.model == "Kvaser Virtual CAN Driver"
+    assert virtual.transport == "Software"
+    assert virtual.serial is None
+    assert [(c.channel, c.label, c.hw_id) for c in virtual.channels] == [
+        (0, "ch0", "virtual.1"),
+        (1, "ch1", "virtual.2"),
+    ]
+    assert (leaf.transport, [c.hw_id for c in leaf.channels]) == ("USB", ["12345.1"])
+    assert (unkeyed.transport, [c.hw_id for c in unkeyed.channels]) == ("USB", [None])
 
 
 def test_kvaser_reads_firmware_folded_in_by_prober() -> None:

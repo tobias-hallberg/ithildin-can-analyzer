@@ -87,6 +87,8 @@ def _format_bitrate(bps: int) -> str:
 def _suggested_name(device: DeviceInfo, channel: ChannelInfo, taken: set[str]) -> str:
     if device.interface == "virtual":
         base = "CAN"
+    elif device.transport == "Software":
+        base = f"{device.vendor} virtual {channel.label}"
     else:
         base = f"{device.vendor} {channel.label}"
     if base not in taken:

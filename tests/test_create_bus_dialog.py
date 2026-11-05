@@ -487,3 +487,38 @@ def test_dialog_skips_hung_backends_and_shares_new_ones(qapp, qtbot, monkeypatch
         assert hung == {"pcan", "kvaser"}
     finally:
         release.set()
+
+
+def test_dev_mode_offers_kvaser_virtual_channels_pinned_as_virtual(
+    qapp, qtbot, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    def detect(backend: str) -> list[dict[str, object]]:
+        if backend != "kvaser":
+            return []
+        return [
+            {
+                "interface": "kvaser",
+                "channel": channel,
+                "device_name": "Kvaser Virtual CAN Driver",
+                "serial": 0,
+                "dongle_channel": channel + 1,
+                "card_type": 1,
+            }
+            for channel in (0, 1)
+        ]
+
+    monkeypatch.setattr(prober_mod, "_detect_configs", detect)
+    dlg = _make_dialog(qtbot)
+    qtbot.waitUntil(lambda: dlg._prober is None, timeout=5000)
+    index = next(i for i, d in enumerate(dlg._devices) if d.interface == "kvaser")
+    dlg._device_combo.setCurrentIndex(index)
+    captured: list[BusConfig] = []
+    dlg.bus_declared.connect(lambda cfg, _dbcs: captured.append(cfg))
+
+    dlg._on_create()
+
+    assert (captured[0].name, captured[0].channel, captured[0].hw_id) == (
+        "Kvaser virtual ch0",
+        0,
+        "virtual.1",
+    )
