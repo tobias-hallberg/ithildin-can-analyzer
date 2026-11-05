@@ -489,7 +489,7 @@ the `application/x-ithildin-signal` MIME type. Drop-target widgets use
 `ui/_signal_drop.py`'s `SignalDropArea` wrapper around any pyqtgraph
 widget (drops on the inner GraphicsView don't propagate reliably).
 
-### Signal Plot samples and export
+### Signal Plot samples, pause and export
 
 Each curve's samples live in two rings (`_SignalCurve.times` / `values`,
 `maxlen = _maxlen_for_window(window)`: one window at 1 kHz, 1024 to
@@ -499,9 +499,19 @@ memory and the per-paint upload don't grow with the capture. Rebuild a
 curve's line with `set_points` (vectorised), never a loop of
 `append_point`.
 
+Pause freezes the picture, not the capture. Frames keep going into the
+rings (filtered to the plotted IDs first, as when running) while the
+sub-plots are frozen: nothing is drawn, the X axis and Y ranges hold, and
+`_SignalCurve.frozen` keeps the samples and legend value from the pause,
+which the plot, legend and Export use (`_SignalCurve.shown()`), since a
+long pause rolls the rings past them. A curve added or moved while paused
+follows the same snapshot. Resume (`_SubPlot.thaw`) redraws each curve
+from its ring, which always covers the visible window, so there is no gap
+and no line drawn across one.
+
 The Signal Plot's Export button works only while paused. It writes the
 visible curves over the visible time window (`[shown_hi − window, shown_hi]`)
-from the samples the curves already hold, so it decodes nothing.
+from the pause's snapshot, so it decodes nothing.
 `core/signal_export.py` is the Qt-free writer: wide CSV, one row per
 distinct timestamp, blank cells where a signal has no sample, NaN
 line-break markers skipped, UTF-8 with BOM for Excel. The CSV format
