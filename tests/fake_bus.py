@@ -5,17 +5,23 @@
 ``use_fake_bus`` makes every ``BusWorker`` open the fake instead of a real
 backend, so a ``BusConfig(interface="pcan" | "kvaser" | "ixxat", ...)``
 exercises that backend's branches without importing a vendor module.
-``LiveReader`` stands in for open buses where only their names matter.
+``FakePcanBasic`` stands in for the PCAN-Basic driver under python-can's
+real ``PcanBus``, for tests of ``BusWorker._open_pcan`` on a host without
+PEAK's driver. ``LiveReader`` stands in for open buses where only their
+names matter.
 """
 
 from __future__ import annotations
 
+import ctypes
 import queue
 import threading
 from typing import Any
 
 import can
 import pytest
+from can.interfaces.pcan import basic
+from can.interfaces.pcan import pcan as pcan_mod
 
 from ithildin.app_state.bus_reader import BusReader
 from ithildin.core.bus import BusWorker
@@ -125,6 +131,85 @@ def use_fake_bus(monkeypatch: pytest.MonkeyPatch, fake: FakeBus | None = None) -
 
     monkeypatch.setattr(BusWorker, "_open_bus", _open)
     return bus
+
+
+class FakePcanBasic:
+    """PCAN-Basic for one process, under python-can's real ``PcanBus``.
+
+    Like the driver it keeps the channels this process has initialised:
+    ``Initialize`` refuses one already initialised, ``GetStatus`` reports
+    ``PCAN_ERROR_INITIALIZE`` for one that isn't. ``init_result`` is what
+    ``Initialize`` returns otherwise (CAUTION initialises too); ``refused``
+    maps a parameter to the error ``SetValue`` returns for it, ``raises`` to
+    the exception it raises, and ``unreadable`` to the error ``GetValue``
+    returns for it. Listen-only set before ``Initialize`` is read back after
+    it, until ``Uninitialize``. ``received`` is the receive queue: ``Read``
+    pops it, ``Reset`` empties it. ``api_version`` is the PCAN-Basic version
+    it reports.
+    """
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.api_version = b"4.6.0.0"
+        self.initialised: set[int] = set()
+        self.init_result = basic.PCAN_ERROR_OK
+        self.refused: dict[int, int] = {}
+        self.raises: dict[int, BaseException] = {}
+        self.unreadable: dict[int, int] = {}
+        self.values: dict[int, object] = {}
+        self.received: list[basic.TPCANMsg] = []
+        self.calls: list[tuple[str, int]] = []
+        self.uninitialised: list[int] = []
+        monkeypatch.setattr(basic, "PCANBasic", lambda: self)
+        monkeypatch.setattr(pcan_mod, "PCANBasic", lambda: self)
+
+    def Initialize(self, channel: ctypes.c_ushort, btr0btr1: ctypes.c_ushort, *_: object) -> int:
+        self.calls.append(("Initialize", btr0btr1.value))
+        if channel.value in self.initialised:
+            return basic.PCAN_ERROR_INITIALIZE
+        if self.init_result in (basic.PCAN_ERROR_OK, basic.PCAN_ERROR_CAUTION):
+            self.initialised.add(channel.value)
+        return self.init_result
+
+    def SetValue(self, _channel: ctypes.c_ushort, parameter: ctypes.c_ubyte, value: object) -> int:
+        self.calls.append(("SetValue", parameter.value))
+        if parameter.value in self.raises:
+            raise self.raises[parameter.value]
+        status = self.refused.get(parameter.value, basic.PCAN_ERROR_OK)
+        if status == basic.PCAN_ERROR_OK:
+            self.values[parameter.value] = value
+        return status
+
+    def GetValue(self, _channel: ctypes.c_ushort, parameter: ctypes.c_ubyte) -> tuple[int, object]:
+        if parameter.value == basic.PCAN_API_VERSION.value:
+            return basic.PCAN_ERROR_OK, self.api_version
+        if parameter.value in self.unreadable:
+            return self.unreadable[parameter.value], 0
+        return basic.PCAN_ERROR_OK, self.values.get(parameter.value, 0)
+
+    def Read(self, _channel: ctypes.c_ushort) -> tuple[int, basic.TPCANMsg, basic.TPCANTimestamp]:
+        if not self.received:
+            return basic.PCAN_ERROR_QRCVEMPTY, basic.TPCANMsg(), basic.TPCANTimestamp()
+        return basic.PCAN_ERROR_OK, self.received.pop(0), basic.TPCANTimestamp()
+
+    def Reset(self, _channel: ctypes.c_ushort) -> int:
+        self.received.clear()
+        return basic.PCAN_ERROR_OK
+
+    def GetStatus(self, channel: ctypes.c_ushort) -> int:
+        if channel.value in self.initialised:
+            return basic.PCAN_ERROR_OK
+        return basic.PCAN_ERROR_INITIALIZE
+
+    def Uninitialize(self, channel: ctypes.c_ushort) -> int:
+        self.uninitialised.append(channel.value)
+        if channel.value not in self.initialised:
+            return basic.PCAN_ERROR_INITIALIZE
+        self.initialised.discard(channel.value)
+        self.values.clear()
+        return basic.PCAN_ERROR_OK
+
+    def GetErrorText(self, error: int, _language: int = 0) -> tuple[int, bytes]:
+        return basic.PCAN_ERROR_OK, f"PCAN error 0x{error:X}".encode()
 
 
 class LiveReader(BusReader):
