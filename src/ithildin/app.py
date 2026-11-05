@@ -180,13 +180,6 @@ def main(argv: list[str] | None = None) -> int:
     if project.is_saved:
         window_manager.restore_from_disk()
 
-    # Bring up any bus the user marked "connect on startup". Done after
-    # views are restored so they're listening when frames arrive.
-    # open_all swallows per-bus failures (surfaced via BusReader.error).
-    startup_buses = [b for b in project.workspace.bus if b.connect_on_startup]
-    if startup_buses:
-        bus_reader.open_all(startup_buses)
-
     # Opt-in auto-start. Bind failures surface via McpServerBridge.error,
     # which MainWindow routes into the report dock.
     if project.workspace.mcp.enabled:
@@ -195,8 +188,8 @@ def main(argv: list[str] | None = None) -> int:
     app.aboutToQuit.connect(window_manager.flush)
     app.aboutToQuit.connect(lambda: mcp_bridge.stop())
     app.aboutToQuit.connect(audit.close)
-    # Armed once the loop runs: synchronous startup (layout restore,
-    # open_all) is not a stall.
+    # Armed once the loop runs: synchronous startup (layout restore) is
+    # not a stall.
     QTimer.singleShot(0, watchdog.start)
     return _finish(bus_reader, relay, app.exec())
 

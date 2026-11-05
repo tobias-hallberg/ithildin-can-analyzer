@@ -380,35 +380,18 @@ def test_views_round_trip(tmp_path: Path) -> None:
     assert reloaded.views[1].state == {"filter": "0x1", "paused": True}
 
 
-def test_bus_profile_connect_on_startup_defaults_off() -> None:
-    cfg = BusConfig(name="CAN_1", interface="virtual", channel="v", bitrate=500000)
-    assert cfg.connect_on_startup is False
-
-
-def test_bus_profile_connect_on_startup_round_trip(tmp_path: Path) -> None:
-    ws = Workspace(
-        name="profile",
-        bus=[
-            BusConfig(
-                name="Powertrain",
-                interface="virtual",
-                channel="v",
-                bitrate=500000,
-                connect_on_startup=True,
-            )
-        ],
+def test_retired_connect_on_startup_key_loads_and_is_dropped_on_save(tmp_path: Path) -> None:
+    """Up to 0.1.2 every saved bus carried ``connect_on_startup``; such a
+    project must still open (``extra='forbid'``), and saving it drops the key."""
+    old = tmp_path / "old.itp"
+    old.write_text(
+        _DEMO_V2_TOML.replace("fd = false\n", "fd = false\nconnect_on_startup = true\n"),
+        encoding="utf-8",
     )
-    out = tmp_path / "profile.itp"
+    assert "connect_on_startup = true" in old.read_text(encoding="utf-8")
+    ws = load_workspace(old)
+    assert [b.name for b in ws.bus] == ["CAN_1"]
+
+    out = tmp_path / "resaved.itp"
     save_workspace(ws, out)
-    cfg = load_workspace(out).bus[0]
-    assert cfg.connect_on_startup is True
-
-
-def test_legacy_v2_file_without_connect_on_startup_still_loads(tmp_path: Path) -> None:
-    """A v2 file written before ``connect_on_startup`` existed must parse,
-    with the field falling back to its default (extra='forbid' rejects
-    only unknown keys, not missing ones)."""
-    out = tmp_path / "old.itp"
-    out.write_text(_DEMO_V2_TOML, encoding="utf-8")
-    cfg = load_workspace(out).bus[0]
-    assert cfg.connect_on_startup is False
+    assert "connect_on_startup" not in out.read_text(encoding="utf-8")

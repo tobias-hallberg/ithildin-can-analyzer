@@ -83,9 +83,6 @@ class BusConfig(BaseModel):
     ``LISTEN_ONLY_INTERFACES``.
     """
 
-    connect_on_startup: bool = False
-    """Open this bus automatically at app launch (``app.py`` acts on it)."""
-
     hw_id: str | None = Field(default=None, exclude=True)
     """The adapter channel this bus is pinned to, in :func:`hw_id_of`'s format.
 
@@ -104,6 +101,15 @@ class BusConfig(BaseModel):
         if isinstance(data, dict) and data.get("interface") == "cantact":
             channel = str(data.get("channel", 0)).removeprefix("ch:")
             data = {**data, "interface": "gs_usb", "channel": int(channel)}
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def _drop_connect_on_startup(cls, data: Any) -> Any:
+        # Up to 0.1.2 every saved bus carried ``connect_on_startup``; the
+        # option is gone, and a bus opens only when the user connects it.
+        if isinstance(data, dict) and "connect_on_startup" in data:
+            data = {k: v for k, v in data.items() if k != "connect_on_startup"}
         return data
 
     @model_validator(mode="after")
