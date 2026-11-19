@@ -50,6 +50,18 @@ _stuck_bus_readers: list[BusReader] = []
 
 
 @pytest.fixture(autouse=True)
+def _windows_backend_set(monkeypatch):  # type: ignore[no-untyped-def]
+    """Probe the Windows/Linux backend set on every platform: tests stub
+    kvaser & co., which macOS doesn't probe. ``supported_backends("darwin")``
+    is tested by calling it with the platform."""
+    from ithildin.ui import adapter_prober
+
+    monkeypatch.setattr(
+        adapter_prober, "supported_backends", lambda: adapter_prober._SUPPORTED_BACKENDS
+    )
+
+
+@pytest.fixture(autouse=True)
 def _close_leaked_bus_readers():  # type: ignore[no-untyped-def]
     """Shut down every BusReader a test built via ``make_app_context``.
 

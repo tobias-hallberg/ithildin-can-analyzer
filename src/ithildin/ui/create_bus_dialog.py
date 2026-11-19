@@ -44,7 +44,9 @@ from ithildin.ui.adapter_enrich import ChannelInfo, DeviceInfo
 from ithildin.ui.adapter_prober import (
     AdapterProber,
     dev_mode,
+    missing_driver_hint,
     register_prober,
+    socketcand_device,
     virtual_device,
 )
 from ithildin.ui.banner import Banner
@@ -55,6 +57,8 @@ from ithildin.ui.pill_toggle import IthildinPillToggle
 from ithildin.ui.theme import ThemeManager
 from ithildin.workspace.schema import (
     LISTEN_ONLY_INTERFACES,
+    SOCKETCAND_DEFAULT_HOST,
+    SOCKETCAND_DEFAULT_PORT,
     BusConfig,
     ChannelKey,
     channel_keys,
@@ -261,6 +265,16 @@ class CreateCanBusDialog(QDialog):
         self._empty_hint.setVisible(False)
         layout.addWidget(self._empty_hint)
 
+        hint = missing_driver_hint()
+        self._driver_hint = QLabel(hint or "", self)
+        self._driver_hint.setObjectName("DeviceInfoStrip")
+        self._driver_hint.setFont(tabular_font(8))
+        self._driver_hint.setWordWrap(True)
+        self._driver_hint.setTextFormat(Qt.TextFormat.RichText)
+        self._driver_hint.setOpenExternalLinks(True)
+        self._driver_hint.setVisible(hint is not None)
+        layout.addWidget(self._driver_hint)
+
         # Channels
         self._channel_label = self._field_label("Channel")
         layout.addWidget(self._channel_label)
@@ -271,8 +285,28 @@ class CreateCanBusDialog(QDialog):
         self._channel_layout.addStretch(1)
         layout.addWidget(self._channel_box)
 
+        # socketcand: where the daemon listens, and the interface it serves
+        self._net_box = QWidget(self)
+        net = QHBoxLayout(self._net_box)
+        net.setContentsMargins(0, 0, 0, 0)
+        self._host_edit = QLineEdit(SOCKETCAND_DEFAULT_HOST, self._net_box)
+        self._host_edit.setPlaceholderText("Host")
+        self._port_edit = QLineEdit(str(SOCKETCAND_DEFAULT_PORT), self._net_box)
+        self._port_edit.setPlaceholderText("Port")
+        self._port_edit.setMaximumWidth(90)
+        self._channel_edit = QLineEdit("can0", self._net_box)
+        self._channel_edit.setPlaceholderText("Channel")
+        self._channel_edit.setMaximumWidth(110)
+        for edit in (self._host_edit, self._port_edit, self._channel_edit):
+            edit.textChanged.connect(lambda _t: self._on_net_edited())
+            net.addWidget(edit)
+        net.setStretch(0, 1)
+        self._net_box.setVisible(False)
+        layout.addWidget(self._net_box)
+
         # Baudrate
-        layout.addWidget(self._field_label("Baudrate"))
+        self._baud_label = self._field_label("Baudrate")
+        layout.addWidget(self._baud_label)
         self._baud_combo = QComboBox(self)
         self._offer_baudrates(_BAUDRATES)
         layout.addWidget(self._baud_combo)
@@ -342,6 +376,22 @@ class CreateCanBusDialog(QDialog):
         if dev_mode():
             self._add_device(virtual_device())
 
+    def _is_socketcand(self) -> bool:
+        device = self._current_device()
+        return device is not None and device.interface == "socketcand"
+
+    def _socketcand_port(self) -> int | None:
+        text = self._port_edit.text().strip()
+        if text.isdecimal() and 0 < int(text) < 65535:
+            return int(text)
+        return None
+
+    def _on_net_edited(self) -> None:
+        if self._is_socketcand():
+            name = self._channel_edit.text().strip()
+            self._channel = ChannelInfo(channel=name, label=name) if name else None
+            self._validate()
+
     def _start_probe(self) -> None:
         if self._prober is not None:
             return
@@ -407,6 +457,8 @@ class CreateCanBusDialog(QDialog):
         self._prober = None
         self._prober_thread = None
         self._rescan_btn.setEnabled(True)
+        # After the probe so that hardware, when there is any, comes first.
+        self._add_device(socketcand_device())
         self._refresh_empty_state()
 
     def _add_device(self, device: DeviceInfo) -> None:
@@ -421,7 +473,7 @@ class CreateCanBusDialog(QDialog):
         common case in normal use with no hardware attached and the loopback
         hidden). When a device is present, ``_render_info_strip`` owns the
         strip's visibility — it hides itself for devices with no real data."""
-        empty = self._device_combo.count() == 0
+        empty = all(d.interface == "socketcand" for d in self._devices)
         self._empty_hint.setVisible(empty)
         if empty:
             self._info_strip.setVisible(False)
@@ -445,6 +497,12 @@ class CreateCanBusDialog(QDialog):
         self._render_info_strip(device)
         self._render_channels(device)
         self._apply_device_capabilities(device)
+        socketcand = device.interface == "socketcand"
+        self._net_box.setVisible(socketcand)
+        self._baud_label.setVisible(not socketcand)
+        self._baud_combo.setVisible(not socketcand)
+        if socketcand and self._channel is not None:
+            self._channel_edit.setText(str(self._channel.channel))
         if not self._name_edited and self._channel is not None:
             self._name_edit.setText(_suggested_name(device, self._channel, self._existing))
         self._validate()
@@ -524,6 +582,8 @@ class CreateCanBusDialog(QDialog):
                 w.setChecked(False)
         btn.setChecked(True)
         self._channel = channel
+        if self._is_socketcand():
+            self._channel_edit.setText(str(channel.channel))
         self._validate()
 
     def _apply_device_capabilities(self, device: DeviceInfo) -> None:
@@ -573,6 +633,12 @@ class CreateCanBusDialog(QDialog):
         # ✗ + tooltip tell them to remove it).
         dbc_ready = self._dbc_picker.is_ready()
         can_create = problem is None and has_channel and dbc_ready
+        if self._is_socketcand():
+            can_create = (
+                can_create
+                and bool(self._host_edit.text().strip())
+                and self._socketcand_port() is not None
+            )
         offline = device is not None and device.status == "offline"
         self._create_btn.setEnabled(can_create)
         self._connect_btn.setEnabled(can_create and not offline)
@@ -597,10 +663,15 @@ class CreateCanBusDialog(QDialog):
         device = self._current_device()
         if device is None or self._channel is None or self._name_problem():
             return None
+        socketcand = device.interface == "socketcand"
+        if socketcand and self._socketcand_port() is None:
+            return None
         try:
             return BusConfig(
                 name=self._name_edit.text().strip(),
                 interface=device.interface,
+                host=self._host_edit.text().strip() if socketcand else None,
+                port=self._socketcand_port() if socketcand else None,
                 channel=self._channel.channel,
                 bitrate=int(self._baud_combo.currentData() or _DEFAULT_BAUD),
                 fd=False,

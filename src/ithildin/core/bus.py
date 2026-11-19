@@ -42,7 +42,13 @@ from PySide6.QtCore import QDeadlineTimer, QObject, Qt, QThread, Signal, Slot
 
 from ithildin.core.ringbuf import RingBuffer
 from ithildin.core.types import HEALTH_RANK, BusHealth, FrameRecord
-from ithildin.workspace.schema import KVASER_VIRTUAL_PREFIX, BusConfig, hw_id_of
+from ithildin.workspace.schema import (
+    KVASER_VIRTUAL_PREFIX,
+    BusConfig,
+    gs_usb_serial_of,
+    hw_id_of,
+    parse_gs_usb_channel,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -421,18 +427,7 @@ class BusWorker(QObject):
 
     def _open_bus(self) -> can.BusABC:
         if self._config.interface == "gs_usb":
-            from ithildin.core.gs_usb_bus import GS_USB_LOCK, GsUsbBus
-
-            self._take_driver_lock(GS_USB_LOCK, "gs_usb")
-            try:
-                return GsUsbBus(
-                    channel=int(self._config.channel),
-                    bitrate=self._config.bitrate,
-                    listen_only=self._config.listen_only,
-                    serial=self._config.hw_id,
-                )
-            finally:
-                GS_USB_LOCK.release()
+            return self._open_gs_usb()
         kwargs: dict[str, Any] = {
             "interface": self._config.interface,
             "channel": self._config.channel,
@@ -452,7 +447,65 @@ class BusWorker(QObject):
             return self._open_pcan(kwargs)
         if self._config.interface == "ixxat" and self._config.hw_id is not None:
             return self._open_ixxat(kwargs, self._config.hw_id)
+        if self._config.interface == "socketcand":
+            return self._open_socketcand()
         return can.Bus(**kwargs)
+
+    def _open_gs_usb(self) -> can.BusABC:
+        """One CAN channel of a gs_usb adapter (``schema.parse_gs_usb_channel``)."""
+        from ithildin.core.gs_usb_bus import GS_USB_LOCK, GsUsbBus
+
+        try:
+            index, device_channel = parse_gs_usb_channel(self._config.channel)
+        except ValueError as exc:
+            raise can.CanInitializationError(str(exc)) from exc
+        hw_id = self._config.hw_id
+        self._take_driver_lock(GS_USB_LOCK, "gs_usb")
+        try:
+            return GsUsbBus(
+                channel=index,
+                bitrate=self._config.bitrate,
+                listen_only=self._config.listen_only,
+                serial=None if hw_id is None else gs_usb_serial_of(hw_id, device_channel),
+                device_channel=device_channel,
+            )
+        finally:
+            GS_USB_LOCK.release()
+
+    def _open_socketcand(self) -> can.BusABC:
+        # No bitrate (the daemon owns the CAN side) and no receive_own_messages
+        # (python-can ignores it here). tcp_tune stays off: it is a Linux-only
+        # socket option and python-can only warns about it elsewhere.
+        bus = can.Bus(
+            interface="socketcand",
+            channel=self._config.channel,
+            host=self._config.host,
+            port=self._config.port,
+            tcp_tune=False,
+        )
+        # socketcand never sends a client its own frames back, so echo them
+        # into the ring ourselves, tagged TX like the other backends do.
+        # Wrapping send covers cyclic tasks too: they call bus.send directly.
+        send = bus.send
+
+        def send_and_echo(msg: can.Message, timeout: float | None = None) -> None:
+            send(msg, timeout)
+            self._ring.append(
+                FrameRecord(
+                    bus_name=self._name,
+                    timestamp=time.time(),
+                    arbitration_id=msg.arbitration_id,
+                    data=bytes(msg.data),
+                    is_extended_id=msg.is_extended_id,
+                    is_fd=bool(getattr(msg, "is_fd", False)),
+                    is_error_frame=False,
+                    is_remote_frame=msg.is_remote_frame,
+                    is_rx=False,
+                )
+            )
+
+        cast(Any, bus).send = send_and_echo
+        return bus
 
     def _open_ixxat(self, kwargs: dict[str, Any], hw_id: str) -> can.BusABC:
         from can.interfaces.ixxat.exceptions import VCIDeviceNotFoundError

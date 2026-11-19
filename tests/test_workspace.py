@@ -21,6 +21,7 @@ from ithildin.workspace.schema import (
     LegacyV1Workspace,
     ViewState,
     Workspace,
+    parse_gs_usb_channel,
 )
 
 _DEMO_V2_TOML = """\
@@ -395,3 +396,70 @@ def test_retired_connect_on_startup_key_loads_and_is_dropped_on_save(tmp_path: P
     out = tmp_path / "resaved.itp"
     save_workspace(ws, out)
     assert "connect_on_startup" not in out.read_text(encoding="utf-8")
+
+
+# ---- gs_usb channels on multi-channel adapters ----
+
+
+_TWO_CHANNEL_TOML = """\
+schema_version = 2
+name = "CCU"
+
+[[bus]]
+name = "BMS"
+interface = "gs_usb"
+channel = 0
+bitrate = 500000
+listen_only = true
+
+[[bus]]
+name = "Charger"
+interface = "gs_usb"
+channel = "0:1"
+bitrate = 500000
+listen_only = true
+"""
+
+
+def test_two_channels_of_one_gs_usb_adapter_round_trip(tmp_path: Path) -> None:
+    """Channel 1 of adapter 0 is ``"0:1"``; it and channel 0 are two channels."""
+    path = tmp_path / "ccu.itp"
+    path.write_text(_TWO_CHANNEL_TOML, encoding="utf-8")
+
+    ws = load_workspace(path)
+    assert [(b.name, b.channel) for b in ws.bus] == [("BMS", 0), ("Charger", "0:1")]
+    save_workspace(ws, path)
+    assert [b.channel for b in load_workspace(path).bus] == [0, "0:1"]
+
+
+def test_old_gs_usb_bus_is_channel_0_of_its_adapter(tmp_path: Path) -> None:
+    """A project from before multi-channel support saved the adapter index only."""
+    path = tmp_path / "old.itp"
+    path.write_text('schema_version = 2\nname = "Old"\n\n' + _CANTACT_BUS_TOML, encoding="utf-8")
+
+    bus = load_workspace(path).bus[0]
+    assert parse_gs_usb_channel(bus.channel) == (0, 0)
+
+
+@pytest.mark.parametrize("alias", ["0:0", "0", 0])
+def test_spellings_of_one_gs_usb_channel_clash(alias: str | int) -> None:
+    with pytest.raises(ValidationError, match="same interface and channel"):
+        Workspace(
+            bus=[
+                BusConfig(name="A", interface="gs_usb", channel=0, bitrate=500000),
+                BusConfig(name="B", interface="gs_usb", channel=alias, bitrate=500000),
+            ]
+        )
+
+
+@pytest.mark.parametrize(
+    ("channel", "parsed"), [(0, (0, 0)), ("2", (2, 0)), ("1:1", (1, 1)), (" 0:3 ", (0, 3))]
+)
+def test_parse_gs_usb_channel(channel: str | int, parsed: tuple[int, int]) -> None:
+    assert parse_gs_usb_channel(channel) == parsed
+
+
+@pytest.mark.parametrize("channel", ["can0", "0:", ":1", "-1", "0:x", None, True])
+def test_parse_gs_usb_channel_refuses_garbage(channel: object) -> None:
+    with pytest.raises(ValueError, match="not a gs_usb channel"):
+        parse_gs_usb_channel(channel)

@@ -38,21 +38,30 @@ SupportedInterface = Literal[
     "socketcan",
     "virtual",
     "ixxat",
+    "socketcand",
 ]
 """python-can backends ithildin officially supports."""
 
-LISTEN_ONLY_INTERFACES: frozenset[str] = frozenset({"pcan", "kvaser", "gs_usb", "virtual"})
+LISTEN_ONLY_INTERFACES: frozenset[str] = frozenset(
+    {"pcan", "kvaser", "gs_usb", "virtual", "socketcand"}
+)
 """Interfaces for which ``listen_only=True`` is honored.
 
 ``pcan`` / ``kvaser`` receive a native silent kwarg (see
 ``core.bus._apply_listen_only_kwargs``); ``gs_usb`` takes
 ``GsUsbBus(listen_only=True)``, which refuses to open when the adapter's
 firmware has no listen-only mode; ``virtual`` has no wire so the
-app-level send block alone is sufficient. ``socketcan`` (silent mode is an
+app-level send block alone is sufficient, and so does ``socketcand``
+(a TCP link to a daemon: nothing of ours ACKs on a CAN wire). ``socketcan`` (silent mode is an
 OS-level ``ip link ... listen-only`` netlink property, not a python-can
 constructor kwarg) and ``ixxat`` (the VCI wrapper hardcodes its opmode) have
 no python-can kwarg ithildin can set, so the combo is rejected rather than
 degrading to a bus that still ACKs on the wire."""
+
+
+SOCKETCAND_DEFAULT_HOST = "127.0.0.1"
+SOCKETCAND_DEFAULT_PORT = 29536
+"""bms-sim's CAN bridge address."""
 
 
 class BusConfig(BaseModel):
@@ -63,6 +72,10 @@ class BusConfig(BaseModel):
     name: str
     interface: SupportedInterface
     channel: str | int
+    """The channel on ``interface``. gs_usb: the adapter's scan index for its
+    first CAN channel, ``"<index>:<n>"`` for channel ``n`` of a multi-channel
+    adapter (:func:`gs_usb_channel`); a project saved before multi-channel
+    support has only indexes, which are channel 0."""
     bitrate: int = Field(gt=0)
     fd: bool = False
     listen_only: bool = False
@@ -83,6 +96,13 @@ class BusConfig(BaseModel):
     ``LISTEN_ONLY_INTERFACES``.
     """
 
+    host: str | None = None
+    port: int | None = Field(default=None, gt=0, lt=65535)
+    """Where a ``socketcand`` daemon listens (``None`` on every other
+    interface; a socketcand bus without them gets the sim bridge's
+    ``127.0.0.1:29536``). ``channel`` is then the daemon's interface name
+    (``can0``) and ``bitrate`` is ignored: the daemon owns the CAN side."""
+
     hw_id: str | None = Field(default=None, exclude=True)
     """The adapter channel this bus is pinned to, in :func:`hw_id_of`'s format.
 
@@ -101,6 +121,14 @@ class BusConfig(BaseModel):
         if isinstance(data, dict) and data.get("interface") == "cantact":
             channel = str(data.get("channel", 0)).removeprefix("ch:")
             data = {**data, "interface": "gs_usb", "channel": int(channel)}
+        # One spelling per gs_usb channel ("0", "0:0" and 0 are one), so the
+        # Workspace's unique-channel check sees them as the same channel.
+        if isinstance(data, dict) and data.get("interface") == "gs_usb":
+            try:
+                index, device_channel = parse_gs_usb_channel(data.get("channel", 0))
+            except ValueError:
+                return data  # refused with a clear error when the bus opens
+            data = {**data, "channel": gs_usb_channel(index, device_channel)}
         return data
 
     @model_validator(mode="before")
@@ -113,6 +141,17 @@ class BusConfig(BaseModel):
         return data
 
     @model_validator(mode="after")
+    def _socketcand_address(self) -> BusConfig:
+        if self.interface == "socketcand":
+            if self.host is None:
+                self.host = SOCKETCAND_DEFAULT_HOST
+            if self.port is None:
+                self.port = SOCKETCAND_DEFAULT_PORT
+        elif self.host is not None or self.port is not None:
+            raise ValueError("host and port apply only to the socketcand interface")
+        return self
+
+    @model_validator(mode="after")
     def _reject_unsupported_listen_only(self) -> BusConfig:
         if self.listen_only and self.interface not in LISTEN_ONLY_INTERFACES:
             raise ValueError(
@@ -121,6 +160,45 @@ class BusConfig(BaseModel):
                 "bus or use a pcan/kvaser/gs_usb adapter."
             )
         return self
+
+
+def gs_usb_channel(index: int, device_channel: int) -> str | int:
+    """The ``BusConfig.channel`` of CAN channel ``device_channel`` of gs_usb adapter ``index``.
+
+    Channel 0 is the bare index, as every project saved before multi-channel
+    support has it, so a single-channel adapter's bus is unchanged.
+    """
+    return index if device_channel == 0 else f"{index}:{device_channel}"
+
+
+def parse_gs_usb_channel(channel: object) -> tuple[int, int]:
+    """``(adapter index, CAN channel on the adapter)`` of a gs_usb ``BusConfig.channel``.
+
+    Takes an index (``0``, ``"0"``) or ``"<index>:<n>"``; ``ValueError`` for
+    anything else.
+    """
+    if isinstance(channel, bool):
+        raise ValueError(f"not a gs_usb channel: {channel!r}")
+    if isinstance(channel, int):
+        index, device_channel = channel, 0
+    elif isinstance(channel, str):
+        head, sep, tail = channel.strip().partition(":")
+        if not head.isdigit() or (sep and not tail.isdigit()):
+            raise ValueError(f"not a gs_usb channel: {channel!r} (expected N or N:M)")
+        index, device_channel = int(head), int(tail) if sep else 0
+    else:
+        raise ValueError(f"not a gs_usb channel: {channel!r}")
+    if index < 0:
+        raise ValueError(f"not a gs_usb channel: {channel!r}")
+    return index, device_channel
+
+
+def gs_usb_serial_of(hw_id: str, device_channel: int) -> str:
+    """The USB serial in a gs_usb ``hw_id`` (:func:`hw_id_of`) for that CAN channel."""
+    suffix = f":{device_channel}"
+    if device_channel and hw_id.endswith(suffix):
+        return hw_id[: -len(suffix)]
+    return hw_id
 
 
 PCAN_DEFAULT_DEVICE_IDS = (0xFF, 0xFFFFFFFF)
@@ -143,7 +221,9 @@ def hw_id_of(interface: str, detected: Mapping[str, object]) -> str | None:
     the card serial and channel on the card, ``"{serial}.{dongle_channel}"``,
     or ``"virtual.{dongle_channel}"`` for a Virtual channel (by its
     ``"card_type"``); ixxat: the unique hardware id, which names the device,
-    not the channel; gs_usb: the USB serial.
+    not the channel; gs_usb: the USB serial, ``"{serial}:{n}"`` for CAN
+    channel ``n`` > 0 of a multi-channel adapter (so a pin made before
+    multi-channel support, the bare serial, still means channel 0).
     """
     if interface == "pcan":
         device_id = detected.get("device_id")
@@ -166,6 +246,12 @@ def hw_id_of(interface: str, detected: Mapping[str, object]) -> str | None:
         value = detected.get("unique_hardware_id")
     elif interface == "gs_usb":
         value = detected.get("serial")
+        try:
+            _, device_channel = parse_gs_usb_channel(detected.get("channel", 0))
+        except ValueError:
+            return None
+        if isinstance(value, str) and value and device_channel:
+            return f"{value}:{device_channel}"
     else:
         return None
     return value if isinstance(value, str) and value else None

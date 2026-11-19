@@ -80,6 +80,9 @@ def _kvaser_virtual(channel: int, dongle_channel: int) -> dict[str, object]:
         ("ixxat", {"channel": 1, "unique_hardware_id": "HW123456"}, "HW123456"),
         ("gs_usb", {"channel": 0, "serial": "206C3EA1"}, "206C3EA1"),
         ("gs_usb", {"channel": 0, "serial": None}, None),
+        # Channel 1 of a two-channel adapter; channel 0 keeps the bare serial.
+        ("gs_usb", {"channel": "0:1", "serial": "206C3EA1"}, "206C3EA1:1"),
+        ("gs_usb", {"channel": "0:1", "serial": None}, None),
         ("socketcan", {"channel": "can0"}, None),
         ("virtual", {"channel": "x"}, None),
     ],
@@ -93,6 +96,9 @@ def test_channel_key_names_the_adapter_when_pinned() -> None:
     # pcan, kvaser and gs_usb ids name a channel wherever it enumerates.
     assert channel_key("pcan", "PCAN_USBBUS1", "0000002a.0") == ("pcan", "0000002a.0", None)
     assert channel_key("gs_usb", 0, "206C3EA1") == channel_key("gs_usb", 3, "206C3EA1")
+    # Two channels of one gs_usb adapter are two channels, pinned or not.
+    assert channel_key("gs_usb", 0, None) != channel_key("gs_usb", "0:1", None)
+    assert channel_key("gs_usb", 0, "206C3EA1") != channel_key("gs_usb", "0:1", "206C3EA1:1")
     # An IXXAT id names the device: its channel index still counts.
     assert channel_key("ixxat", 0, "HW1") != channel_key("ixxat", 1, "HW1")
 

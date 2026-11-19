@@ -1,16 +1,19 @@
-# PyInstaller spec for ithildin — shared by the Windows and Linux build
-# pipelines. Run from the repo root:
+# PyInstaller spec for ithildin — shared by the Windows, Linux and macOS
+# build pipelines. Run from the repo root:
 #
 #     uv run pyinstaller packaging/ithildin.spec --noconfirm
 #
 # Output: dist/ithildin/ithildin(.exe) plus a _internal/ tree. Windows
 # Inno Setup and the Linux AppImage scripts both consume this directory.
+# On macOS it additionally wraps that tree as dist/Ithildin.app, which
+# packaging/macos/build-dmg.sh consumes.
 
 # ruff: noqa
 # type: ignore
 from __future__ import annotations
 
 import sys
+import tomllib
 from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_dynamic_libs, collect_submodules
@@ -63,14 +66,16 @@ excludes = [
     "PySide2",
 ]
 
-# Icon: .ico for Windows, .png for Linux. Both optional — the build
-# still produces a working bundle without them, just with the Qt default.
-ico_path = RESOURCES / "app_icon.ico"
-png_path = RESOURCES / "app_icon.png"
+# Icon: .ico for Windows, .icns for macOS, .png for Linux. All optional —
+# the build still produces a working bundle without them, just with the
+# Qt default.
 if sys.platform == "win32":
-    icon = str(ico_path) if ico_path.exists() else None
+    icon_path = RESOURCES / "app_icon.ico"
+elif sys.platform == "darwin":
+    icon_path = RESOURCES / "app_icon.icns"
 else:
-    icon = str(png_path) if png_path.exists() else None
+    icon_path = RESOURCES / "app_icon.png"
+icon = str(icon_path) if icon_path.exists() else None
 
 
 block_cipher = None
@@ -123,3 +128,21 @@ coll = COLLECT(
     upx_exclude=[],
     name="ithildin",
 )
+
+if sys.platform == "darwin":
+    with open(REPO_ROOT / "pyproject.toml", "rb") as fh:
+        version = tomllib.load(fh)["project"]["version"]
+    app = BUNDLE(
+        coll,
+        name="Ithildin.app",
+        icon=icon,
+        bundle_identifier="se.ithildin.analyzer",
+        info_plist={
+            "CFBundleName": "Ithildin",
+            "CFBundleDisplayName": "Ithildin",
+            "CFBundleShortVersionString": version,
+            "CFBundleVersion": version,
+            "NSHighResolutionCapable": True,
+            "LSMinimumSystemVersion": "14.0",
+        },
+    )

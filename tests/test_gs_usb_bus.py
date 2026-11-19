@@ -5,10 +5,11 @@
 from __future__ import annotations
 
 import queue
+import struct
 import threading
 import time
+from array import array
 from collections.abc import Callable, Iterator
-from types import SimpleNamespace
 from typing import Any
 
 import can
@@ -17,7 +18,7 @@ import pytest
 import usb.core
 import usb.util
 from gs_usb.constants import GS_CAN_MODE_HW_TIMESTAMP, GS_CAN_MODE_LISTEN_ONLY
-from gs_usb.gs_usb_frame import GS_USB_NONE_ECHO_ID
+from gs_usb.gs_usb_frame import GS_USB_NONE_ECHO_ID, GsUsbFrame
 
 from ithildin.app_state.bus_reader import BusReader
 from ithildin.core import gs_usb_bus
@@ -29,48 +30,129 @@ from ithildin.workspace.schema import BusConfig
 
 _LISTEN_ONLY = GS_CAN_MODE_LISTEN_ONLY | GS_CAN_MODE_HW_TIMESTAMP
 
+# gs_usb vendor requests (bRequest), as the Linux driver and candleLight number them.
+_BITTIMING, _MODE, _BT_CONST, _DEVICE_CONFIG = 1, 2, 4, 5
+_STALL = ("Pipe error", -9, 32)  # libusb's LIBUSB_ERROR_PIPE / EPIPE
+
 
 class FakeAdapter:
-    """One adapter as gs_usb's ``GsUsb`` presents it.
+    """One adapter, both as gs_usb's ``GsUsb`` and as its pyusb device.
 
-    * ``feature``: the firmware's feature bits; ``no_driver`` makes the
-      first control transfer raise like libusb without WinUSB bound.
+    It speaks the gs_usb protocol at the USB level: vendor control requests
+    with the CAN channel in ``wValue`` (DEVICE_CONFIG is per device), and
+    one bulk-IN endpoint whose frames carry their channel.
+
+    * ``channels``: CAN channels it reports (DEVICE_CONFIG's icount + 1).
+    * ``feature``: the firmware's feature bits; ``no_driver`` makes every
+      control transfer raise like libusb without WinUSB bound.
     * ``gone``: unplugged. Control transfers raise ``USBError`` and the
       fake ``scan`` / ``find`` skip it.
-    * ``read_fails``: every read returns False at once, as gs_usb's read
-      does on any USB error.
-    * ``rx``: ``(can_id, data, timestamp_us)`` frames, one per read; an
-      empty queue makes the read wait out its timeout.
-    * ``calls``: ``(name, args)`` per set_timing / start / stop and per
-      ``usb.util.dispose_resources`` of its pyusb device (``gs_usb``, the
-      fake itself), in order.
-    * ``sent``: the CAN ID of every frame written to the adapter.
+    * ``read_fails``: every read raises a ``USBError`` at once.
+    * ``rx``: ``(can_id, data, timestamp_us[, channel])`` frames, one per
+      read; an empty queue makes the read wait out its timeout.
+    * ``refuse_normal``: channels whose normal-mode start the device stalls
+      (the KRAKA CCU's charger bus always, its BMS bus while charging).
+    * ``refuse_start``: every start fails, access denied.
+    * ``calls``: ``(name, args)`` per bit timing / start / stop request and
+      per ``usb.util.dispose_resources`` of it, in order.
+    * ``requests``: ``(name, channel)`` per per-channel control request.
+    * ``resets``: USB resets, which a first start does on Windows / Linux.
+    * ``sent``: ``(can_id, channel)`` of every frame written to the adapter.
     * ``serial``: its USB serial; ``held`` makes reading it fail as WinUSB
       does while another handle has the adapter open.
     """
 
-    def __init__(self, address: int, feature: int = _LISTEN_ONLY, serial: str = "") -> None:
+    def __init__(
+        self, address: int, feature: int = _LISTEN_ONLY, serial: str = "", channels: int = 1
+    ) -> None:
         self.bus = 1
         self.address = address
         self.feature = feature
         self.serial = serial or f"SN{address}"
+        self.channels = channels
         self.held = False
         self.no_driver = False
         self.gone = False
         self.read_fails = False
-        self.rx: queue.SimpleQueue[tuple[int, bytes, int]] = queue.SimpleQueue()
+        self.refuse_normal: set[int] = set()
+        self.refuse_start = False
+        self.rx: queue.SimpleQueue[tuple[Any, ...]] = queue.SimpleQueue()
         self.calls: list[tuple[str, object]] = []
-        self.sent: list[int] = []
+        self.requests: list[tuple[str, int]] = []
+        self.sent: list[tuple[int, int]] = []
+        self.modes: dict[int, int] = {}
         self.gs_usb = self
-        self.device_flags = 0
         self.reads = 0
         self.probes = 0
+        self.resets = 0
 
-    @property
-    def device_capability(self) -> SimpleNamespace:
+    # ---- pyusb device ----
+
+    def reset(self) -> None:
+        self.resets += 1
+
+    def is_kernel_driver_active(self, interface: int) -> bool:
+        return False
+
+    def ctrl_transfer(
+        self, request_type: int, request: int, value: int, index: int, data: Any = None
+    ) -> Any:
         if self.no_driver:
             raise NotImplementedError("Operation not supported or unimplemented on this platform")
-        return SimpleNamespace(feature=self.feature, fclk_can=48_000_000)
+        if self.gone:
+            raise usb.core.USBError("No such device (it may have been disconnected)", -4, 19)
+        if request == _DEVICE_CONFIG:
+            self.probes += 1
+            return array("B", struct.pack("<4B2I", 0, 0, 0, self.channels - 1, 2, 1))
+        if value >= self.channels:
+            raise usb.core.USBError(*_STALL)
+        if request == _BT_CONST:
+            self.requests.append(("bt_const", value))
+            consts = (self.feature, 48_000_000, 1, 16, 1, 8, 4, 1, 1024, 1)
+            return array("B", struct.pack("<10I", *consts))
+        if request == _BITTIMING:
+            self.requests.append(("set_timing", value))
+            self.calls.append(("set_timing", struct.unpack("<5I", bytes(data))))
+            return len(data)
+        if request == _MODE:
+            mode, flags = struct.unpack("<II", bytes(data))
+            if mode == 0:
+                self.modes.pop(value, None)
+                self.requests.append(("stop", value))
+                self.calls.append(("stop", None))
+                return len(data)
+            if self.refuse_start:
+                raise usb.core.USBError("Access denied (insufficient permissions)", -3, 13)
+            if value in self.refuse_normal and not flags & GS_CAN_MODE_LISTEN_ONLY:
+                raise usb.core.USBError(*_STALL)
+            self.modes[value] = flags
+            self.requests.append(("start", value))
+            self.calls.append(("start", flags))
+            return len(data)
+        raise usb.core.USBError(*_STALL)
+
+    def read(self, endpoint: int, size: int, timeout: int) -> array[int]:
+        self.reads += 1
+        if self.read_fails:
+            raise usb.core.USBError("No such device (it may have been disconnected)", -4, 19)
+        try:
+            can_id, data, timestamp_us, *rest = self.rx.get_nowait()
+        except queue.Empty:
+            time.sleep(timeout / 1000)
+            raise usb.core.USBTimeoutError("Operation timed out", -7, 60) from None
+        channel = rest[0] if rest else 0
+        frame = GsUsbFrame(can_id, list(data))
+        frame.echo_id = GS_USB_NONE_ECHO_ID
+        frame.channel = channel
+        frame.timestamp_us = timestamp_us
+        return array("B", frame.pack(bool(self.modes.get(channel, 0) & GS_CAN_MODE_HW_TIMESTAMP)))
+
+    def write(self, endpoint: int, data: bytes, timeout: int | None = None) -> int:
+        _, can_id, _, channel = struct.unpack_from("<2I2B", data)
+        self.sent.append((can_id, channel))
+        return len(data)
+
+    # ---- GsUsb ----
 
     @property
     def serial_number(self) -> str:
@@ -78,51 +160,17 @@ class FakeAdapter:
             raise usb.core.USBError("Access denied (insufficient permissions)", -3, 13)
         return self.serial
 
-    @property
-    def device_info(self) -> SimpleNamespace:
-        self.probes += 1
-        if self.gone:
-            raise usb.core.USBError("No such device (it may have been disconnected)", -4, 19)
-        return SimpleNamespace(fw_version=20, hw_version=10)
-
-    def set_timing(
-        self, prop_seg: int, phase_seg1: int, phase_seg2: int, sjw: int, brp: int
-    ) -> None:
-        self.calls.append(("set_timing", (prop_seg, phase_seg1, phase_seg2, sjw, brp)))
-
-    def start(self, flags: int) -> None:
-        self.device_flags = flags & self.feature
-        self.calls.append(("start", flags))
-
-    def stop(self) -> None:
-        self.calls.append(("stop", None))
-
-    def send(self, frame: Any) -> None:
-        self.sent.append(frame.can_id)
-
-    def read(self, frame: Any, timeout_ms: int) -> bool:
-        self.reads += 1
-        if self.read_fails:
-            return False
-        try:
-            can_id, data, timestamp_us = self.rx.get_nowait()
-        except queue.Empty:
-            time.sleep(timeout_ms / 1000)
-            return False
-        frame.can_id = can_id
-        frame.can_dlc = len(data)
-        frame.data = list(data.ljust(8, b"\0"))
-        frame.timestamp_us = timestamp_us
-        frame.echo_id = GS_USB_NONE_ECHO_ID
-        return True
-
     def starts(self) -> list[object]:
         return [flags for name, flags in self.calls if name == "start"]
 
 
 @pytest.fixture
-def adapters(monkeypatch: pytest.MonkeyPatch) -> list[FakeAdapter]:
-    """The plugged-in adapters, in scan order; one to start with."""
+def adapters(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[FakeAdapter]]:
+    """The plugged-in adapters, in scan order; one to start with.
+
+    Every test lets go of every adapter it opened: a bus left open would
+    hand its adapter to the next test's open of the same USB address.
+    """
     plugged = [FakeAdapter(address=5)]
 
     class FakeGsUsb:
@@ -141,15 +189,30 @@ def adapters(monkeypatch: pytest.MonkeyPatch) -> list[FakeAdapter]:
     monkeypatch.setattr(
         usb.util, "dispose_resources", lambda dev: dev.calls.append(("dispose", None))
     )
-    return plugged
+    yield plugged
+    leaked = dict(gs_usb_bus._ADAPTERS)
+    gs_usb_bus._ADAPTERS.clear()
+    assert not leaked, f"adapters still held after the test: {list(leaked)}"
 
 
 @pytest.fixture
 def make_bus(adapters: list[FakeAdapter]) -> Iterator[Callable[..., GsUsbBus]]:
     buses: list[GsUsbBus] = []
 
-    def make(channel: int = 0, *, listen_only: bool = False) -> GsUsbBus:
-        bus = GsUsbBus(channel=channel, bitrate=500_000, listen_only=listen_only)
+    def make(
+        channel: int = 0,
+        *,
+        listen_only: bool = False,
+        device_channel: int = 0,
+        serial: str | None = None,
+    ) -> GsUsbBus:
+        bus = GsUsbBus(
+            channel=channel,
+            bitrate=500_000,
+            listen_only=listen_only,
+            serial=serial,
+            device_channel=device_channel,
+        )
         buses.append(bus)
         return bus
 
@@ -217,8 +280,9 @@ def test_unplug_raises_without_spinning(adapters, make_bus) -> None:  # type: ig
 
 def test_timed_out_read_does_not_probe(adapters, make_bus) -> None:  # type: ignore[no-untyped-def]
     bus = make_bus()
+    opened = adapters[0].probes  # the open reads DEVICE_CONFIG for the channel count
     assert bus.recv(0.05) is None
-    assert adapters[0].probes == 0
+    assert adapters[0].probes == opened
 
 
 def test_silent_bus_is_probed(monkeypatch, adapters, make_bus) -> None:  # type: ignore[no-untyped-def]
@@ -298,11 +362,12 @@ def test_listen_only_shutdown_never_leaves_listen_only(adapters, make_bus) -> No
     bus.shutdown()
     # Opened, then started and stopped once more after closing.
     assert adapters[0].starts() == [_LISTEN_ONLY, _LISTEN_ONLY]
-    assert adapters[0].calls[-1] == ("stop", None)
+    assert adapters[0].calls[-2:] == [("stop", None), ("dispose", None)]
 
 
 def test_shutdown_releases_its_handle_before_rearming(adapters, make_bus) -> None:  # type: ignore[no-untyped-def]
-    """WinUSB refuses the re-arm's fresh handle while the bus's own is open."""
+    """WinUSB refuses the re-arm's fresh handle while the bus's own is open,
+    and on macOS a few leaked handles leave every later read access-denied."""
     bus = make_bus()
     timing, start = adapters[0].calls
 
@@ -313,7 +378,16 @@ def test_shutdown_releases_its_handle_before_rearming(adapters, make_bus) -> Non
         timing,
         start,
         ("stop", None),
+        ("dispose", None),
     ]
+
+
+def test_shutdown_releases_the_rearm_handle_when_the_rearm_fails(adapters, make_bus) -> None:  # type: ignore[no-untyped-def]
+    bus = make_bus()
+
+    adapters[0].refuse_start = True
+    bus.shutdown()
+    assert adapters[0].calls[-1] == ("dispose", None)
 
 
 def test_send_after_shutdown_never_reaches_the_adapter(adapters, make_bus) -> None:  # type: ignore[no-untyped-def]
@@ -323,7 +397,7 @@ def test_send_after_shutdown_never_reaches_the_adapter(adapters, make_bus) -> No
     bus.shutdown()
     with pytest.raises(can.CanOperationError, match="shut down"):
         bus.send(can.Message(arbitration_id=0x101, data=b"", is_extended_id=False))
-    assert adapters[0].sent == [0x100]
+    assert adapters[0].sent == [(0x100, 0)]
 
 
 def test_shutdown_after_unplug_leaves_other_adapters_alone(adapters, make_bus) -> None:  # type: ignore[no-untyped-def]
@@ -334,6 +408,19 @@ def test_shutdown_after_unplug_leaves_other_adapters_alone(adapters, make_bus) -
 
     bus.shutdown()
     assert adapters[1].calls == []
+
+
+@pytest.mark.parametrize(("platform", "resets"), [("darwin", 0), ("win32", 3)])
+def test_adapter_is_never_usb_reset_on_macos(  # type: ignore[no-untyped-def]
+    adapters, monkeypatch, platform: str, resets: int
+) -> None:
+    """After the reset macOS libusb reports a kernel driver on the adapter,
+    and the detach gs_usb's start() then attempts needs root."""
+    monkeypatch.setattr(gs_usb_bus.sys, "platform", platform)
+    bus = GsUsbBus(channel=0, bitrate=500_000)
+    bus.flush_tx_buffer()
+    bus.shutdown()
+    assert adapters[0].resets == resets
 
 
 # ---- Opening by serial ----
@@ -401,10 +488,11 @@ class _ExclusiveAdapter(FakeAdapter):
         time.sleep(0.05)
         return self.serial
 
-    @property
-    def device_capability(self) -> SimpleNamespace:
+    def ctrl_transfer(
+        self, request_type: int, request: int, value: int, index: int, data: Any = None
+    ) -> Any:
         self.claim()
-        return super().device_capability
+        return super().ctrl_transfer(request_type, request, value, index, data)
 
 
 def test_pinned_opens_in_parallel_never_collide_on_a_serial_read(monkeypatch, adapters) -> None:  # type: ignore[no-untyped-def]
@@ -463,3 +551,256 @@ def test_worker_opens_a_pinned_adapter_by_serial(adapters) -> None:  # type: ign
         assert bus.gs_usb is adapters[1]  # type: ignore[attr-defined]
     finally:
         bus.shutdown()
+
+
+# ---- Multi-channel adapters (e.g. the KRAKA CCU: ch0 BMS bus, ch1 charger bus) ----
+
+
+@pytest.fixture
+def two_channel(adapters: list[FakeAdapter]) -> FakeAdapter:
+    adapters[0].channels = 2
+    return adapters[0]
+
+
+def _frame(bus: GsUsbBus, timeout: float = 1.0) -> int:
+    msg = bus.recv(timeout)
+    assert msg is not None
+    return msg.arbitration_id
+
+
+def test_both_channels_open_at_once_on_one_handle(two_channel, make_bus) -> None:  # type: ignore[no-untyped-def]
+    bms = make_bus(listen_only=True)
+    charger = make_bus(listen_only=True, device_channel=1)
+    assert bms.gs_usb is charger.gs_usb is two_channel
+    assert two_channel.modes == {0: _LISTEN_ONLY, 1: _LISTEN_ONLY}
+    # Neither open let go of the device: there is one claimed handle.
+    assert ("dispose", None) not in two_channel.calls
+
+
+def test_control_requests_carry_the_channel(two_channel, make_bus) -> None:  # type: ignore[no-untyped-def]
+    make_bus(listen_only=True, device_channel=1)
+    assert two_channel.requests == [("bt_const", 1), ("set_timing", 1), ("start", 1)]
+
+
+def test_second_channel_never_usb_resets_the_first(monkeypatch, two_channel, make_bus) -> None:  # type: ignore[no-untyped-def]
+    """A USB reset ends every channel's session on the device (the CCU drops
+    all channels to off), so only the first start of a handle resets."""
+    monkeypatch.setattr(gs_usb_bus.sys, "platform", "win32")
+    make_bus(listen_only=True)
+    make_bus(listen_only=True, device_channel=1).flush_tx_buffer()
+    assert two_channel.resets == 1
+
+
+def test_frames_reach_the_bus_of_their_channel(two_channel, make_bus) -> None:  # type: ignore[no-untyped-def]
+    bms = make_bus(listen_only=True)
+    charger = make_bus(listen_only=True, device_channel=1)
+    for can_id, channel in [(0x101, 1), (0x200, 0), (0x102, 1), (0x201, 0)]:
+        two_channel.rx.put((can_id, b"\x01", 1000 + can_id, channel))
+
+    # The charger bus reads first and files the BMS frames for the BMS bus.
+    assert [_frame(charger), _frame(charger)] == [0x101, 0x102]
+    assert [_frame(bms), _frame(bms)] == [0x200, 0x201]
+    assert bms.recv(0.02) is None and charger.recv(0.02) is None
+
+
+def test_both_channels_read_from_their_own_threads(two_channel, make_bus) -> None:  # type: ignore[no-untyped-def]
+    bms = make_bus(listen_only=True)
+    charger = make_bus(listen_only=True, device_channel=1)
+    got: dict[int, list[int]] = {0: [], 1: []}
+
+    def read(bus: GsUsbBus, channel: int) -> None:
+        deadline = time.monotonic() + 3
+        while len(got[channel]) < 50 and time.monotonic() < deadline:
+            msg = bus.recv(0.05)
+            if msg is not None:
+                got[channel].append(msg.arbitration_id)
+
+    threads = [
+        threading.Thread(target=read, args=(bms, 0)),
+        threading.Thread(target=read, args=(charger, 1)),
+    ]
+    for thread in threads:
+        thread.start()
+    for i in range(50):
+        two_channel.rx.put((0x100 + i, b"", i, 0))
+        two_channel.rx.put((0x400 + i, b"", i, 1))
+    for thread in threads:
+        thread.join(5)
+    assert got == {0: [0x100 + i for i in range(50)], 1: [0x400 + i for i in range(50)]}
+
+
+def test_closing_one_channel_leaves_the_other_running(two_channel, make_bus) -> None:  # type: ignore[no-untyped-def]
+    bms = make_bus(listen_only=True)
+    charger = make_bus(listen_only=True, device_channel=1)
+
+    bms.shutdown()
+    assert two_channel.requests[-1] == ("stop", 0)
+    assert ("dispose", None) not in two_channel.calls
+    assert two_channel.modes == {1: _LISTEN_ONLY}
+    # A late frame of the closed channel is dropped, not handed to the other.
+    two_channel.rx.put((0x200, b"", 1, 0))
+    two_channel.rx.put((0x101, b"", 2, 1))
+    assert _frame(charger) == 0x101
+
+
+def test_last_channel_out_releases_the_device(two_channel, make_bus) -> None:  # type: ignore[no-untyped-def]
+    bms = make_bus(listen_only=True)
+    charger = make_bus(listen_only=True, device_channel=1)
+    bms.shutdown()
+    before = len(two_channel.requests)
+
+    charger.shutdown()
+    # Stopped and released, then re-armed listen-only on its own channel
+    # through a fresh handle that is released too.
+    assert two_channel.requests[before:] == [
+        ("stop", 1),
+        ("set_timing", 1),
+        ("start", 1),
+        ("stop", 1),
+    ]
+    assert [name for name, _ in two_channel.calls[-6:]] == [
+        "stop",
+        "dispose",
+        "set_timing",
+        "start",
+        "stop",
+        "dispose",
+    ]
+    assert two_channel.starts()[-1] == _LISTEN_ONLY
+
+
+def test_device_reopens_after_both_channels_closed(two_channel, make_bus) -> None:  # type: ignore[no-untyped-def]
+    make_bus(listen_only=True).shutdown()
+    charger = make_bus(listen_only=True, device_channel=1)
+    two_channel.rx.put((0x101, b"", 2, 1))
+    assert _frame(charger) == 0x101
+
+
+def test_sends_go_out_on_their_channel(two_channel, make_bus) -> None:  # type: ignore[no-untyped-def]
+    make_bus(listen_only=True)
+    bus = make_bus(device_channel=1)
+    bus.send(can.Message(arbitration_id=0x123, data=b"\x01", is_extended_id=False))
+    assert two_channel.sent == [(0x123, 1)]
+
+
+def test_a_channel_the_adapter_lacks_is_refused(two_channel) -> None:  # type: ignore[no-untyped-def]
+    with pytest.raises(can.CanInitializationError, match="has no channel 2"):
+        GsUsbBus(channel=0, bitrate=500_000, listen_only=True, device_channel=2)
+    assert two_channel.calls == [("dispose", None)]
+
+
+def test_a_channel_open_twice_is_refused(two_channel, make_bus) -> None:  # type: ignore[no-untyped-def]
+    make_bus(listen_only=True, device_channel=1)
+    with pytest.raises(can.CanInitializationError, match="channel 1 is already open"):
+        GsUsbBus(channel=0, bitrate=500_000, listen_only=True, device_channel=1)
+    assert two_channel.modes == {1: _LISTEN_ONLY}
+
+
+def test_stalled_start_is_a_clear_open_error(two_channel, make_bus) -> None:  # type: ignore[no-untyped-def]
+    """The CCU stalls a normal-mode start of its charger bus (always) and of
+    its BMS bus while charging. The open fails and the device is let go."""
+    two_channel.refuse_normal = {1}
+    with pytest.raises(can.CanInitializationError, match="refused to start channel 1") as info:
+        GsUsbBus(channel=0, bitrate=500_000, device_channel=1)
+    assert "listen-only" in str(info.value)
+    assert isinstance(info.value.__cause__, usb.core.USBError)
+    assert two_channel.calls[-1] == ("dispose", None)
+    # Nothing was left claimed: the same channel opens listen-only next.
+    make_bus(listen_only=True, device_channel=1)
+    assert two_channel.modes == {1: _LISTEN_ONLY}
+
+
+def test_stalled_start_leaves_the_other_channel_open(two_channel, make_bus) -> None:  # type: ignore[no-untyped-def]
+    two_channel.refuse_normal = {1}
+    bms = make_bus(listen_only=True)
+    with pytest.raises(can.CanInitializationError, match="refused"):
+        GsUsbBus(channel=0, bitrate=500_000, device_channel=1)
+    assert ("dispose", None) not in two_channel.calls
+    two_channel.rx.put((0x200, b"", 1, 0))
+    assert _frame(bms) == 0x200
+
+
+def test_refused_channel_fails_the_bus_open(qapp, qtbot, two_channel) -> None:  # type: ignore[no-untyped-def]
+    two_channel.refuse_normal = {1}
+    reader = BusReader()
+    try:
+        cfg = BusConfig(name="Charger", interface="gs_usb", channel="0:1", bitrate=500_000)
+        with qtbot.waitSignal(reader.bus_failed, timeout=3000) as blocker:
+            reader.open(cfg)
+        assert blocker.args[0] == "Charger"
+        assert "refused to start channel 1" in blocker.args[1]
+    finally:
+        reader.close()
+
+
+def test_worker_opens_both_channels_and_routes_frames(qapp, qtbot, two_channel) -> None:  # type: ignore[no-untyped-def]
+    reader = BusReader()
+    try:
+        for name, channel in [("BMS", 0), ("Charger", "0:1")]:
+            cfg = BusConfig(
+                name=name, interface="gs_usb", channel=channel, bitrate=500_000, listen_only=True
+            )
+            with qtbot.waitSignal(reader.bus_started, timeout=2000):
+                reader.open(cfg)
+        two_channel.rx.put((0x101, b"\x01", 10, 1))
+        two_channel.rx.put((0x200, b"\x02", 20, 0))
+        qtbot.waitUntil(
+            lambda: reader.rings["BMS"].total_seq >= 1 and reader.rings["Charger"].total_seq >= 1,
+            timeout=2000,
+        )
+        assert reader.rings["BMS"].total_seq == reader.rings["Charger"].total_seq == 1
+
+        reader.close("BMS")
+        two_channel.rx.put((0x102, b"\x03", 30, 1))
+        qtbot.waitUntil(lambda: reader.rings["Charger"].total_seq >= 2, timeout=2000)
+        assert two_channel.modes == {1: _LISTEN_ONLY}
+    finally:
+        reader.close()
+
+
+def test_pinned_second_channel_opens_while_the_first_holds_the_adapter(
+    two_channel, make_bus
+) -> None:  # type: ignore[no-untyped-def]
+    """WinUSB refuses a serial read through a second handle while a bus holds
+    the adapter; the held adapter's serial is known from its own open."""
+    make_bus(listen_only=True, serial="SN5")
+    two_channel.held = True
+    charger = make_bus(listen_only=True, serial="SN5", device_channel=1)
+    assert charger.gs_usb is two_channel
+    assert two_channel.modes == {0: _LISTEN_ONLY, 1: _LISTEN_ONLY}
+
+
+def test_worker_opens_a_pinned_second_channel(adapters, two_channel) -> None:  # type: ignore[no-untyped-def]
+    adapters.insert(0, FakeAdapter(address=6))
+    cfg = BusConfig(
+        name="Charger",
+        interface="gs_usb",
+        channel="1:1",
+        bitrate=500_000,
+        listen_only=True,
+        hw_id="SN5:1",
+    )
+    bus = BusWorker("Charger", cfg, RingBuffer(8))._open_bus()
+    try:
+        assert bus.gs_usb is two_channel  # type: ignore[attr-defined]
+        assert two_channel.modes == {1: _LISTEN_ONLY}
+    finally:
+        bus.shutdown()
+
+
+def test_single_channel_adapter_is_addressed_on_channel_0_only(adapters, make_bus) -> None:  # type: ignore[no-untyped-def]
+    bus = make_bus(listen_only=True)
+    bus.flush_tx_buffer()
+    bus.shutdown()
+    assert {channel for _, channel in adapters[0].requests} == {0}
+    with pytest.raises(can.CanInitializationError, match="has no channel 1"):
+        GsUsbBus(channel=0, bitrate=500_000, listen_only=True, device_channel=1)
+
+
+def test_unplug_fails_both_channels(two_channel, make_bus) -> None:  # type: ignore[no-untyped-def]
+    bms = make_bus(listen_only=True)
+    charger = make_bus(listen_only=True, device_channel=1)
+    two_channel.gone = two_channel.read_fails = True
+    for bus in (bms, charger):
+        with pytest.raises(can.CanOperationError, match="gs_usb adapter lost"):
+            bus.recv(1.0)

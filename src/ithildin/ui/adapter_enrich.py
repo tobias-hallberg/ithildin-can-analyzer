@@ -37,12 +37,14 @@ from ithildin.workspace.schema import (
     PCAN_DEFAULT_DEVICE_IDS,
     SupportedInterface,
     channel_key,
+    gs_usb_channel,
     hw_id_of,
+    parse_gs_usb_channel,
 )
 
 ChannelStatus = Literal["free", "in-use", "offline"]
 DeviceStatus = Literal["available", "in-use", "offline"]
-Transport = Literal["USB", "Kernel", "Software", "Unknown"]
+Transport = Literal["USB", "Kernel", "Software", "Network", "Unknown"]
 
 # PCAN channel_condition bit flags (mirrored from PCANBasic to avoid
 # importing the backend just to read three constants).
@@ -77,10 +79,10 @@ class DeviceInfo:
     @property
     def key(self) -> str:
         """Stable-ish identity for combo de-dup within one probe."""
-        tail = (
-            self.serial or self.model or (str(self.channels[0].channel) if self.channels else "?")
-        )
-        return f"{self.interface}:{tail}"
+        if self.serial:
+            return f"{self.interface}:{self.serial}"
+        first = str(self.channels[0].channel) if self.channels else "?"
+        return f"{self.interface}:{self.model}@{first}"
 
     @property
     def display_label(self) -> str:
@@ -253,10 +255,15 @@ def _enrich_kvaser(backend: str, configs: list[dict[str, object]]) -> list[Devic
 
 
 def _enrich_pcan(backend: str, configs: list[dict[str, object]]) -> list[DeviceInfo]:
-    """Group pcan channels by device_id; read FD + per-channel status."""
+    """Group pcan channels by device_id; read FD + per-channel status.
+
+    On macOS the MacCAN PCBUSB library reports no ``device_id``; there each
+    channel is treated as its own adapter.
+    """
     by_dev: OrderedDict[object, list[dict[str, object]]] = OrderedDict()
     for cfg in configs:
-        by_dev.setdefault(cfg.get("device_id"), []).append(cfg)
+        dev_key = cfg.get("device_id", ("channel", cfg.get("channel")))
+        by_dev.setdefault(dev_key, []).append(cfg)
 
     out: list[DeviceInfo] = []
     for dev_id, group in by_dev.items():
@@ -303,26 +310,35 @@ def _enrich_pcan(backend: str, configs: list[dict[str, object]]) -> list[DeviceI
 
 
 def _enrich_gs_usb(backend: str, configs: list[dict[str, object]]) -> list[DeviceInfo]:
-    """One single-channel device per adapter.
+    """One device per adapter, with a channel per CAN channel it has.
 
-    The scan reads only the USB serial, so there is no product name; the
-    index in the model keeps two adapters apart, clones sharing a serial too.
+    The scan reads only the USB serial and the channel count, so there is
+    no product name; the index in the model keeps two adapters apart, clones
+    sharing a serial too.
     """
-    out: list[DeviceInfo] = []
+    channels: OrderedDict[int, list[ChannelInfo]] = OrderedDict()
     for cfg in configs:
-        channel = cfg.get("channel")
-        if not isinstance(channel, int):
+        try:
+            index, device_channel = parse_gs_usb_channel(cfg.get("channel"))
+        except ValueError:
             continue
-        out.append(
-            DeviceInfo(
-                interface="gs_usb",
-                vendor="candleLight",
-                model=f"gs_usb adapter #{channel}",
-                transport="USB",
-                channels=(ChannelInfo(channel=channel, label="ch0", hw_id=hw_id_of(backend, cfg)),),
+        channels.setdefault(index, []).append(
+            ChannelInfo(
+                channel=gs_usb_channel(index, device_channel),
+                label=f"ch{device_channel}",
+                hw_id=hw_id_of(backend, cfg),
             )
         )
-    return out
+    return [
+        DeviceInfo(
+            interface="gs_usb",
+            vendor="candleLight",
+            model=f"gs_usb adapter #{index}",
+            transport="USB",
+            channels=tuple(chans),
+        )
+        for index, chans in channels.items()
+    ]
 
 
 def _pcan_status(condition: object) -> ChannelStatus:

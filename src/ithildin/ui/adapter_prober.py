@@ -29,6 +29,7 @@ wedge the dock indefinitely.
 from __future__ import annotations
 
 import contextlib
+import ctypes.util
 import logging
 import os
 import sys
@@ -39,7 +40,7 @@ from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot
 from PySide6.QtWidgets import QApplication
 
 from ithildin.ui.adapter_enrich import ChannelInfo, DeviceInfo, enrich
-from ithildin.workspace.schema import SupportedInterface
+from ithildin.workspace.schema import SupportedInterface, gs_usb_channel
 
 _log = logging.getLogger(__name__)
 
@@ -52,6 +53,10 @@ _SUPPORTED_BACKENDS: tuple[str, ...] = (
 )
 """Backends the prober actively probes. Kept narrow so we don't import
 vendor modules we don't intend to support."""
+
+_MACOS_BACKENDS: tuple[str, ...] = ("pcan", "gs_usb")
+"""macOS has drivers for none of the others: PEAK goes through the MacCAN
+PCBUSB library and candleLight adapters through libusb."""
 
 BACKEND_TIMEOUT_S = 3.0
 """Hard ceiling per backend probe. A vendor import or detection hung past
@@ -92,6 +97,20 @@ VIRTUAL_LOOPBACK = AdapterChoice(
 :func:`dev_mode`); appended last in every probe when it is on."""
 
 
+def supported_backends(platform: str = sys.platform) -> tuple[str, ...]:
+    return _MACOS_BACKENDS if platform == "darwin" else _SUPPORTED_BACKENDS
+
+
+def missing_driver_hint() -> str | None:
+    """Rich-text install pointer when a probed backend's driver is absent."""
+    if sys.platform == "darwin" and ctypes.util.find_library("PCBUSB") is None:
+        return (
+            "PEAK adapters need the MacCAN PCBUSB library — install it from "
+            '<a href="https://www.mac-can.com">mac-can.com</a>, then ↻ Rescan.'
+        )
+    return None
+
+
 def dev_mode() -> bool:
     """Whether dev-only surfaces (the virtual loopback adapter, Kvaser
     Virtual channels) are exposed in the UI.
@@ -119,6 +138,25 @@ def virtual_device() -> DeviceInfo:
         channels=(
             ChannelInfo(channel="ithildin_virtual", label="vcan0"),
             ChannelInfo(channel="ithildin_virtual_1", label="vcan1"),
+        ),
+    )
+
+
+def socketcand_device() -> DeviceInfo:
+    """The hand-added "socketcand (TCP)" entry of the Create dialog.
+
+    Never probed: python-can detects socketcand by waiting for UDP beacons,
+    which bms-sim's bridge does not send, and a TCP connect at every rescan
+    would open a session on the daemon. The user types host and port.
+    """
+    return DeviceInfo(
+        interface="socketcand",
+        vendor="socketcand",
+        model="TCP",
+        transport="Network",
+        channels=(
+            ChannelInfo(channel="can0", label="can0"),
+            ChannelInfo(channel="can1", label="can1"),
         ),
     )
 
@@ -166,7 +204,7 @@ class AdapterProber(QObject):
     @Slot()
     def run(self) -> None:
         seen: set[tuple[str, str | None, str | int]] = set()
-        for backend in _SUPPORTED_BACKENDS:
+        for backend in supported_backends():
             if self._cancelled:
                 break
             if backend in self._skip_backends:
@@ -302,7 +340,7 @@ def _detect_configs(backend: str) -> list[dict[str, object]]:
     if backend == "gs_usb":
         # On Linux the kernel's gs_usb driver owns the adapter, which shows
         # up as SocketCAN; pyusb would detach it.
-        return _detect_gs_usb() if sys.platform == "win32" else []
+        return _detect_gs_usb() if sys.platform in ("win32", "darwin") else []
 
     from ithildin.core.bus import KVASER_ENUM_LOCK, detect_configs, kvaser_enum_hardware
 
@@ -319,19 +357,28 @@ def _detect_configs(backend: str) -> list[dict[str, object]]:
 
 
 def _detect_gs_usb() -> list[dict[str, object]]:
-    """One config per connected gs_usb adapter: its ``GsUsb.scan()`` index and USB serial.
+    """One config per CAN channel of each connected gs_usb adapter.
 
-    The index follows plug order, so ``GsUsbBus`` opens a pinned bus by the
-    serial. Reading it opens the device, which WinUSB grants to one handle
-    at a time: the reads hold ``GS_USB_LOCK`` so no bus opens meanwhile, the
-    handle is released at once, and an adapter a bus holds open reports no
-    serial.
+    Its ``channel`` is the ``GsUsb.scan()`` index, ``"<index>:<n>"`` for
+    channel ``n`` > 0 of a multi-channel adapter (``schema.gs_usb_channel``),
+    and its ``serial`` the adapter's USB serial. The index follows plug
+    order, so ``GsUsbBus`` opens a pinned bus by the serial. Reading it and
+    the channel count opens the device, which WinUSB grants to one handle at
+    a time: the reads hold ``GS_USB_LOCK`` so no bus opens meanwhile, the
+    handle is released at once, an adapter a bus of this process holds is
+    described from its open instead (``gs_usb_bus.held_adapter``), and one
+    another program holds reports no serial and one channel.
     """
     import libusb_package
     import usb.util
     from gs_usb.gs_usb import GsUsb
 
-    from ithildin.core.gs_usb_bus import GS_USB_LOCK, SERIAL_READ_ERRORS
+    from ithildin.core.gs_usb_bus import (
+        GS_USB_LOCK,
+        SERIAL_READ_ERRORS,
+        channel_count,
+        held_adapter,
+    )
 
     libusb_package.get_libusb1_backend()
     if not GS_USB_LOCK.acquire(timeout=_PROBE_LOCK_WAIT_S):
@@ -339,11 +386,19 @@ def _detect_gs_usb() -> list[dict[str, object]]:
     try:
         configs: list[dict[str, object]] = []
         for index, dev in enumerate(GsUsb.scan()):
-            serial: str | None = None
-            with contextlib.suppress(*SERIAL_READ_ERRORS):
-                serial = dev.serial_number
-            usb.util.dispose_resources(dev.gs_usb)
-            configs.append({"interface": "gs_usb", "channel": index, "serial": serial})
+            held = held_adapter(dev)
+            if held is not None:
+                serial, count = held
+            else:
+                serial = None
+                with contextlib.suppress(*SERIAL_READ_ERRORS):
+                    serial = dev.serial_number
+                count = channel_count(dev)
+                usb.util.dispose_resources(dev.gs_usb)
+            configs.extend(
+                {"interface": "gs_usb", "channel": gs_usb_channel(index, n), "serial": serial}
+                for n in range(count)
+            )
     finally:
         GS_USB_LOCK.release()
     return configs

@@ -13,14 +13,16 @@ Open-source CAN bus analyser with a built-in MCP server.
 
 ## What it is
 
-A cross-platform (Windows + Linux) CAN bus analyser aimed at the gap
+A cross-platform (Windows, Linux and macOS) CAN bus analyser aimed at the gap
 between [BusMaster](https://rbei-etas.github.io/busmaster/) (free but
 dated UX) and [CAN Easy](https://www.ixxat.com/can-easy) (better UX but
 proprietary). It captures CAN traffic from PEAK, Kvaser, CANable /
-CANtact / candleLight, and IXXAT hardware (plus SocketCAN on Linux),
-decodes via DBC files, logs and replays sessions, and ships a built-in MCP
-server so AI agents can observe traffic and (under strict
-per-message/per-signal allowlists) transmit frames.
+CANtact / candleLight, and IXXAT hardware (plus SocketCAN on Linux, and any
+[socketcand](https://github.com/linux-can/socketcand) daemon over TCP; only
+PEAK and CANable / candleLight on macOS), decodes via DBC files, logs and
+replays sessions, and ships a built-in MCP server so AI agents can observe
+traffic and (under strict per-message/per-signal allowlists) transmit
+frames.
 
 |  |  |
 |---|---|
@@ -94,7 +96,7 @@ What works today:
   icons, comprehensive QSS covering toolbar / docks / tables / lists /
   MDI subwindows.
 
-What's not here yet (v0.1 non-goals): macOS, CAN FD, UDS / ISO-TP
+What's not here yet (v0.1 non-goals): CAN FD, UDS / ISO-TP
 transport, J1939, DBC editor.
 
 Deferred to v0.2: cyclic / periodic MCP transmit, replay pause and
@@ -133,6 +135,11 @@ End users — grab a pre-built installer from the
 - **Ubuntu / other Linux** — download
   `Ithildin-<version>-x86_64.AppImage`, `chmod +x` it, and double-click
   (or run from a terminal). Tested on Ubuntu 22.04 and 24.04.
+- **macOS** (Apple silicon, macOS 14 or later) — download
+  `Ithildin-<version>-arm64.dmg`, open it, and drag Ithildin into
+  Applications. The build is not yet signed, so the first launch is
+  blocked: right-click the app → **Open**, or run
+  `xattr -dr com.apple.quarantine /Applications/Ithildin.app`.
 
 Hardware vendor drivers are a separate install — see [Drivers](#drivers).
 
@@ -158,6 +165,27 @@ the one matching your adapter:
   with Ithildin. On Linux the kernel's `gs_usb` driver exposes the adapter
   as SocketCAN (`can0`), so use the `socketcan` backend there. Adapters
   running slcan firmware are not supported.
+- **Multi-channel `gs_usb` devices** — each CAN channel is its own bus: the
+  Create CAN bus dialog shows one pill per channel (`ch0`, `ch1`, …) under
+  the device, and the buses on one device can be open at the same time
+  (they share the one USB claim; closing one leaves the others running).
+  In the project file channel 0 stays the adapter index (`channel = 0`)
+  and channel *n* is `channel = "0:n"`; projects saved before this load as
+  channel 0. If the device refuses to start a channel in the mode asked
+  for (it stalls the request — some devices allow a channel listen-only
+  only), the bus fails to open with that reason; open it listen-only. On
+  Linux each channel is its own SocketCAN interface (`can0`, `can1`);
+  set listen-only there with `ip link set canN type can … listen-only on`.
+
+On **macOS** only two adapter families are supported:
+
+- **PEAK** (PCAN-USB family) — install the MacCAN **PCBUSB** library
+  from [mac-can.com](https://www.mac-can.com) (it lands in
+  `/usr/local/lib`). Without it the adapter probe reports no PEAK
+  devices.
+- **candleLight / gs_usb** (CANable, candleLight and other gs_usb
+  firmware, single- or multi-channel) — no install needed; the app bundles
+  libusb, and no root is needed.
 
 The built-in `virtual` backend works with no driver and is handy for
 trying the UI without hardware.
@@ -280,7 +308,7 @@ uv run ruff format --check
 uv run mypy src                           # strict mode
 ```
 
-CI runs Linux + Windows × Python 3.12 / 3.13 with the `python-can`
+CI runs Linux + Windows + macOS × Python 3.12 / 3.13 with the `python-can`
 `virtual` backend and offscreen Qt; `import ithildin` does no vendor
 work, and adapter detection runs on a background `QThread` after the
 window paints (`ui/adapter_prober.py`).
@@ -290,9 +318,9 @@ conventions, and how to add a view or an MCP tool.
 
 ## Building installers
 
-The release artifacts (Windows `.exe`, Linux `.AppImage`) are built by
-GitHub Actions in `.github/workflows/release.yml` — pushing a `v*` tag
-attaches both to a Release. Build inputs live under `packaging/`:
+The release artifacts (Windows `.exe`, Linux `.AppImage`, macOS `.dmg`)
+are built by GitHub Actions in `.github/workflows/release.yml` — pushing a
+`v*` tag attaches all three to a Release. Build inputs live under `packaging/`:
 
 - `packaging/ithildin.spec` — shared PyInstaller spec (run with
   `uv run pyinstaller packaging/ithildin.spec --noconfirm`).
@@ -301,6 +329,8 @@ attaches both to a Release. Build inputs live under `packaging/`:
 - `packaging/linux/build-appimage.sh` — wraps the PyInstaller output
   into an AppImage; needs `appimagetool` on PATH and `libfuse2`
   installed.
+- `packaging/macos/build-dmg.sh` — wraps `dist/Ithildin.app` into a DMG.
+  The build host needs Homebrew's `libusb` so PyInstaller can bundle it.
 
 ## Contributing
 

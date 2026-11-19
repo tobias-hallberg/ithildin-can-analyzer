@@ -259,8 +259,11 @@ MCP layer (`src/ithildin/mcp/`):
   `QThread` (`ui/adapter_prober.py::AdapterProber`), first from
   `LeftDockWidget.start_adapter_probe()` after `MainWindow.show()`, then
   from `LeftDockWidget.rescan_adapters()` (below). The
-  supported set is deliberately narrow (`pcan`, `kvaser`, `gs_usb`,
-  `socketcan`, `ixxat`) — every name in `_SUPPORTED_BACKENDS` is a
+  supported set is deliberately narrow and per platform
+  (`supported_backends()`): `pcan`, `kvaser`, `gs_usb`, `socketcan`,
+  `ixxat` on Windows/Linux (`_SUPPORTED_BACKENDS`), only `pcan` (via the
+  user-installed MacCAN PCBUSB library) and `gs_usb` (via the bundled
+  libusb) on macOS (`_MACOS_BACKENDS`). Every probed name is a
   vendor module the probe imports (`core/bus.py::detect_configs`, or
   `_detect_gs_usb`), so adding one is paying real startup cost. Detect
   through `detect_configs`, which calls the backend's
@@ -288,20 +291,40 @@ MCP layer (`src/ithildin/mcp/`):
   dependencies. Open the adapter with `core/gs_usb_bus.py::GsUsbBus`,
   never `can.Bus(interface="gs_usb")`: it adds listen-only (refused when
   the firmware lacks it, since gs_usb drops the flag silently), an in-bus
-  probe that raises "adapter lost" within ~1 s of an unplug (gs_usb's
-  read swallows USB errors, so `recv` would spin), epoch timestamps across
-  the device counter's 71.6 min wrap, a listen-only-safe shutdown and
-  `flush_tx_buffer`. python-can can't enumerate gs_usb, so
-  `adapter_prober._detect_gs_usb` scans on Windows only (on Linux the
-  kernel driver owns the adapter: use SocketCAN). It reads only the USB
-  serial, the adapter's identity (the scan index follows plug order), and
-  releases the handle at once (`usb.util.dispose_resources`): opening a
-  WinUSB device is exclusive, so an adapter a bus holds has no serial.
+  probe that raises "adapter lost" within ~1 s of an unplug, epoch
+  timestamps across the device counter's 71.6 min wrap, a listen-only-safe
+  shutdown, `flush_tx_buffer` and every CAN channel of a multi-channel
+  device. The `gs_usb` library addresses channel 0 only, so `GsUsbBus`
+  speaks the protocol to pyusb itself (control requests with the channel
+  in `wValue`, the bulk endpoints) and uses the library for `scan` / `find`
+  / the serial only. The buses on one device share one claimed handle
+  (`_Adapter`, registered in `_ADAPTERS` by USB bus/address): `_join` /
+  `_leave` count its channels, the last one out releases it and re-arms
+  its own channel in its own mode through a fresh handle (python-can
+  #1790); one bus at a time reads the bulk-IN endpoint and files other
+  channels' frames for their buses. A start the device stalls (EPIPE) is a
+  `CanInitializationError` ("refused to start channel …"). The USB reset a
+  start does (never on macOS: after it libusb reports a kernel driver whose
+  detach needs root) happens only when no other channel of the device
+  runs, since it ends every channel's session. `BusConfig.channel` is the
+  scan index for channel 0 and `"<index>:<n>"` for channel n
+  (`schema.gs_usb_channel` / `parse_gs_usb_channel`; old projects have
+  indexes only), and the pin `<serial>:<n>` for n > 0
+  (`schema.hw_id_of`, `gs_usb_serial_of`). python-can can't enumerate
+  gs_usb, so `adapter_prober._detect_gs_usb` scans on Windows and macOS
+  (on Linux the kernel driver owns the adapter: use SocketCAN, one
+  interface per channel). It reads the USB serial, the adapter's identity
+  (the scan index follows plug order), and the channel count
+  (DEVICE_CONFIG), emits one config per channel, and releases the handle
+  at once (`usb.util.dispose_resources`): opening a WinUSB device is
+  exclusive, so an adapter another program holds has no serial and one
+  channel, and one a bus of this process holds is described from its open
+  (`gs_usb_bus.held_adapter`) without a second handle.
   `GsUsbBus(serial=)` opens a pinned adapter at whatever index it scans
   at, reading every adapter's serial (refused when clones share it). A
   serial read on another thread makes an open of that adapter fail, so
-  the prober's reads and every `GsUsbBus` construction hold
-  `gs_usb_bus.GS_USB_LOCK`, waited for with a timeout like
+  the prober's reads, every `GsUsbBus` construction and the last close of
+  a device hold `gs_usb_bus.GS_USB_LOCK`, waited for with a timeout like
   `KVASER_ENUM_LOCK` (`BusWorker._take_driver_lock`). Call `libusb_package.get_libusb1_backend()` before
   `GsUsb.scan()` so pyusb loads the bundled libusb. `BusConfig` migrates
   saved `cantact` buses (0.1.0 / 0.1.1) to `gs_usb`.
@@ -352,7 +375,7 @@ MCP layer (`src/ithildin/mcp/`):
   in PCAN-View; the factory 0xFF / 0xFFFFFFFF identify nothing) +
   controller, kvaser serial + channel on the card (`virtual.` + channel for
   a Kvaser Virtual channel), IXXAT unique hardware
-  id, gs_usb USB serial. Pins live in `~/.ithildin/<project>/adapter_pins.json`
+  id, gs_usb USB serial (`:<n>` for channel n > 0). Pins live in `~/.ithildin/<project>/adapter_pins.json`
   (bus name → hw_id, atomic `os.replace`), loaded by `open_or_migrate` and
   written by `Project.save()` / `save_adapter_pins()`. A pin is set only by
   the Create dialog's choice or the dock's "Pin to …" (offered for a bus
@@ -551,8 +574,10 @@ test org, as it does for the dock and theme.
   backend's branches without importing a vendor module. `open_gate` /
   `block` hang the open or `recv` like a stuck vendor call until the
   event is set; set it before the test ends. Extend it rather than
-  writing another fake. `GsUsbBus` itself runs against a fake `GsUsb`
-  adapter in `tests/test_gs_usb_bus.py`, and `_open_pcan` runs
+  writing another fake. `GsUsbBus` itself runs against a fake adapter
+  that speaks the gs_usb protocol at the pyusb level (per-channel control
+  requests, channel-tagged bulk frames, stalls) in
+  `tests/test_gs_usb_bus.py`, and `_open_pcan` runs
   python-can's own `PcanBus` against a fake PCAN-Basic driver
   (`fake_bus.FakePcanBasic`), which any test that opens a pcan bus through
   `_open_pcan` needs, a pinned one included: it loads PCAN-Basic and
@@ -588,8 +613,8 @@ test org, as it does for the dock and theme.
 | Add an MCP read tool | implement in `mcp/tools.py`, register in `mcp/server.py::register_read_tools` |
 | Add an MCP write tool | same split; the body runs inside `tools._audited` and goes through `AllowlistStore.check_*`; register an `async` wrapper in `mcp/server.py::register_write_tools` that calls it via `to_thread.run_sync` with the server's `sends` limiter |
 | Wire a `BusReader` error display | `MainWindow.report()` and per-view banners |
-| Add or re-enable a CAN backend | `ui/adapter_prober.py::_SUPPORTED_BACKENDS` + `workspace/schema.py::SupportedInterface` (must update both) + `hiddenimports` in `packaging/ithildin.spec` (and `collect_dynamic_libs` for a native library it bundles) + an enricher in `ui/adapter_enrich.py::_ENRICHERS` unless the default one labels it well; for listen-only also `LISTEN_ONLY_INTERFACES` + `core/bus.py::_apply_listen_only_kwargs`; for pinning `schema.hw_id_of` + `core/bus.py::_pin_adapter`, or its own branch in `BusWorker._open_bus` |
-| Change what identifies an adapter | `workspace/schema.py::hw_id_of` / `channel_key(s)` |
+| Add or re-enable a CAN backend | `ui/adapter_prober.py::_SUPPORTED_BACKENDS` / `_MACOS_BACKENDS` + `workspace/schema.py::SupportedInterface` (must update both) + `hiddenimports` in `packaging/ithildin.spec` (and `collect_dynamic_libs` for a native library it bundles) + an enricher in `ui/adapter_enrich.py::_ENRICHERS` unless the default one labels it well; for listen-only also `LISTEN_ONLY_INTERFACES` + `core/bus.py::_apply_listen_only_kwargs`; for pinning `schema.hw_id_of` + `core/bus.py::_pin_adapter`, or its own branch in `BusWorker._open_bus` |
+| Change what identifies an adapter | `workspace/schema.py::hw_id_of` / `channel_key(s)` (gs_usb: also `gs_usb_channel` / `parse_gs_usb_channel` / `gs_usb_serial_of`) |
 | React to a device change | `ui/main_window.py::nativeEvent` (Windows) → `LeftDockWidget.rescan_adapters` |
 | Add a vendor dep that limits the Python range | none today; make it an extra under `[project.optional-dependencies]` in `pyproject.toml` with a matching `--extra` in `.github/workflows/release.yml` |
 | Persist user-private state | `~/.ithildin/<project>/` (allowlist, audit, layout, adapter pins) |
@@ -601,7 +626,6 @@ test org, as it does for the dock and theme.
 
 - Not CAN FD in v0.1.
 - Not a DBC editor — read-only DBC tree only.
-- Not macOS in v1.
 - Not UDS / ISO-TP / J1939.
 
 ## Deferred features (not in v0.1)

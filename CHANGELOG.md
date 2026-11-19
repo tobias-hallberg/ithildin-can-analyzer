@@ -9,6 +9,24 @@ once it reaches 1.0.
 
 ### Added
 
+- macOS support (Apple silicon, macOS 14+), shipped as an unsigned DMG.
+  The adapter probe looks for PEAK adapters through the MacCAN PCBUSB
+  library and for CANable / candleLight (`gs_usb`) adapters through the
+  bundled libusb, and opens a `gs_usb` adapter without root.
+- Multi-channel `gs_usb` devices: every CAN channel is listed (one channel
+  pill each in the Create CAN bus dialog) and is its own bus, and the
+  channels of one device can be open at once, each closing on its own.
+  Channel 0 is saved as before (the adapter index); channel *n* is saved as
+  `"<index>:<n>"`, and its adapter pin as `<serial>:<n>`. A channel start
+  the device refuses (a stalled request) fails the bus open with a message
+  that says so, instead of a USB error.
+- socketcand buses. Create CAN bus lists a hand-added **socketcand (TCP)**
+  device: type the host and port (default `127.0.0.1:29536`, the address of
+  bms-sim's CAN bridge) and the daemon's interface (`can0` / `can1`, or any
+  name). It is never probed, since python-can finds socketcand through UDP
+  beacons that bms-sim does not send. A socketcand bus has no baud rate.
+  The daemon does not echo a client's own frames, so Ithildin adds the
+  frames it sends to the Trace itself, tagged TX.
 - Export plot data to CSV. Pause a Signal Plot and click **Export** in its
   header to save the visible signals over the visible time window, with one
   `time_s` column and one column per signal. Signals from the same frame
@@ -44,6 +62,8 @@ once it reaches 1.0.
   so over a long capture its memory use grew without limit and redrawing
   it got slower. It now keeps only as many samples per signal as its time
   window needs.
+- PEAK adapters on macOS are listed as separate devices; MacCAN reports
+  no device ID, so they used to merge into a single "PCAN device".
 
 ## [0.1.2] - 2026-10-26
 

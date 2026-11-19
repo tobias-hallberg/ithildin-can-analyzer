@@ -4,8 +4,10 @@
 
 from __future__ import annotations
 
+import math
+
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QFontMetrics
+from PySide6.QtGui import QFontMetrics, QFontMetricsF
 
 from ithildin.core.transmit import TxSignalSpec
 from ithildin.ui.fonts import tabular_font
@@ -132,7 +134,9 @@ def test_list_name_is_elided_to_keep_clear_of_the_badge(qapp) -> None:  # type: 
     fm = QFontMetrics(tabular_font())
     full, ident = "BCU_IMD_Ctrl_Long_Name", "0xA100101"
     id_w = fm.horizontalAdvance(ident) + 8
-    roomy = fm.horizontalAdvance(full) + id_w
+    # elidedText measures the unrounded advance; on macOS Menlo's is
+    # fractional, so the rounded int width is up to 1 px too small.
+    roomy = math.ceil(QFontMetricsF(tabular_font()).horizontalAdvance(full)) + id_w
     assert fit_name_and_id(fm, full, ident, roomy) == (full, True)
 
     tight = id_w + fm.horizontalAdvance("BCU_IMD…")
